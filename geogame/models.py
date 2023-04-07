@@ -87,6 +87,7 @@ class Tower(models.Model):
     is_active = models.BooleanField()
 
     initial_bonus = models.PositiveIntegerField(default=0, help_text="Număr inițial de puncte obținute la câștigarea turnului")
+    decrease_initial_bonus = models.BooleanField(default=False)
 
     rfid_code = models.CharField(max_length=16, unique=True, null=True, blank=True)
 
@@ -142,7 +143,13 @@ class Tower(models.Model):
 
     def assign_to_team(self, team, challenge=None, no_bonus=False):
         if not no_bonus:
-            team.update_score(self.initial_bonus)
+            previous_tower_ownerships = TeamTowerOwnership.objects.filter(tower=self, team=team).count()
+            bonus = self.initial_bonus
+            if self.decrease_initial_bonus:
+                while previous_tower_ownerships > 0:
+                    bonus = bonus / 2.
+                    previous_tower_ownerships -= 1
+            team.update_score(max(bonus, 1))
 
         handover_time = datetime.now(timezone.utc)
         try:
