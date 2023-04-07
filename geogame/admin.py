@@ -40,7 +40,7 @@ unassign_all.short_description = "Închide toate deținerile de Zone (selecteaz�
 class TowerAdmin(LeafletGeoAdmin):
     list_display = [
         '__str__', 'is_active', 'zone', 'category', 'get_tower_control', 'get_rfid_url', 'id',
-        'initial_bonus'
+        'initial_bonus', 'decrease_initial_bonus'
     ]
     list_filter = ['zone', 'is_active', 'category']
     # readonly_fields = ['rfid_code']

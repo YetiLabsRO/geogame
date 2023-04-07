@@ -87,7 +87,7 @@ class Tower(models.Model):
     is_active = models.BooleanField()
 
     initial_bonus = models.PositiveIntegerField(default=0, help_text="Număr inițial de puncte obținute la câștigarea turnului")
-    decrease_initial_bonus = models.BooleanField(default=False)
+    decrease_initial_bonus = models.BooleanField(default=False, help_text="Dacă la fiecare recucerire ulterioară de către aceeași echipă să se înjumătățească numărul inițial de puncte obținute (minimul va fi 1)")
 
     rfid_code = models.CharField(max_length=16, unique=True, null=True, blank=True)
 
