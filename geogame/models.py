@@ -143,9 +143,9 @@ class Tower(models.Model):
 
     def assign_to_team(self, team, challenge=None, no_bonus=False):
         if not no_bonus:
-            previous_tower_ownerships = TeamTowerOwnership.objects.filter(tower=self, team=team).count()
             bonus = self.initial_bonus
             if self.decrease_initial_bonus:
+                previous_tower_ownerships = TeamTowerOwnership.objects.filter(tower=self, team=team).count()
                 while previous_tower_ownerships > 0:
                     bonus = bonus / 2.
                     previous_tower_ownerships -= 1
