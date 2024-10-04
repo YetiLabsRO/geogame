@@ -36,7 +36,7 @@ jobs:
           END
 
       - name: Stop the server
-        run: ssh production 'sudo supervisorctl stop geocode'
+        run: ssh production 'sudo supervisorctl stop geogame'
 
       - name: Check out the source
         run: ssh production 'cd /var/app/cercetador && git fetch && git reset --hard origin/main'
@@ -52,4 +52,4 @@ jobs:
 
       - name: Start the server
         if: ${{ always() }}
-        run: ssh production 'sudo supervisorctl start geocode'
+        run: ssh production 'sudo supervisorctl start geogame'
