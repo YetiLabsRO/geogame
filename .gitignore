@@ -8,3 +8,8 @@ __pycache__/
 venv/*
 .idea/*
 media/*
+
+.env
+.envrc
+dump*sql
+cercetador/local_settings*.py
