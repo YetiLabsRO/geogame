@@ -48,7 +48,7 @@ jobs:
         run: ssh production 'cd /var/app/cercetador && .venv/bin/python manage.py migrate'
 
       - name: Collectstatic
-        run: ssh production 'cd /var/app/cercetador && .venv/bin/python manage.py collectstatic --noinput
+        run: ssh production 'cd /var/app/cercetador && .venv/bin/python manage.py collectstatic --noinput'
 
       - name: Start the server
         if: ${{ always() }}
