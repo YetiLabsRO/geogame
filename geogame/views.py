@@ -148,21 +148,22 @@ class TowerDetailView(DetailView):
             if not self.lng or not self.lat:
                 return HttpResponseBadRequest("Nu esti langa obiectiv!")
 
+        self.team = None
         if "team_id" in request.session:
             try:
                 self.team = Team.objects.get(code=request.session["team_id"])
             except Team.DoesNotExist:
                 self.team = None
 
-
-        self.team_code = request.GET.get("team_code")
-        self.team = None
-        if self.team_code:
-            try:
-                self.team = Team.objects.get(code=self.team_code)
-                request.session['team_id'] = self.team.code
-            except Team.DoesNotExist:
-                raise Http404("Codul tău de echipă nu e corect!")
+        if not self.team:
+            self.team_code = request.GET.get("team_code")
+            self.team = None
+            if self.team_code:
+                try:
+                    self.team = Team.objects.get(code=self.team_code)
+                    request.session['team_id'] = self.team.code
+                except Team.DoesNotExist:
+                    raise Http404("Codul tău de echipă nu e corect!")
         return super(TowerDetailView, self).dispatch(request, *args, **kwargs)
 
     def get_object(self, queryset=None):
