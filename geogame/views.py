@@ -152,7 +152,7 @@ class TowerDetailView(DetailView):
         self.team = None
         if self.team_code:
             try:
-                    self.team = Team.objects.get(code=self.team_code)
+                self.team = Team.objects.get(code=self.team_code)
             except Team.DoesNotExist:
                 raise Http404("Codul tău de echipă nu e corect!")
         return super(TowerDetailView, self).dispatch(request, *args, **kwargs)

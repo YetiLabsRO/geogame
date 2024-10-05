@@ -36,7 +36,7 @@ function create_towers(data) {
 fetch("/api/towers/").then(response => response.json()).then(data => create_towers(data));
 
 function show_options(data, e) {
-    let tower_list = "<ul>";
+    let tower_list = "<ul style='list-style: none'>";
     data.forEach(function(tower) {
         console.log(tower);
         tower_list += "<li><a href='/tower/" + tower.id + "/?lat=" + e.latlng['lat'] + "&lng=" + e.latlng['lng'] + "'>" + tower.name + "</a></li>";
