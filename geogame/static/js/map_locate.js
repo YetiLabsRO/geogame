@@ -1,4 +1,4 @@
-let map = L.map('map').setView([46.06549996715349, 23.570670843267617], 14);
+let map = L.map('map').setView([46.068374, 23.571797], 17);
 
 L.tileLayer('https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}', {
     attribution: 'Map data &copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, Imagery © <a href="https://www.mapbox.com/">Mapbox</a>',
@@ -18,7 +18,7 @@ function create_zones(data) {
             // switch lat / long
             let shape = [];
             e.shape.coordinates[0].forEach(function (longlat) {
-               shape.push([longlat[1], longlat[0]])
+               shape.push([longlat[1], longlat[0]]);
             });
 
             L.polygon(shape, {color: e.color}).addTo(map);
@@ -54,8 +54,8 @@ function show_options(data, e) {
 function onLocationFound(e) {
     //  make a call to get towers by their closest location to you
     console.log("location", e);
-    let geo_url = "/api/towers/?lat=" + e.latlng['lat'] + "&lng=" + e.latlng['lng'] + "&accuracy=" + e.accuracy
-    fetch(geo_url).then(response => response.json()).then(data => show_options(data, e))
+    let geo_url = "/api/towers/?lat=" + e.latlng['lat'] + "&lng=" + e.latlng['lng'] + "&accuracy=" + e.accuracy;
+    fetch(geo_url).then(response => response.json()).then(data => show_options(data, e));
 }
 
 map.on('locationfound', onLocationFound);
@@ -65,4 +65,4 @@ function onLocationError(e) {
 }
 
 map.on('locationerror', onLocationError);
-map.locate({setView: true, maxZoom: 16});
+map.locate({setView: true, maxZoom: 17});
