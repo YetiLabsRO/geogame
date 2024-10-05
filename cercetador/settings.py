@@ -150,6 +150,7 @@ LEAFLET_CONFIG = {
     'DEFAULT_ZOOM': 14,
 }
 
+DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 
 MEDIA_ROOT = BASE_DIR / "media"

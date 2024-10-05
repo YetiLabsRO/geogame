@@ -82,12 +82,14 @@ class Tower(models.Model):
 
     name = models.CharField(max_length=255)
     location = models.PointField()
-    zone = models.ForeignKey(Zone, on_delete=models.CASCADE)
+    zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True, blank=True)
     category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
     is_active = models.BooleanField()
 
     initial_bonus = models.PositiveIntegerField(default=0, help_text="Număr inițial de puncte obținute la câștigarea turnului")
     decrease_initial_bonus = models.BooleanField(default=False, help_text="Dacă la fiecare recucerire ulterioară de către aceeași echipă să se înjumătățească numărul inițial de puncte obținute (minimul va fi 1)")
+
+    autocreate_zone = models.BooleanField(default=False, verbose_name="Creează zonă", help_text="Creează o zonă nou, circulară, pentru acest turn")
 
     rfid_code = models.CharField(max_length=16, unique=True, null=True, blank=True)
 
@@ -241,6 +243,19 @@ class Tower(models.Model):
             return True
 
     def save(self, *args, **kwargs):
+        if self.id is None and self.autocreate_zone:
+            p = self.location
+            p.transform(3857)
+            circle = p.buffer(100)
+            circle.transform(4326)
+
+            self.zone = Zone.objects.create(
+                name=f"{self.name} - zone",
+                color="#000000",
+                shape=circle,
+                scoring_type=Zone.SCORE_LIN
+            )
+
         super(Tower, self).save(*args, **kwargs)
         if self.__is_active != self.is_active and self.is_active is False:
             self.unassign()
