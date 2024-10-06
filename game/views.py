@@ -9,9 +9,9 @@ from rest_framework.status import HTTP_400_BAD_REQUEST
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 
-from geogame.forms import RFIDTowerForm
-from geogame.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
-from geogame.serializers import ZoneSerializer, TowerSerializer, TeamSerializer, ChallengeSerializer, \
+from game.forms import RFIDTowerForm
+from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
+from game.serializers import ZoneSerializer, TowerSerializer, TeamSerializer, ChallengeSerializer, \
     TeamTowerChallengeSerializer
 
 

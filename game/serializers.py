@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from geogame.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
+from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 

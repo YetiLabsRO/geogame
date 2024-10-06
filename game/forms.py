@@ -3,7 +3,7 @@ from django.core.exceptions import ValidationError
 
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
-from geogame.models import TeamTowerChallenge, Tower, Team
+from game.models import TeamTowerChallenge, Tower, Team
 
 
 class RFIDTowerForm(forms.Form):

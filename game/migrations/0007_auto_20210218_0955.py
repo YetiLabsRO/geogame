@@ -7,7 +7,7 @@ from django.db import migrations
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('geogame', '0006_auto_20210218_0852'),
+        ('game', '0006_auto_20210218_0852'),
     ]
 
     operations = [

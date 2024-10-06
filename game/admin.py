@@ -6,7 +6,7 @@ from leaflet.admin import LeafletGeoAdmin
 # Register your models here.
 from django.utils.safestring import mark_safe
 
-from geogame.models import Zone, Tower, Team, Challenge, TeamTowerChallenge, TeamTowerOwnership
+from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge, TeamTowerOwnership
 
 
 class ZoneAdmin(LeafletGeoAdmin):

@@ -6,7 +6,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ('geogame', '0008_tower_rfid_code'),
+        ('game', '0008_tower_rfid_code'),
     ]
 
     operations = [

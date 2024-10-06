@@ -17,8 +17,8 @@ from django.contrib import admin
 from django.urls import path, include
 from rest_framework import routers
 
-from geogame.models import Team
-from geogame.views import ZoneViewSet, TowerViewSet, TeamViewSet, ChallengeViewSet, MapView, RFIDTowerView, \
+from game.models import Team
+from game.views import ZoneViewSet, TowerViewSet, TeamViewSet, ChallengeViewSet, MapView, RFIDTowerView, \
     TowerChallengeView, ScoreMapView, TowerDetailView, TeamTowerChallengeViewSet, RFIDChallengeView, PendingChallenges, \
     RulesView
 from django.conf import settings

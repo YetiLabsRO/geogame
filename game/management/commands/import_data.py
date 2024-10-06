@@ -3,7 +3,7 @@ from django.conf import settings
 from django.contrib.gis.geos import Polygon, Point
 from django.core.management.base import BaseCommand, CommandError
 import xml.dom.minidom
-from geogame.models import *
+from game.models import *
 
 
 class Command(BaseCommand):

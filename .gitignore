@@ -12,4 +12,4 @@ media/*
 .env
 .envrc
 dump*sql
-cercetador/local_settings*.py
+geogame/local_settings*.py

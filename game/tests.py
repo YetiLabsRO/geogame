@@ -1,7 +1,7 @@
 from django.test import TestCase
 from unittest.mock import MagicMock, patch
 
-from geogame.models import Team, Tower, TeamZoneOwnership, TeamTowerOwnership, TeamTowerChallenge, Challenge
+from game.models import Team, Tower, TeamZoneOwnership, TeamTowerOwnership, TeamTowerChallenge, Challenge
 
 
 class ZoneControlTest(TestCase):
