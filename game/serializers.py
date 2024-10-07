@@ -1,6 +1,7 @@
 from rest_framework import serializers
 
-from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
+from game.models import Zone, Tower, Challenge, TeamTowerChallenge
+from organize.models import Team
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 
@@ -13,9 +14,9 @@ class ZoneSerializer(serializers.HyperlinkedModelSerializer):
     team_color = serializers.SerializerMethodField()
 
     def get_team_color(self, zone):
-        category = int(self.context.get("category", 0))
-        if category:
-            control_team_ids = zone.zone_control(category=category)
+        group = int(self.context.get("group", 0))
+        if group:
+            control_team_ids = zone.zone_control(group=group)
             teams = Team.objects.filter(pk__in=control_team_ids)
             if teams.count() > 1:
                 return "#FFFFFF"
@@ -27,13 +28,17 @@ class ZoneSerializer(serializers.HyperlinkedModelSerializer):
 class TowerSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Tower
-        fields = ["name", "location", "zone", "category", "is_active", "ownership", "id"]
+        fields = ["name", "location", "zone", "category", "is_active", "ownership", "id", "has_initial_bonus"]
 
     ownership = serializers.SerializerMethodField()
+    has_initial_bonus = serializers.SerializerMethodField()
 
     def get_ownership(self, obj):
         #   TODO: fix this
         return TeamSerializer(obj.tower_control(1)).data
+
+    def get_has_initial_bonus(self, obj: Tower):
+        return obj.initial_bonus != 0
 
 
 class TeamSerializer(serializers.HyperlinkedModelSerializer):

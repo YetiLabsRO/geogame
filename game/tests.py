@@ -1,24 +1,31 @@
+from datetime import datetime, timedelta
+
 from django.test import TestCase
 from unittest.mock import MagicMock, patch
+from django.utils import timezone
+from jedi.inference.filters import GlobalNameFilter
 
-from game.models import Team, Tower, TeamZoneOwnership, TeamTowerOwnership, TeamTowerChallenge, Challenge
+from game.models import Tower, TeamZoneOwnership, TeamTowerOwnership, TeamTowerChallenge, Challenge
+from organize.models import Team, Game, TeamGroup
 
 
 class ZoneControlTest(TestCase):
     fixtures = ["tower_zones.json"]
 
     def setUp(self):
-        self.t1 = Team.objects.create(name="explo1", category=Team.EXPLORATORI, code="EXPLO1", color="#003366")
-        self.t2 = Team.objects.create(name="explo2", category=Team.EXPLORATORI, code="EXPLO2", color="#003366")
+        self.game = Game.objects.create(name='game1', start_time=timezone.now(), end_time=timezone.now() + timedelta(hours=1))
+        self.group = TeamGroup.objects.create(name='group1', game=self.game)
+        self.t1 = Team.objects.create(name="explo1", game=self.game, group=self.group, code="EXPLO1", color="#003366")
+        self.t2 = Team.objects.create(name="explo2", game=self.game, group=self.group, code="EXPLO2", color="#003366")
 
         self.tower1 = Tower.objects.get(name__icontains="Dendroparc")
         self.zone1 = self.tower1.zone
 
-    @patch('geogame.models.Zone.get_score', MagicMock(return_value=1))
+    @patch('game.models.Zone.get_score', MagicMock(return_value=1))
     def test_zone_control_from_empty(self):
         self.tower1.assign_to_team(self.t1)
         self.assertEqual(TeamZoneOwnership.objects.all().count(), 1)
-        self.assertEqual(list(self.zone1.zone_control(self.t1.category)), [self.t1.pk])
+        self.assertEqual(list(self.zone1.zone_control(self.t1.group)), [self.t1.pk])
         self.t1 = Team.objects.get(code="EXPLO1")
         self.t2 = Team.objects.get(code="EXPLO2")
         self.assertEqual(self.t1.score, 0)
@@ -26,7 +33,7 @@ class ZoneControlTest(TestCase):
 
         self.tower1.assign_to_team(self.t2)
         self.assertEqual(TeamZoneOwnership.objects.all().count(), 2)
-        self.assertEqual(list(self.zone1.zone_control(self.t2.category)), [self.t2.pk])
+        self.assertEqual(list(self.zone1.zone_control(self.t2.group)), [self.t2.pk])
         self.t1 = Team.objects.get(code="EXPLO1")
         self.t2 = Team.objects.get(code="EXPLO2")
         self.assertEqual(self.t1.score, 1)

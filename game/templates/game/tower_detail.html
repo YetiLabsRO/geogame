@@ -140,17 +140,7 @@
         <span class="text-muted">
         <a href = "{% url 'tower-challenge' %}">Cucerește alt turn!</a> |
         {% if team %}
-            {% if team.category == 1 %}
-                <a href="{% url 'score-map-explo' %}">Harta cu scoruri!</a>
-            {% endif %}
-
-            {% if team.category == 2 %}
-                <a href="{% url 'score-map-teme' %}">Harta cu scoruri!</a>
-            {% endif %}
-
-            {% if team.category == 3 %}
-                <a href="{% url 'score-map-seniori' %}">Harta cu scoruri!</a>
-            {% endif %}
+            <a href="{% url 'score-map' team_short=team.group.slug %}">Harta cu scoruri!</a>
         {% endif %}
         </span>
     </div>

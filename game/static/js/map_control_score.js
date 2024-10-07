@@ -19,6 +19,25 @@ L.tileLayer('https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_toke
     accessToken: 'pk.eyJ1IjoieWV0aWJhbGF1cnUiLCJhIjoiY2tqMnl6cWZwNWJ0aDJycWo4ZG41YjNtciJ9.IkhU0PgtFeEYaslj78WO1A'
 }).addTo(map);
 
+var redIcon = new L.Icon({
+  iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34],
+  shadowSize: [41, 41]
+});
+
+var blueIcon = new L.Icon({
+  iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-blue.png',
+  shadowUrl: 'https://cdnjs.cloudflare.com/ajax/libs/leaflet/0.7.7/images/marker-shadow.png',
+  iconSize: [25, 41],
+  iconAnchor: [12, 41],
+  popupAnchor: [1, -34],
+  shadowSize: [41, 41]
+});
+
+
 zones = [];
 towers = [];
 
@@ -46,7 +65,12 @@ function create_zones(data) {
 
 function create_towers(data) {
     data.forEach(function(e) {
-        let tower = L.marker([e.location.coordinates[1], e.location.coordinates[0]], {"title": e.name, });
+        let tower = L.marker(
+            [e.location.coordinates[1], e.location.coordinates[0]],
+            {
+                "title": e.name,
+                "icon": e.has_initial_bonus ? redIcon : blueIcon
+            });
         towers.push(tower);
         tower.addTo(map);
     })
@@ -70,13 +94,13 @@ function update_teams(data) {
     document.getElementById("scores").innerHTML = score_list;
 }
 
-let category = document.getElementById("category")
-let teamCategory = category.dataset.teamCategory;
+let group = document.getElementById("team-group");
+let teamGroup = group.dataset.teamGroup;
 
-fetch("/api/zones/?category=" + teamCategory).then(response => response.json()).then(data => create_zones(data));
+fetch("/api/zones/?group=" + teamGroup).then(response => response.json()).then(data => create_zones(data));
 fetch("/api/towers/").then(response => response.json()).then(data => create_towers(data));
-fetch("/api/teams/?category=" + teamCategory).then(response => response.json()).then(data => update_teams(data));
+fetch("/api/teams/?group=" + teamGroup).then(response => response.json()).then(data => update_teams(data));
 let teams_intervel = setInterval(function () {
-    fetch("/api/teams/?category=" + teamCategory).then(response => response.json()).then(data => update_teams(data));
-    fetch("/api/zones/?category=" + teamCategory).then(response => response.json()).then(data => create_zones(data));
+    fetch("/api/teams/?group=" + teamGroup).then(response => response.json()).then(data => update_teams(data));
+    fetch("/api/zones/?group=" + teamGroup).then(response => response.json()).then(data => create_zones(data));
 }, 5000);

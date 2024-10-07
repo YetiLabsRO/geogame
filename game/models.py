@@ -5,6 +5,8 @@ from django.db.models import Count, Max
 from datetime import datetime, timezone
 import math
 
+from organize.models import Team, Game, TeamGroup
+
 
 class Zone(models.Model):
     SCORE_LOG = 1
@@ -20,6 +22,8 @@ class Zone(models.Model):
     ]
 
     name = models.CharField(max_length=255)
+    game = models.ForeignKey("organize.Game", on_delete=models.CASCADE)
+
     color = ColorField(default="#000000", max_length=18)
     scoring_type = models.PositiveSmallIntegerField(choices=ZONE_SCORING_CHOICES)
     shape = models.PolygonField(null=True, blank=True)
@@ -27,8 +31,8 @@ class Zone(models.Model):
     def __str__(self):
         return self.name
 
-    def zone_control(self, category):
-        teams = self.teamzoneownership_set.filter(team__category=category, timestamp_end__isnull=True).values_list('team', flat=True)
+    def zone_control(self, group: TeamGroup):
+        teams = self.teamzoneownership_set.filter(group=group, timestamp_end__isnull=True).values_list('team', flat=True)
         # return Team.objects.filter(pk__in=teams)
         return teams
 
@@ -36,7 +40,7 @@ class Zone(models.Model):
         if not handover_time:
             handover_time = datetime.now(timezone.utc)
         try:
-            current_ownership = TeamZoneOwnership.objects.get(zone=self, timestamp_end__isnull=True, team__category=team.category)
+            current_ownership = TeamZoneOwnership.objects.get(zone=self, timestamp_end__isnull=True, team__group=team.group)
             current_ownership.timestamp_end = handover_time
             current_ownership.save()
             current_ownership.team.update_score(current_ownership.get_score())
@@ -81,6 +85,8 @@ class Tower(models.Model):
     ]
 
     name = models.CharField(max_length=255)
+    game = models.ForeignKey(Game, on_delete=models.CASCADE)
+
     location = models.PointField()
     zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True, blank=True)
     category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
@@ -92,6 +98,7 @@ class Tower(models.Model):
     autocreate_zone = models.BooleanField(default=False, verbose_name="Creează zonă", help_text="Creează o zonă nou, circulară, pentru acest turn")
 
     rfid_code = models.CharField(max_length=16, unique=True, null=True, blank=True)
+    order = models.PositiveIntegerField(null=True, blank=True, help_text="if the game requires any tower order, use this to order towers")
 
     def __init__(self, *args, **kwargs):
         super(Tower, self).__init__(*args, **kwargs)
@@ -117,12 +124,14 @@ class Tower(models.Model):
             #   recalculeaza ownership pentru situatia cu noul turn
             #   get current zone owners
             #   for each team type (separate controls)
-            for category in [choice[0] for choice in Team.CATEGORY_CHOICES]:
-                current_zone_control_teams = self.zone.zone_control(category=category)
+            for group in TeamGroup.objects.filter(game=self.zone.game):
+                current_zone_control_teams = self.zone.zone_control(group=group)
                 #   recalculate maximum number of towers owned in zone
-                team_stats = TeamTowerOwnership.objects.filter(tower__zone=self.zone, tower__is_active=True,
-                                                               timestamp_end__isnull=True, team__category=category)\
-                    .values('team').annotate(tower_count=Count('tower'))
+                team_stats = TeamTowerOwnership.objects.filter(
+                    tower__zone=self.zone,
+                    tower__is_active=True,
+                    timestamp_end__isnull=True,
+                    team__group=group).values('team').annotate(tower_count=Count('tower'))
 
                 if team_stats.count():
                     max_towers = max((stat['tower_count'] for stat in team_stats))
@@ -156,7 +165,7 @@ class Tower(models.Model):
         handover_time = datetime.now(timezone.utc)
         try:
             ownership = TeamTowerOwnership.objects.exclude(team=team)\
-                .get(tower=self, timestamp_end__isnull=True, team__category=team.category)
+                .get(tower=self, timestamp_end__isnull=True, team__group=team.group)
             ownership.timestamp_end = handover_time
             ownership.save()
         except TeamTowerOwnership.DoesNotExist:
@@ -174,11 +183,11 @@ class Tower(models.Model):
             #   figure out more
 
             #   get current zone owners
-            current_zone_control_teams = self.zone.zone_control(category=team.category)
+            current_zone_control_teams = self.zone.zone_control(group=team.group)
             #   recalculate maximum number of towers owned in zone
             team_stats = TeamTowerOwnership.objects\
                 .filter(tower__zone=self.zone, tower__is_active=True, timestamp_end__isnull=True,
-                        team__category=team.category)\
+                        team__group=team.group)\
                 .values('team').annotate(tower_count=Count('tower'))
 
             max_towers = max((stat['tower_count'] for stat in team_stats))
@@ -228,9 +237,9 @@ class Tower(models.Model):
         # Returning toughest challenge on repeat for now
         return Challenge.objects.filter(tower__isnull=True).order_by("-difficulty").first()
 
-    def tower_control(self, category):
+    def tower_control(self, group: TeamGroup):
         try:
-            return TeamTowerOwnership.objects.get(timestamp_end__isnull=True, tower=self, team__category=category).team
+            return TeamTowerOwnership.objects.get(timestamp_end__isnull=True, tower=self, team__group=group).team
         except TeamTowerOwnership.DoesNotExist:
             return None
 
@@ -243,7 +252,7 @@ class Tower(models.Model):
             return True
 
     def save(self, *args, **kwargs):
-        if self.id is None and self.autocreate_zone:
+        if self.zone is None and self.autocreate_zone:
             p = self.location
             p.transform(3857)
             circle = p.buffer(100)
@@ -259,41 +268,6 @@ class Tower(models.Model):
         super(Tower, self).save(*args, **kwargs)
         if self.__is_active != self.is_active and self.is_active is False:
             self.unassign()
-
-
-class Team(models.Model):
-    EXPLORATORI = 1
-    TEMERARI = 2
-    SENIORI = 3
-    CATEGORY_CHOICES = [
-        (EXPLORATORI, "eXplo"),
-        (TEMERARI, "Temerari"),
-        (SENIORI, "Seniori")
-    ]
-
-    name = models.CharField(max_length=255)
-    code = models.CharField(max_length=8, unique=True)
-    category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
-    color = ColorField()
-    description = models.TextField(null=True, blank=True)
-
-    score = models.PositiveIntegerField(default=0)
-
-    def __str__(self):
-        return self.name
-
-    def update_score(self, score):
-        self.score += score
-        self.save()
-
-    def floating_score(self, when=None):
-        floating_score_current = 0
-        for zone_ownership in self.teamzoneownership_set.filter(timestamp_end__isnull=True):
-            floating_score_current += zone_ownership.get_score(when=when)
-        return floating_score_current
-
-    def current_score(self):
-        return round(self.score + self.floating_score(), 2)
 
 
 class Challenge(models.Model):

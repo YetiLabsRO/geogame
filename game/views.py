@@ -10,7 +10,8 @@ from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 
 from game.forms import RFIDTowerForm
-from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge
+from game.models import Zone, Tower, Challenge, TeamTowerChallenge
+from organize.models import Team, TeamGroup
 from game.serializers import ZoneSerializer, TowerSerializer, TeamSerializer, ChallengeSerializer, \
     TeamTowerChallengeSerializer
 
@@ -25,7 +26,7 @@ class ZoneViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(ZoneViewSet, self).get_serializer_context()
-        context['category'] = self.request.query_params.get('category', 0)
+        context['group'] = self.request.query_params.get('group', 0)
         return context
 
 
@@ -76,25 +77,33 @@ class TeamTowerChallengeViewSet(viewsets.ModelViewSet):
 
 
 class MapView(TemplateView):
-    template_name = "geogame/map.html"
+    template_name = "game/map.html"
 
 
 class ScoreMapView(TemplateView):
-    template_name = "geogame/map_score.html"
+    template_name = "game/map_score.html"
+
+    def dispatch(self, request, *args, **kwargs):
+        try:
+            self.team_group = TeamGroup.objects.get(slug=kwargs.get("team_short"))
+        except TeamGroup.DoesNotExist:
+            self.team_group = None
+
+        return super().dispatch(request, *args, **kwargs)
 
     def get_context_data(self, **kwargs):
         context = super(ScoreMapView, self).get_context_data(**kwargs)
 
-        context['team_category'] = self.kwargs.get("category", Team.EXPLORATORI)
+        context['team_group'] = self.team_group
         return context
 
 
 class TowerChallengeView(TemplateView):
-    template_name = "geogame/tower_challenge.html"
+    template_name = "game/tower_challenge.html"
 
 
 class RFIDChallengeView(FormView):
-    template_name = "geogame/tower_rfid_error.html"
+    template_name = "game/tower_rfid_error.html"
     model = TeamTowerChallenge
     form_class = RFIDTowerForm
 
@@ -131,7 +140,7 @@ class RFIDTowerView(DetailView):
         context = super(RFIDTowerView, self).get_context_data(**kwargs)
         context['team'] = self.team
         if self.team:
-            context['tower_owner'] = self.object.tower_control(category=self.team.category)
+            context['tower_owner'] = self.object.tower_control(category=self.team.group)
             context['challenge'] = self.object.get_next_challenge(self.team)
             context['team_has_pending'] = self.object.team_pending(self.team)
             context['team_in_cooloff'] = self.object.team_in_cooloff(self.team)
@@ -184,7 +193,7 @@ class TowerDetailView(DetailView):
         context['lng'] = self.lng
         context['team'] = self.team
         if self.team:
-            context['tower_owner'] = self.object.tower_control(category=self.team.category)
+            context['tower_owner'] = self.object.tower_control(group=self.team.group)
             context['challenge'] = self.object.get_next_challenge(self.team)
             context['team_has_pending'] = self.object.team_pending(self.team)
             context['team_in_cooloff'] = self.object.team_in_cooloff(self.team)
@@ -192,7 +201,7 @@ class TowerDetailView(DetailView):
 
 
 class PendingChallenges(TemplateView):
-    template_name = "geogame/pending.html"
+    template_name = "game/pending.html"
 
     def get_context_data(self, **kwargs):
         context = super(PendingChallenges, self).get_context_data(**kwargs)
@@ -201,4 +210,4 @@ class PendingChallenges(TemplateView):
 
 
 class RulesView(TemplateView):
-    template_name = "geogame/rules.html"
+    template_name = "game/rules.html"

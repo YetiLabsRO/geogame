@@ -6,18 +6,19 @@ from leaflet.admin import LeafletGeoAdmin
 # Register your models here.
 from django.utils.safestring import mark_safe
 
-from game.models import Zone, Tower, Team, Challenge, TeamTowerChallenge, TeamTowerOwnership
+from game.models import Zone, Tower, Challenge, TeamTowerChallenge, TeamTowerOwnership
+from organize.models import Team, TeamGroup
 
 
 class ZoneAdmin(LeafletGeoAdmin):
     list_display = ['__str__', 'scoring_type', 'color', 'get_zone_control']
 
-    def get_zone_control(self, instance):
+    def get_zone_control(self, instance: Zone):
         output = "<ul>"
-        for option, title in Team.CATEGORY_CHOICES:
-            zone_control_teams = instance.zone_control(option)
+        for group in TeamGroup.objects.filter(game=instance.game):
+            zone_control_teams = instance.zone_control(group.id)
             zone_control_teams = Team.objects.filter(pk__in=zone_control_teams)
-            output += "<li>{}: {}</li>\n".format(title, ",".join([t.__str__() for t in zone_control_teams]))
+            output += "<li>{}: {}</li>\n".format(group.name, ",".join([t.__str__() for t in zone_control_teams]))
 
         output += "</ul>"
 
@@ -48,12 +49,12 @@ class TowerAdmin(LeafletGeoAdmin):
 
     def get_tower_control(self, instance):
         output = "<ul>"
-        for option, title in Team.CATEGORY_CHOICES:
+        for group in TeamGroup.objects.filter(game=instance.game):
             try:
-                t = TeamTowerOwnership.objects.get(tower=instance, timestamp_end__isnull=True, team__category=option).team
+                t = TeamTowerOwnership.objects.get(tower=instance, timestamp_end__isnull=True, team__group=group).team
             except TeamTowerOwnership.DoesNotExist:
                 t = "NOT CONTROLLED"
-            output += "<li>{}: {}</li>\n".format(title, t)
+            output += "<li>{}: {}</li>\n".format(group.name, t)
         output += "</ul>"
 
         return mark_safe(output)
@@ -70,8 +71,8 @@ class TowerAdmin(LeafletGeoAdmin):
 
 
 class TeamAdmin(admin.ModelAdmin):
-    list_display = ['__str__', 'category', 'score', 'floating_score', 'description']
-    list_filter = ['category']
+    list_display = ['__str__', 'group', 'score', 'floating_score', 'description']
+    list_filter = ['group', 'game']
     readonly_fields = ["score", ]
 
 

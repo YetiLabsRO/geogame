@@ -60,7 +60,7 @@
 <body>
     <div id = "map"></div>
     <div><button id="rules" href = "{% url 'rules' %}">Reguli</button></div>
-    <div data-team-category="{{ team_category }}" id = "category"></div>
+    <div data-team-group="{{ team_group }}" id = "team-group"></div>
     <div id = "scores">Scores</div>
     <div><button id="challenge">Turnuri în apropiere!</button></div>
 <script src="{% static 'js/map_control_score.js' %}"></script>

@@ -26,13 +26,13 @@ class Command(BaseCommand):
         Tower.objects.all().delete()
         Challenge.objects.all().delete()
 
-        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "geogame" / "data" / "zone_normal.kml"))
+        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "game" / "data" / "zone_normal.kml"))
         self.parse_zones(doc, 1)
 
-        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "geogame" / "data" / "zone_bonus.kml"))
+        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "game" / "data" / "zone_bonus.kml"))
         self.parse_zones(doc, 4)
 
-        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "geogame" / "data" / "puncte.kml"))
+        doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "game" / "data" / "puncte.kml"))
         points = doc.getElementsByTagName("Placemark")
         for point in points:
             point_name = point.getElementsByTagName("name")[0].firstChild.wholeText

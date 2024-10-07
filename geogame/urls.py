@@ -1,4 +1,4 @@
-"""cercetador URL Configuration
+"""geogame URL Configuration
 
 The `urlpatterns` list routes URLs to views. For more information please see:
     https://docs.djangoproject.com/en/3.1/topics/http/urls/
@@ -17,7 +17,7 @@ from django.contrib import admin
 from django.urls import path, include
 from rest_framework import routers
 
-from game.models import Team
+from organize.models import Team
 from game.views import ZoneViewSet, TowerViewSet, TeamViewSet, ChallengeViewSet, MapView, RFIDTowerView, \
     TowerChallengeView, ScoreMapView, TowerDetailView, TeamTowerChallengeViewSet, RFIDChallengeView, PendingChallenges, \
     RulesView
@@ -35,9 +35,7 @@ router.register(r'team_tower_challenges', TeamTowerChallengeViewSet)
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('', MapView.as_view()),
-    path('explo/', ScoreMapView.as_view(), {"category": Team.EXPLORATORI}, name="score-map-explo"),
-    path('temerari/', ScoreMapView.as_view(), {"category": Team.TEMERARI}, name="score-map-teme"),
-    path('seniori/', ScoreMapView.as_view(), {"category": Team.SENIORI}, name="score-map-seniori"),
+    path('map/<str:team_short>/', ScoreMapView.as_view(), name="score-map"),
     path('tower/<int:pk>/', TowerDetailView.as_view(), name='tower-detail'),
     path('tower/rfid-challenge/', RFIDChallengeView.as_view(), name='tower-rfid-challenge'),
     path('tower/rfid/<str:rfid_code>/', RFIDTowerView.as_view(), name='tower-rfid'),
@@ -45,7 +43,8 @@ urlpatterns = [
     path('pending/', PendingChallenges.as_view()),
     path('rules/', RulesView.as_view(), name="rules"),
     path('api/', include(router.urls)),
-    path('api-auth/', include('rest_framework.urls'))
+    path('api-auth/', include('rest_framework.urls')),
+    path('chaining/', include('smart_selects.urls')),
 
 ] + static(settings.STATIC_URL, document_root=settings.STATIC_ROOT) \
               + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
