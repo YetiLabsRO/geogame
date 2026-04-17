@@ -1,0 +1,18 @@
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = [
+    "*/migrations/*",
+    "cercetador/local_settings*.py",
+    "geogame/local_settings*.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I"]
+ignore = [
+    "E501",   # legacy files exceed 120 in places
+    "F403",   # `from .local_settings import *` is the project pattern
+    "F405",   # same
+    "E741",   # legacy single-letter variable names
+    "E117",   # over-indentation in legacy views
+]

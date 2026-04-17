@@ -1,0 +1,38 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(ls:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(cd:*)",
+      "Bash(cat:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git branch:*)",
+      "Bash(git fetch:*)",
+      "Bash(git pull:*)",
+      "Bash(git stash:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git checkout:*)",
+      "Bash(gh pr:*)",
+      "Bash(gh issue:*)",
+      "Bash(gh auth:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py test:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py migrate:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py makemigrations:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py showmigrations:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py shell:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python manage.py collectstatic:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/python -m:*)",
+      "Bash(/home/yeti/.virtualenvs/cercetador/bin/pip:*)",
+      "Bash(source .envrc)",
+      "Bash(source /home/yeti/.virtualenvs/cercetador/bin/activate)",
+      "Bash(curl -s http://localhost:8000/*)",
+      "Bash(curl -s http://127.0.0.1:8000/*)"
+    ]
+  }
+}

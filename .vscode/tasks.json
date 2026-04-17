@@ -1,0 +1,59 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Django: runserver",
+      "type": "shell",
+      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8000",
+      "options": {
+        "cwd": "${workspaceFolder}",
+        "env": {
+          "DJANGO_SETTINGS_MODULE": "geogame.settings"
+        }
+      },
+      "isBackground": true,
+      "problemMatcher": {
+        "owner": "django",
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*Watching for file changes.*|.*Performing system checks.*",
+          "endsPattern": ".*Quit the server with.*|.*Starting development server at.*"
+        }
+      }
+    },
+    {
+      "label": "Django: migrate",
+      "type": "shell",
+      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py migrate",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Django: makemigrations",
+      "type": "shell",
+      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py makemigrations",
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "Django: test",
+      "type": "shell",
+      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py test --verbosity=2 --noinput",
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "options": {
+        "cwd": "${workspaceFolder}"
+      },
+      "problemMatcher": []
+    }
+  ]
+}

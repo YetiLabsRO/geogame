@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from django.contrib.gis.db.models import PointField
 from django.db import models
 from django.db.models import ManyToManyField
-from smart_selects.db_fields import ChainedForeignKey, ChainedManyToManyField
+from smart_selects.db_fields import ChainedForeignKey
 
 
 class Player(models.Model):

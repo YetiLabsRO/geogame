@@ -8,8 +8,20 @@ __pycache__/
 venv/*
 .idea/*
 media/*
-
 .env
 .envrc
 dump*sql
 geogame/local_settings*.py
+cercetador/local_settings*
+
+# Claude Code — local/private state
+.claude/settings.local.json
+.claude/worktrees/
+
+# VS Code — user-local state (keep launch.json, settings.json, tasks.json tracked)
+.vscode/*.log
+
+# Test / coverage artifacts
+.coverage
+coverage.xml
+htmlcov/

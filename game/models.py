@@ -1,11 +1,12 @@
-from colorfield.fields import ColorField
-from django.contrib.gis.db import models
-from django.conf import settings
-from django.db.models import Count, Max
-from datetime import datetime, timezone
 import math
+from datetime import datetime, timezone
 
-from organize.models import Team, Game, TeamGroup
+from colorfield.fields import ColorField
+from django.conf import settings
+from django.contrib.gis.db import models
+from django.db.models import Count, Max
+
+from organize.models import Game, Team, TeamGroup
 
 
 class Zone(models.Model):
@@ -32,7 +33,7 @@ class Zone(models.Model):
         return self.name
 
     def zone_control(self, group: TeamGroup):
-        teams = self.teamzoneownership_set.filter(group=group, timestamp_end__isnull=True).values_list('team', flat=True)
+        teams = self.teamzoneownership_set.filter(team__group=group, timestamp_end__isnull=True).values_list('team', flat=True)
         # return Team.objects.filter(pk__in=teams)
         return teams
 

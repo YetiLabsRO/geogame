@@ -1,9 +1,9 @@
-from rest_framework import serializers
-
-from game.models import Zone, Tower, Challenge, TeamTowerChallenge
-from organize.models import Team
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
+from rest_framework import serializers
+
+from game.models import Challenge, TeamTowerChallenge, Tower, Zone
+from organize.models import Team
 
 
 class ZoneSerializer(serializers.HyperlinkedModelSerializer):
@@ -44,7 +44,7 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 class TeamSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Team
-        fields = ["name", "code", "category", "current_score", "color"]
+        fields = ["name", "code", "group", "current_score", "color"]
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
@@ -56,9 +56,10 @@ class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
 class Base64ImageField(serializers.ImageField):
 
     def to_internal_value(self, data):
-        from django.core.files.base import ContentFile
         import base64
         import uuid
+
+        from django.core.files.base import ContentFile
 
         if isinstance(data, str):
             if 'data:' in data and ';base64,' in data:
@@ -102,10 +103,13 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Trebuie un turn!")
 
         point = Point(attrs['lng'], attrs['lat'])
-        try:
-            Tower.objects.filter(pk=attrs['tower'].id, location__distance_lt=(point, Distance(m=50)))
-        except Tower.DoesNotExist:
-            raise serializers.ValidationError("Trebuie să fii la maxim 50 de metri de turn pentru a putea face provoarea!")
+        if not Tower.objects.filter(
+            pk=attrs['tower'].id,
+            location__distance_lte=(point, Distance(m=50)),
+        ).exists():
+            raise serializers.ValidationError(
+                "Trebuie să fii la maxim 50 de metri de turn pentru a putea face provoarea!",
+            )
 
         return attrs
 

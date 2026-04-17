@@ -1,0 +1,6 @@
+-r requirements.txt
+
+# Dev-only: interactive shell, test coverage, linter.
+ipython==8.28.0
+coverage>=7.6
+ruff>=0.9

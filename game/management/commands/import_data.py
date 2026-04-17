@@ -1,8 +1,9 @@
-from pathlib import Path
-from django.conf import settings
-from django.contrib.gis.geos import Polygon, Point
-from django.core.management.base import BaseCommand, CommandError
 import xml.dom.minidom
+
+from django.conf import settings
+from django.contrib.gis.geos import Point, Polygon
+from django.core.management.base import BaseCommand
+
 from game.models import *
 
 
@@ -19,7 +20,7 @@ class Command(BaseCommand):
             for line in zone_data.split("\n"):
                 point_data = line.strip().split(",")
                 poly_data.append((float(point_data[0]), float(point_data[1])))
-            z = Zone.objects.create(name=zone_name, shape=Polygon(poly_data), color="000000", scoring_type=zone_type)
+            Zone.objects.create(name=zone_name, shape=Polygon(poly_data), color="000000", scoring_type=zone_type)
 
     def handle(self, *args, **options):
         Zone.objects.all().delete()

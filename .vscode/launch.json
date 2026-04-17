@@ -1,0 +1,86 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Django (runserver)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/manage.py",
+      "args": ["runserver", "8000"],
+      "django": true,
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Django (no reload)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/manage.py",
+      "args": ["runserver", "8000", "--noreload"],
+      "django": true,
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": true
+    },
+    {
+      "name": "Django: Tests",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/manage.py",
+      "args": ["test", "--verbosity=2", "--noinput"],
+      "django": true,
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Django: Tests (game)",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/manage.py",
+      "args": ["test", "game", "--verbosity=2", "--noinput"],
+      "django": true,
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Django: shell",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/manage.py",
+      "args": ["shell"],
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Django: Current file",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${file}",
+      "env": {
+        "DJANGO_SETTINGS_MODULE": "geogame.settings"
+      },
+      "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    }
+  ]
+}

@@ -1,8 +1,8 @@
 from django import forms
-from django.core.exceptions import ValidationError
-
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
+from django.core.exceptions import ValidationError
+
 from game.models import TeamTowerChallenge, Tower
 from organize.models import Team
 

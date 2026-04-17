@@ -1,0 +1,17 @@
+[run]
+source = game,organize
+omit =
+    */migrations/*
+    */tests.py
+    */management/commands/*
+branch = True
+
+[report]
+exclude_lines =
+    pragma: no cover
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    def __repr__
+    def __str__
+show_missing = True
+skip_covered = False

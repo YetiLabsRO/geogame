@@ -1,12 +1,12 @@
+from django.conf import settings
 from django.contrib import admin, messages
 from django.urls import reverse
-from django.conf import settings
-from leaflet.admin import LeafletGeoAdmin
 
 # Register your models here.
 from django.utils.safestring import mark_safe
+from leaflet.admin import LeafletGeoAdmin
 
-from game.models import Zone, Tower, Challenge, TeamTowerChallenge, TeamTowerOwnership
+from game.models import Challenge, TeamTowerChallenge, TeamTowerOwnership, Tower, Zone
 from organize.models import Team, TeamGroup
 
 

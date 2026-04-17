@@ -1,19 +1,22 @@
-from django.db.models import Count, Q
-from django.http import HttpResponseBadRequest, Http404, HttpResponseRedirect
-from django.shortcuts import render
-from django.urls import reverse
-from django.views.generic import TemplateView, DetailView, FormView
-from rest_framework import viewsets
-from rest_framework import permissions
-from rest_framework.status import HTTP_400_BAD_REQUEST
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
+from django.db import OperationalError, connection
+from django.db.models import Count, Q
+from django.http import Http404, HttpResponseBadRequest, HttpResponseRedirect, JsonResponse
+from django.urls import reverse
+from django.views.generic import DetailView, FormView, TemplateView
+from rest_framework import permissions, viewsets
 
 from game.forms import RFIDTowerForm
-from game.models import Zone, Tower, Challenge, TeamTowerChallenge
+from game.models import Challenge, TeamTowerChallenge, Tower, Zone
+from game.serializers import (
+    ChallengeSerializer,
+    TeamSerializer,
+    TeamTowerChallengeSerializer,
+    TowerSerializer,
+    ZoneSerializer,
+)
 from organize.models import Team, TeamGroup
-from game.serializers import ZoneSerializer, TowerSerializer, TeamSerializer, ChallengeSerializer, \
-    TeamTowerChallengeSerializer
 
 
 class ZoneViewSet(viewsets.ModelViewSet):
@@ -122,7 +125,7 @@ class RFIDChallengeView(FormView):
 
 
 class RFIDTowerView(DetailView):
-    template_name = "geogame/tower_rfid.html"
+    template_name = "game/tower_rfid.html"
     model = Tower
 
     def dispatch(self, request, *args, **kwargs):
@@ -134,13 +137,16 @@ class RFIDTowerView(DetailView):
         return super(RFIDTowerView, self).dispatch(request, *args, **kwargs)
 
     def get_object(self, queryset=None):
-        return Tower.objects.get(is_active=True, category=Tower.CATEGORY_RFID, rfid_code=self.kwargs.get("rfid_code"))
+        try:
+            return Tower.objects.get(is_active=True, category=Tower.CATEGORY_RFID, rfid_code=self.kwargs.get("rfid_code"))
+        except Tower.DoesNotExist as exc:
+            raise Http404("Turn RFID necunoscut") from exc
 
     def get_context_data(self, **kwargs):
         context = super(RFIDTowerView, self).get_context_data(**kwargs)
         context['team'] = self.team
         if self.team:
-            context['tower_owner'] = self.object.tower_control(category=self.team.group)
+            context['tower_owner'] = self.object.tower_control(group=self.team.group)
             context['challenge'] = self.object.get_next_challenge(self.team)
             context['team_has_pending'] = self.object.team_pending(self.team)
             context['team_in_cooloff'] = self.object.team_in_cooloff(self.team)
@@ -211,3 +217,13 @@ class PendingChallenges(TemplateView):
 
 class RulesView(TemplateView):
     template_name = "game/rules.html"
+
+
+def health(request):
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SELECT 1")
+            cursor.fetchone()
+    except OperationalError:
+        return JsonResponse({"status": "error", "database": "unreachable"}, status=503)
+    return JsonResponse({"status": "ok"})
