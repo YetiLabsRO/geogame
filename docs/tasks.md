@@ -96,8 +96,8 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2C.1: Login, register, password-reset, and invite-accept landing screens. (Plan: P2C.1, Req: 13.1, 14.2)
 - [x] T2C.2: Main Leaflet map view with zones + active towers, category-colored. (Plan: P2C.2, Req: 15.1)
 - [x] T2C.3: Tower detail page with live GPS distance, cooloff countdown, challenge submit form with photo capture. (Plan: P2C.3, Req: 15.1, 15.2, 15.3)
-- [ ] T2C.4: Per-TeamGroup score map view at `/map/<slug>/` (dynamic on TeamGroup.slug). (Plan: P2C.4, Req: 15.1)
-- [ ] T2C.5: Rules page. (Plan: P2C.5)
+- [x] T2C.4: Per-TeamGroup score map view at `/map/<slug>/` (dynamic on TeamGroup.slug). (Plan: P2C.4, Req: 15.1)
+- [x] T2C.5: Rules page. (Plan: P2C.5)
 
 ## Phase 2D: Accounts & Invites Backend
 - [x] T2D.1: Add `UserProfile`, `TeamMembership`, `Invite` models with migrations. (Plan: P2D.1, Req: 13.1, 14.1)

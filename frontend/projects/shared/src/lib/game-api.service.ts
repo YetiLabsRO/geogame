@@ -75,8 +75,11 @@ export class GameApiService {
     return this.http.get<CurrentGame>('/api/current-game/');
   }
 
-  zones(params?: { group?: number }): Observable<ZoneFeature[]> {
-    const query = params?.group ? `?group=${params.group}` : '';
+  zones(params?: { group?: number; groupSlug?: string }): Observable<ZoneFeature[]> {
+    const parts: string[] = [];
+    if (params?.group) parts.push(`group=${params.group}`);
+    if (params?.groupSlug) parts.push(`group_slug=${encodeURIComponent(params.groupSlug)}`);
+    const query = parts.length ? `?${parts.join('&')}` : '';
     return this.http.get<ZoneFeature[]>(`/api/zones/${query}`);
   }
 

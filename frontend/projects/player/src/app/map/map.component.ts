@@ -4,10 +4,12 @@ import {
   Component,
   DestroyRef,
   ElementRef,
+  computed,
   inject,
   signal,
   viewChild,
 } from '@angular/core';
+import { ActivatedRoute } from '@angular/router';
 import { forkJoin } from 'rxjs';
 import * as L from 'leaflet';
 
@@ -22,6 +24,12 @@ const FALLBACK_ZOOM = 17;
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="map-wrapper">
+      @if (groupSlug()) {
+        <div class="score-badge">
+          <i class="bi bi-flag-fill"></i>
+          Score map · {{ groupSlug() }}
+        </div>
+      }
       <div class="map" #mapContainer></div>
       @if (errorMessage(); as msg) {
         <div class="alert alert-warning map-error">{{ msg }}</div>
@@ -42,12 +50,25 @@ const FALLBACK_ZOOM = 17;
       width: 100%;
       border-radius: 0.375rem;
     }
-    .map-error {
+    .map-error,
+    .score-badge {
       position: absolute;
+      z-index: 1000;
+    }
+    .score-badge {
+      top: 0.75rem;
+      right: 0.75rem;
+      background: rgba(255, 255, 255, 0.92);
+      border: 1px solid rgba(0, 0, 0, 0.1);
+      border-radius: 999px;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.875rem;
+      font-weight: 500;
+    }
+    .map-error {
       top: 1rem;
       left: 1rem;
       right: 1rem;
-      z-index: 1000;
       margin: 0;
     }
   `,
@@ -55,9 +76,13 @@ const FALLBACK_ZOOM = 17;
 export class MapComponent {
   private readonly api = inject(GameApiService);
   private readonly destroyRef = inject(DestroyRef);
+  private readonly route = inject(ActivatedRoute);
 
   protected readonly mapContainer = viewChild.required<ElementRef<HTMLDivElement>>('mapContainer');
   protected readonly errorMessage = signal<string | null>(null);
+  protected readonly groupSlug = computed(
+    () => this.route.snapshot.paramMap.get('slug') ?? null,
+  );
 
   private map: L.Map | null = null;
 
@@ -74,9 +99,10 @@ export class MapComponent {
         '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(this.map);
 
+    const slug = this.groupSlug();
     forkJoin({
       game: this.api.currentGame(),
-      zones: this.api.zones(),
+      zones: this.api.zones(slug ? { groupSlug: slug } : undefined),
       towers: this.api.towers(),
     }).subscribe({
       next: ({ game, zones, towers }) => {
@@ -84,7 +110,7 @@ export class MapComponent {
           const [lng, lat] = game.base_point.coordinates;
           this.map?.setView([lat, lng], game.base_zoom_level || FALLBACK_ZOOM);
         }
-        this.renderZones(zones);
+        this.renderZones(zones, slug !== null);
         this.renderTowers(towers);
       },
       error: () => {
@@ -93,12 +119,19 @@ export class MapComponent {
     });
   }
 
-  private renderZones(zones: ZoneFeature[]): void {
+  private renderZones(zones: ZoneFeature[], scoreMode: boolean): void {
     if (!this.map) return;
     for (const zone of zones) {
       if (!zone.shape) continue;
+      const fill = scoreMode ? zone.team_color : zone.color;
+      const unheld = scoreMode && (fill === '#000000' || fill === '#FFFFFF');
       L.geoJSON(zone.shape, {
-        style: { color: zone.color, weight: 2, fillOpacity: 0.15 },
+        style: {
+          color: fill,
+          weight: 2,
+          fillColor: fill,
+          fillOpacity: unheld ? 0.05 : scoreMode ? 0.35 : 0.15,
+        },
       })
         .bindTooltip(zone.name)
         .addTo(this.map);

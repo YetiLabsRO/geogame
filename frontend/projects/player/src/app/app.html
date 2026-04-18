@@ -1,6 +1,7 @@
 <nav class="navbar navbar-expand-sm bg-body-tertiary border-bottom">
   <div class="container-fluid">
     <a class="navbar-brand fw-semibold" routerLink="/">Cercetador</a>
+    <a class="nav-link small" routerLink="/rules">Rules</a>
     <div class="ms-auto d-flex align-items-center gap-2">
       @if (isAuthenticated()) {
         @if (username(); as name) {

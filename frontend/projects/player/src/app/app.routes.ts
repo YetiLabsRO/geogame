@@ -16,6 +16,15 @@ export const routes: Routes = [
       import('./tower/tower-detail.component').then((m) => m.TowerDetailComponent),
   },
   {
+    path: 'map/:slug',
+    canActivate: [authGuard],
+    loadComponent: () => import('./map/map.component').then((m) => m.MapComponent),
+  },
+  {
+    path: 'rules',
+    loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },
