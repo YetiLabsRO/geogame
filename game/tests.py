@@ -652,6 +652,20 @@ class APIEndpointsTest(TestCase):
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.json()), 1)
 
+    def test_zones_endpoint_accepts_group_slug(self):
+        self.tower.assign_to_team(self.team)
+        by_id = self.client.get("/api/zones/", {"group": self.group.id})
+        by_slug = self.client.get("/api/zones/", {"group_slug": self.group.slug})
+        self.assertEqual(by_id.status_code, 200)
+        self.assertEqual(by_slug.status_code, 200)
+        self.assertEqual(by_id.json()[0]["team_color"], self.team.color)
+        self.assertEqual(by_slug.json()[0]["team_color"], self.team.color)
+
+    def test_zones_endpoint_unknown_group_slug_falls_back_to_default(self):
+        resp = self.client.get("/api/zones/", {"group_slug": "nope"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()[0]["team_color"], "#000000")
+
     def test_towers_endpoint_excludes_inactive_and_rfid(self):
         resp = self.client.get("/api/towers/")
         self.assertEqual(resp.status_code, 200)

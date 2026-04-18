@@ -27,7 +27,12 @@ class ZoneViewSet(viewsets.ModelViewSet):
 
     def get_serializer_context(self):
         context = super(ZoneViewSet, self).get_serializer_context()
-        context['group'] = self.request.query_params.get('group', 0)
+        group_id = self.request.query_params.get('group')
+        group_slug = self.request.query_params.get('group_slug')
+        if not group_id and group_slug:
+            group = TeamGroup.objects.filter(slug=group_slug).first()
+            group_id = group.id if group else 0
+        context['group'] = group_id or 0
         return context
 
 
