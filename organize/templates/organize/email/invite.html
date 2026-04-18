@@ -1,0 +1,37 @@
+{% load tz %}<!DOCTYPE html>
+<html>
+<body style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; color: #222; max-width: 560px; margin: 0 auto; padding: 24px;">
+  <h2 style="color: #1a1a1a; margin-top: 0;">Ești invitat în echipa {{ team_name }}</h2>
+
+  <p>Salut{% if invitee_name %} <strong>{{ invitee_name }}</strong>{% endif %},</p>
+
+  <p>
+    Ai fost invitat să te alături echipei <strong>{{ team_name }}</strong>{% if team_group %}
+    (<em>{{ team_group }}</em>){% endif %} în jocul <em>cercetador</em>.
+    {% if inviter_name %}{{ inviter_name }}{% else %}Un organizator{% endif %} te așteaptă!
+  </p>
+
+  <p style="margin: 28px 0;">
+    <a href="{{ accept_url }}"
+       style="background: #2563eb; color: #fff; padding: 12px 20px; border-radius: 6px;
+              text-decoration: none; font-weight: 600; display: inline-block;">
+      Acceptă invitația
+    </a>
+  </p>
+
+  <p style="color: #666; font-size: 14px;">
+    Sau copiază acest link în browser:<br>
+    <a href="{{ accept_url }}" style="color: #2563eb; word-break: break-all;">{{ accept_url }}</a>
+  </p>
+
+  <p style="color: #666; font-size: 14px;">
+    Invitația expiră la {{ expires_at|date:"d M Y, H:i" }} (UTC).
+  </p>
+
+  <hr style="border: none; border-top: 1px solid #eee; margin: 32px 0 16px;">
+  <p style="color: #999; font-size: 12px;">
+    Dacă nu ai așteptat această invitație, poți ignora acest email.<br>
+    — echipa cercetador
+  </p>
+</body>
+</html>

@@ -1,0 +1,15 @@
+{% load tz %}Salut{% if invitee_name %} {{ invitee_name }}{% endif %}!
+
+Ai fost invitat să te alături echipei {{ team_name }}{% if team_group %} ({{ team_group }}){% endif %} în jocul cercetador.
+
+{% if inviter_name %}{{ inviter_name }}{% else %}Un organizator{% endif %} te așteaptă!
+
+Accesează linkul de mai jos pentru a accepta invitația:
+
+  {{ accept_url }}
+
+Invitația expiră la {{ expires_at|date:"d M Y, H:i" }} (UTC).
+
+Dacă nu ai așteptat această invitație, poți ignora acest email.
+
+— echipa cercetador

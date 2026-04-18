@@ -82,6 +82,16 @@ DB_PASSWORD=REPLACE_ME
 DB_HOST=127.0.0.1
 DB_PORT=5432
 BASE_URL=https://cercetador.albascout.ro
+
+# Email — Gmail SMTP for production. The account sending the email must have
+# 2FA enabled and use an app password (https://myaccount.google.com/apppasswords).
+EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
+EMAIL_HOST=smtp.gmail.com
+EMAIL_PORT=587
+EMAIL_USE_TLS=True
+EMAIL_HOST_USER=invites@cercetador.albascout.ro
+EMAIL_HOST_PASSWORD=xxxx xxxx xxxx xxxx
+DEFAULT_FROM_EMAIL=cercetador <invites@cercetador.albascout.ro>
 ENV
 sudo chown root:ubuntu /etc/cercetador.env
 sudo chmod 640 /etc/cercetador.env

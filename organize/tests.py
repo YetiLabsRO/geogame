@@ -257,6 +257,195 @@ class MyTeamEndpointTest(TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class CurrentGameTest(TestCase):
+    url = reverse('api-current-game')
+
+    def test_returns_active_game(self):
+        now = timezone.now()
+        Game.objects.create(
+            name='Inactive', is_active=False,
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        active = Game.objects.create(
+            name='Live', is_active=True,
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], active.id)
+        self.assertEqual(resp.json()['name'], 'Live')
+
+    def test_returns_404_when_no_active_game(self):
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_post_is_accepted_but_stubbed(self):
+        active = _make_game()
+        active.is_active = True
+        active.save()
+        resp = self.client.post(self.url, {'game_id': active.id}, content_type='application/json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], active.id)
+
+
+class InviteAPITest(TestCase):
+    def setUp(self):
+        self.staff = User.objects.create_user(
+            username='admin', email='a@x.com', password='password123', is_staff=True,
+        )
+        self.staff_token = Token.objects.create(user=self.staff)
+        self.staff_client = APIClient()
+        self.staff_client.credentials(HTTP_AUTHORIZATION=f'Token {self.staff_token.key}')
+
+        self.game = _make_game()
+        self.team = _make_team(self.game)
+
+    def _create_invite(self, **overrides):
+        defaults = {
+            'team': self.team,
+            'email': 'new@example.com',
+            'created_by': self.staff,
+        }
+        defaults.update(overrides)
+        return Invite.objects.create(**defaults)
+
+    def test_create_invite_sends_email(self):
+        resp = self.staff_client.post(reverse('api-invites'), {
+            'team': self.team.id,
+            'email': 'scout@example.com',
+        }, content_type='application/json')
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(len(mail.outbox), 1)
+        self.assertIn('scout@example.com', mail.outbox[0].to)
+        self.assertIn(self.team.name, mail.outbox[0].subject)
+
+    def test_create_invite_without_email_sends_nothing(self):
+        resp = self.staff_client.post(reverse('api-invites'), {
+            'team': self.team.id,
+        }, content_type='application/json')
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(len(mail.outbox), 0)
+
+    def test_create_invite_requires_staff(self):
+        regular = User.objects.create_user(username='r', email='r@x.com', password='password123')
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=regular).key}')
+        resp = client.post(reverse('api-invites'), {
+            'team': self.team.id, 'email': 'x@y.com',
+        }, content_type='application/json')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_list_invites_filters_by_status(self):
+        pending = self._create_invite()
+        self._create_invite(email='rev@x.com', revoked=True)
+        self._create_invite(
+            email='exp@x.com', expires_at=timezone.now() - timedelta(days=1),
+        )
+        resp = self.staff_client.get(reverse('api-invites') + '?status=pending')
+        self.assertEqual(resp.status_code, 200)
+        ids = [i['id'] for i in resp.json()]
+        self.assertEqual(ids, [pending.id])
+
+    def test_preview_returns_team_info(self):
+        invite = self._create_invite()
+        resp = self.client.get(reverse('api-invite-preview', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['team_name'], self.team.name)
+
+    def test_preview_410_for_expired(self):
+        invite = self._create_invite(expires_at=timezone.now() - timedelta(days=1))
+        resp = self.client.get(reverse('api-invite-preview', args=[invite.token]))
+        self.assertEqual(resp.status_code, 410)
+
+    def test_preview_410_for_revoked(self):
+        invite = self._create_invite(revoked=True)
+        resp = self.client.get(reverse('api-invite-preview', args=[invite.token]))
+        self.assertEqual(resp.status_code, 410)
+
+    def test_accept_as_anon_creates_user_and_joins_team(self):
+        invite = self._create_invite()
+        resp = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {
+                'username': 'rookie', 'email': 'rookie@x.com',
+                'password': 'password12345', 'first_name': 'R',
+            },
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn('token', resp.json())
+        user = User.objects.get(username='rookie')
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=self.team, user=user.profile, is_active=True,
+            ).exists()
+        )
+        invite.refresh_from_db()
+        self.assertEqual(invite.accepted_by, user)
+        self.assertIsNotNone(invite.accepted_at)
+
+    def test_accept_as_authenticated_user_skips_registration(self):
+        existing = User.objects.create_user(
+            username='scout', email='s@x.com', password='password123',
+        )
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=existing).key}')
+        invite = self._create_invite()
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['team_id'], self.team.id)
+
+    def test_accept_twice_returns_410(self):
+        invite = self._create_invite()
+        self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'a', 'email': 'a@a.com', 'password': 'password12345'},
+            content_type='application/json',
+        )
+        resp = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'b', 'email': 'b@b.com', 'password': 'password12345'},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 410)
+
+    def test_accept_expired_returns_410(self):
+        invite = self._create_invite(expires_at=timezone.now() - timedelta(days=1))
+        resp = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'x', 'email': 'x@x.com', 'password': 'password12345'},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 410)
+
+    def test_accept_anon_missing_fields_rejected(self):
+        invite = self._create_invite()
+        resp = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'x'},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_delete_invite_marks_revoked(self):
+        invite = self._create_invite()
+        resp = self.staff_client.delete(reverse('api-invite-destroy', args=[invite.id]))
+        self.assertEqual(resp.status_code, 204)
+        invite.refresh_from_db()
+        self.assertTrue(invite.revoked)
+
+    def test_resend_sends_new_email(self):
+        invite = self._create_invite()
+        resp = self.staff_client.post(reverse('api-invite-resend', args=[invite.id]))
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_resend_410_on_expired(self):
+        invite = self._create_invite(expires_at=timezone.now() - timedelta(days=1))
+        resp = self.staff_client.post(reverse('api-invite-resend', args=[invite.id]))
+        self.assertEqual(resp.status_code, 410)
+
+
 class InviteModelTest(TestCase):
     def setUp(self):
         self.game = _make_game()

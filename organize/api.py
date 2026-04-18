@@ -2,16 +2,20 @@ from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
+from django.db import transaction
+from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
 from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
-from rest_framework import serializers, status
+from rest_framework import generics, serializers, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from organize.models import TeamMembership
+from organize.emails import send_invite_email
+from organize.models import Game, Invite, TeamMembership
 
 User = get_user_model()
 
@@ -223,3 +227,205 @@ class MyTeamView(APIView):
                 {'detail': 'You are not a member of any team.'}, status=status.HTTP_404_NOT_FOUND,
             )
         return Response(MyTeamSerializer(membership.team).data)
+
+
+class GameStubSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    name = serializers.CharField()
+    is_active = serializers.BooleanField()
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+
+
+class CurrentGameView(APIView):
+    """Stub for Phase 2. Returns the single active game.
+
+    In Phase 3, POST will persist `current_game` on the user's profile and
+    the returned game will be per-user. Today, the frontend should treat the
+    shape of the response as stable but ignore any POST side-effects.
+    """
+    permission_classes = [AllowAny]
+
+    def get(self, request):
+        game = Game.objects.filter(is_active=True).order_by('-start_time').first()
+        if game is None:
+            return Response(
+                {'detail': 'No active game.'}, status=status.HTTP_404_NOT_FOUND,
+            )
+        return Response(GameStubSerializer(game).data)
+
+    def post(self, request):
+        # Stubbed: Phase 3 will store request.data['game_id'] on the profile.
+        return self.get(request)
+
+
+# ---------- Invites ----------
+
+class InviteSerializer(serializers.ModelSerializer):
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    created_by_username = serializers.CharField(source='created_by.username', read_only=True, default=None)
+    status = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Invite
+        fields = (
+            'id', 'token', 'team', 'team_name', 'email',
+            'created_by', 'created_by_username', 'created_at',
+            'expires_at', 'accepted_by', 'accepted_at', 'revoked', 'status',
+        )
+        read_only_fields = ('token', 'created_by', 'created_at', 'accepted_by', 'accepted_at', 'revoked')
+
+    def get_status(self, invite):
+        if invite.revoked:
+            return 'revoked'
+        if invite.accepted_at is not None:
+            return 'accepted'
+        if invite.expires_at <= timezone.now():
+            return 'expired'
+        return 'pending'
+
+
+class InvitePreviewSerializer(serializers.Serializer):
+    team_name = serializers.CharField()
+    team_group = serializers.CharField(allow_blank=True)
+    expires_at = serializers.DateTimeField()
+
+
+class InviteAcceptSerializer(serializers.Serializer):
+    # Only used when accepting as a new user. Authenticated users skip these.
+    username = serializers.CharField(max_length=150, required=False)
+    email = serializers.EmailField(required=False)
+    password = serializers.CharField(write_only=True, min_length=8, required=False)
+    first_name = serializers.CharField(required=False, allow_blank=True)
+    last_name = serializers.CharField(required=False, allow_blank=True)
+
+
+class InviteListCreate(generics.ListCreateAPIView):
+    serializer_class = InviteSerializer
+    permission_classes = [IsAdminUser]
+    queryset = Invite.objects.select_related('team', 'created_by', 'accepted_by')
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        status_filter = self.request.query_params.get('status')
+        now = timezone.now()
+        if status_filter == 'pending':
+            qs = qs.filter(revoked=False, accepted_at__isnull=True, expires_at__gt=now)
+        elif status_filter == 'accepted':
+            qs = qs.filter(accepted_at__isnull=False)
+        elif status_filter == 'revoked':
+            qs = qs.filter(revoked=True)
+        elif status_filter == 'expired':
+            qs = qs.filter(revoked=False, accepted_at__isnull=True, expires_at__lte=now)
+        return qs
+
+    def perform_create(self, serializer):
+        invite = serializer.save(created_by=self.request.user)
+        if invite.email:
+            send_invite_email(invite)
+
+
+class InviteDestroy(generics.DestroyAPIView):
+    """Revoke a pending invite (soft-delete via revoked=True)."""
+    permission_classes = [IsAdminUser]
+    queryset = Invite.objects.all()
+
+    def perform_destroy(self, invite):
+        invite.revoked = True
+        invite.save(update_fields=['revoked'])
+
+
+@api_view(['POST'])
+@permission_classes([IsAdminUser])
+def invite_resend(request, pk):
+    invite = get_object_or_404(Invite, pk=pk)
+    if not invite.is_usable():
+        return Response(
+            {'detail': 'Invite is not in a resendable state.'},
+            status=status.HTTP_410_GONE,
+        )
+    if not invite.email:
+        return Response(
+            {'detail': 'Invite has no email address to resend to.'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    send_invite_email(invite)
+    return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def invite_preview(request, token):
+    invite = get_object_or_404(Invite, token=token)
+    if not invite.is_usable():
+        return Response(
+            {'detail': 'Invite is no longer usable.'}, status=status.HTTP_410_GONE,
+        )
+    data = {
+        'team_name': invite.team.name,
+        'team_group': invite.team.group.name if invite.team.group else '',
+        'expires_at': invite.expires_at,
+    }
+    return Response(InvitePreviewSerializer(data).data)
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+@transaction.atomic
+def invite_accept(request, token):
+    invite = (
+        Invite.objects
+        .select_for_update()
+        .select_related('team')
+        .filter(token=token)
+        .first()
+    )
+    if invite is None:
+        return Response({'detail': 'Invite not found.'}, status=status.HTTP_404_NOT_FOUND)
+    if not invite.is_usable():
+        return Response({'detail': 'Invite is no longer usable.'}, status=status.HTTP_410_GONE)
+
+    if request.user.is_authenticated:
+        user = request.user
+    else:
+        serializer = InviteAcceptSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+        required = ('username', 'email', 'password')
+        missing = [f for f in required if not data.get(f)]
+        if missing:
+            return Response(
+                {'detail': f'Missing required fields: {", ".join(missing)}.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if User.objects.filter(username__iexact=data['username']).exists():
+            return Response(
+                {'detail': 'Username already taken.'}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        if User.objects.filter(email__iexact=data['email']).exists():
+            return Response(
+                {'detail': 'Email already registered.'}, status=status.HTTP_400_BAD_REQUEST,
+            )
+        user = User.objects.create_user(
+            username=data['username'],
+            email=data['email'],
+            password=data['password'],
+            first_name=data.get('first_name', ''),
+            last_name=data.get('last_name', ''),
+        )
+
+    membership, _ = TeamMembership.objects.get_or_create(
+        team=invite.team, user=user.profile, is_active=True,
+    )
+    invite.accepted_by = user
+    invite.accepted_at = timezone.now()
+    invite.save(update_fields=['accepted_by', 'accepted_at'])
+
+    token_obj, _ = Token.objects.get_or_create(user=user)
+    return Response({
+        'token': token_obj.key,
+        'user_id': user.id,
+        'username': user.username,
+        'team_id': invite.team.id,
+        'team_name': invite.team.name,
+    })

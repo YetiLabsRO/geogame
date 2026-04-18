@@ -10,4 +10,10 @@ urlpatterns = [
     path('auth/password-reset/confirm/', api.password_reset_confirm, name='api-password-reset-confirm'),
     path('me/', api.MeView.as_view(), name='api-me'),
     path('my-team/', api.MyTeamView.as_view(), name='api-my-team'),
+    path('current-game/', api.CurrentGameView.as_view(), name='api-current-game'),
+    path('invites/', api.InviteListCreate.as_view(), name='api-invites'),
+    path('invites/accept/<uuid:token>/', api.invite_accept, name='api-invite-accept'),
+    path('invites/<uuid:token>/', api.invite_preview, name='api-invite-preview'),
+    path('invites/<int:pk>/', api.InviteDestroy.as_view(), name='api-invite-destroy'),
+    path('invites/<int:pk>/resend/', api.invite_resend, name='api-invite-resend'),
 ]
