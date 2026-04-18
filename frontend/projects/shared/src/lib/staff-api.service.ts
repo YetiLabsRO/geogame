@@ -60,6 +60,13 @@ export interface AdminTeamGroup {
   slug: string;
 }
 
+export interface AdminChallenge {
+  id: number;
+  text: string;
+  tower: number | null;
+  difficulty: number;
+}
+
 @Injectable({ providedIn: 'root' })
 export class StaffApiService {
   private readonly http = inject(HttpClient);
@@ -121,5 +128,21 @@ export class StaffApiService {
 
   listTeamGroups(): Observable<AdminTeamGroup[]> {
     return this.http.get<AdminTeamGroup[]>('/api/staff/team-groups/');
+  }
+
+  listChallenges(): Observable<AdminChallenge[]> {
+    return this.http.get<AdminChallenge[]>('/api/staff/challenges/');
+  }
+
+  createChallenge(payload: Omit<AdminChallenge, 'id'>): Observable<AdminChallenge> {
+    return this.http.post<AdminChallenge>('/api/staff/challenges/', payload);
+  }
+
+  updateChallenge(id: number, patch: Partial<AdminChallenge>): Observable<AdminChallenge> {
+    return this.http.patch<AdminChallenge>(`/api/staff/challenges/${id}/`, patch);
+  }
+
+  deleteChallenge(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/challenges/${id}/`);
   }
 }

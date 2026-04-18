@@ -20,6 +20,7 @@ from django.urls import include, path
 from rest_framework import routers
 
 from game.admin_api import (
+    AdminChallengeViewSet,
     AdminTeamGroupList,
     AdminTeamViewSet,
     AdminTowerViewSet,
@@ -56,6 +57,9 @@ admin_router.register(r'towers', AdminTowerViewSet, basename='admin-tower')
 admin_router.register(r'teams', AdminTeamViewSet, basename='admin-team')
 admin_router.register(
     r'team-groups', AdminTeamGroupList, basename='admin-team-group',
+)
+admin_router.register(
+    r'challenges', AdminChallengeViewSet, basename='admin-challenge',
 )
 
 urlpatterns = [

@@ -1009,6 +1009,41 @@ class StaffAdminEndpointsTest(TestCase):
         self.assertEqual(len(resp.json()), 1)
         self.assertEqual(resp.json()[0]['slug'], self.group.slug)
 
+    def test_challenge_crud(self):
+        # Create
+        resp = self.staff_client.post(
+            '/api/staff/challenges/',
+            {'text': 'Do a thing', 'tower': self.tower.id, 'difficulty': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        challenge_id = resp.json()['id']
+
+        # List
+        resp = self.staff_client.get('/api/staff/challenges/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 1)
+
+        # Patch (promote to generic by clearing tower)
+        resp = self.staff_client.patch(
+            f'/api/staff/challenges/{challenge_id}/',
+            {'tower': None, 'difficulty': 3},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.json()['tower'])
+        self.assertEqual(resp.json()['difficulty'], 3)
+
+        # Delete
+        resp = self.staff_client.delete(
+            f'/api/staff/challenges/{challenge_id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+
+    def test_challenge_list_requires_staff(self):
+        resp = self.player_client.get('/api/staff/challenges/')
+        self.assertEqual(resp.status_code, 403)
+
 
 # ---------------------------------------------------------------------------
 # P2E.1 — Staff submission review endpoints

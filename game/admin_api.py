@@ -3,7 +3,7 @@ from rest_framework.decorators import action
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 
-from game.models import Tower, Zone
+from game.models import Challenge, Tower, Zone
 from organize.models import Team, TeamGroup
 
 
@@ -32,6 +32,12 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
     class Meta:
         model = TeamGroup
         fields = ('id', 'name', 'game', 'slug')
+
+
+class AdminChallengeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Challenge
+        fields = ('id', 'text', 'tower', 'difficulty')
 
 
 class AdminZoneViewSet(viewsets.ModelViewSet):
@@ -84,3 +90,11 @@ class AdminTeamGroupList(viewsets.ReadOnlyModelViewSet):
     permission_classes = [IsAdminUser]
     queryset = TeamGroup.objects.all().order_by('name')
     serializer_class = AdminTeamGroupSerializer
+
+
+class AdminChallengeViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for Challenges (tower-specific or generic)."""
+
+    permission_classes = [IsAdminUser]
+    queryset = Challenge.objects.all().order_by('difficulty', 'id')
+    serializer_class = AdminChallengeSerializer
