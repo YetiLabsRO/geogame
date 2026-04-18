@@ -42,6 +42,7 @@ INSTALLED_APPS = [
 
     'leaflet',
     'rest_framework',
+    'rest_framework.authtoken',
     'rest_framework_gis',
     'colorfield',
     'smart_selects',
@@ -145,8 +146,15 @@ REST_FRAMEWORK = {
     # or allow read-only access for unauthenticated users.
     'DEFAULT_PERMISSION_CLASSES': [
         'rest_framework.permissions.DjangoModelPermissionsOrAnonReadOnly'
-    ]
+    ],
+    'DEFAULT_AUTHENTICATION_CLASSES': [
+        'rest_framework.authentication.SessionAuthentication',
+        'rest_framework.authentication.TokenAuthentication',
+    ],
 }
+
+EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
+DEFAULT_FROM_EMAIL = os.environ.get('DEFAULT_FROM_EMAIL', 'noreply@cercetador.albascout.ro')
 
 LEAFLET_CONFIG = {
     'DEFAULT_CENTER': (46.068374, 23.571797),

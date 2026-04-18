@@ -60,7 +60,7 @@ jobs:
 
       - name: Run tests with coverage
         run: |
-          coverage run manage.py test game --noinput --verbosity 2
+          coverage run manage.py test game organize --noinput --verbosity 2
           coverage report --fail-under=80
           coverage xml
 

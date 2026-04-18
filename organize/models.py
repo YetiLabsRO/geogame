@@ -1,18 +1,16 @@
+import uuid
+
 from colorfield.fields import ColorField
-from django.contrib.auth import get_user_model
+from django.conf import settings
 from django.contrib.gis.db.models import PointField
 from django.db import models
 from django.db.models import ManyToManyField
+from django.utils import timezone
 from smart_selects.db_fields import ChainedForeignKey
-
-
-class Player(models.Model):
-    user = models.OneToOneField(get_user_model(), on_delete=models.CASCADE)
 
 
 class Game(models.Model):
     name = models.CharField(max_length=255)
-    players = models.ManyToManyField(Player, blank=True, related_name='games')
 
     base_point = PointField(null=True, blank=True)
     base_zoom_level = models.PositiveSmallIntegerField(default=15)
@@ -21,6 +19,22 @@ class Game(models.Model):
     end_time = models.DateTimeField()
 
     is_active = models.BooleanField(default=False)
+
+    def __str__(self):
+        return self.name
+
+
+class UserProfile(models.Model):
+    user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
+    current_game = models.ForeignKey(
+        Game, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return self.user.get_username()
+
 
 class TeamGroup(models.Model):
     name = models.CharField(max_length=255)
@@ -45,7 +59,9 @@ class Team(models.Model):
     )
     color = ColorField()
     description = models.TextField(null=True, blank=True)
-    players = ManyToManyField(Player, blank=True, related_name='teams', through="organize.TeamPlayer")
+    members = ManyToManyField(
+        UserProfile, blank=True, related_name='teams', through='organize.TeamMembership',
+    )
 
     score = models.PositiveIntegerField(default=0)
 
@@ -66,8 +82,50 @@ class Team(models.Model):
         return round(self.score + self.floating_score(), 2)
 
 
-class TeamPlayer(models.Model):
-    team = models.ForeignKey(Team, on_delete=models.CASCADE)
-    player = models.ForeignKey(Player, on_delete=models.CASCADE)
+class TeamMembership(models.Model):
+    team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name='memberships')
+    user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='memberships')
+    is_active = models.BooleanField(default=True)
+    joined_at = models.DateTimeField(auto_now_add=True)
+    left_at = models.DateTimeField(null=True, blank=True)
 
-    joined_at = models.DateTimeField()
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['team', 'user'],
+                condition=models.Q(is_active=True),
+                name='unique_active_team_membership',
+            ),
+        ]
+
+    def __str__(self):
+        return f'{self.user} in {self.team}'
+
+
+def _default_invite_expiry():
+    return timezone.now() + timezone.timedelta(days=14)
+
+
+class Invite(models.Model):
+    token = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name='invites')
+    email = models.EmailField(blank=True, null=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, related_name='invites_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(default=_default_invite_expiry)
+    accepted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True, related_name='invites_accepted',
+    )
+    accepted_at = models.DateTimeField(null=True, blank=True)
+    revoked = models.BooleanField(default=False)
+
+    def is_usable(self):
+        if self.revoked or self.accepted_at is not None:
+            return False
+        return self.expires_at > timezone.now()
+
+    def __str__(self):
+        label = self.email or 'no-email'
+        return f'Invite({self.team.name} → {label})'

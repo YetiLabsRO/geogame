@@ -15,7 +15,7 @@ Organized by feature area to match Phase 0 issue breakdown:
 
 Tests target the post-refactor structure:
   * `game` app owns Zone, Tower, Challenge, TeamTowerChallenge, ownership records
-  * `organize` app owns Game, TeamGroup, Team, Player, TeamPlayer
+  * `organize` app owns Game, TeamGroup, Team, UserProfile, TeamMembership, Invite
   * Teams are grouped by TeamGroup (replacing the legacy EXPLORATORI/TEMERARI/SENIORI
     hardcoded categories). Each Game has its own set of TeamGroups.
 """
