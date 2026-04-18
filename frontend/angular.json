@@ -45,7 +45,7 @@
             "browser": "projects/player/src/main.ts",
             "tsConfig": "projects/player/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
-            "allowedCommonJsDependencies": ["qrcode"],
+            "allowedCommonJsDependencies": ["qrcode", "leaflet"],
             "assets": [
               {
                 "glob": "**/*",

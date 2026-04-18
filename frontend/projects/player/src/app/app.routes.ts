@@ -7,7 +7,7 @@ export const routes: Routes = [
     path: '',
     pathMatch: 'full',
     canActivate: [authGuard],
-    loadComponent: () => import('./home/home.component').then((m) => m.HomeComponent),
+    loadComponent: () => import('./map/map.component').then((m) => m.MapComponent),
   },
   {
     path: 'login',

@@ -7,4 +7,5 @@ export * from './lib/auth.service';
 export * from './lib/auth.guard';
 export * from './lib/token.interceptor';
 export * from './lib/invites.service';
+export * from './lib/game-api.service';
 export * from './lib/qr-code.component';

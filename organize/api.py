@@ -235,6 +235,16 @@ class GameStubSerializer(serializers.Serializer):
     is_active = serializers.BooleanField()
     start_time = serializers.DateTimeField()
     end_time = serializers.DateTimeField()
+    base_point = serializers.SerializerMethodField()
+    base_zoom_level = serializers.IntegerField()
+
+    def get_base_point(self, game):
+        if game.base_point is None:
+            return None
+        return {
+            'type': 'Point',
+            'coordinates': [game.base_point.x, game.base_point.y],
+        }
 
 
 class CurrentGameView(APIView):
