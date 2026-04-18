@@ -24,6 +24,42 @@ export interface StaffSubmission {
   response_text: string;
 }
 
+export interface AdminTower {
+  id: number;
+  name: string;
+  game: number;
+  zone: number | null;
+  category: number;
+  is_active: boolean;
+  initial_bonus: number;
+  rfid_code: string | null;
+}
+
+export interface AdminZone {
+  id: number;
+  name: string;
+  game: number;
+  color: string;
+  scoring_type: number;
+}
+
+export interface AdminTeam {
+  id: number;
+  name: string;
+  game: number;
+  code: string;
+  group: number | null;
+  color: string;
+  description: string | null;
+}
+
+export interface AdminTeamGroup {
+  id: number;
+  name: string;
+  game: number;
+  slug: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class StaffApiService {
   private readonly http = inject(HttpClient);
@@ -44,5 +80,46 @@ export class StaffApiService {
       `/api/staff/submissions/${id}/review/`,
       { outcome: 'reject', response_text: responseText },
     );
+  }
+
+  // ---- Admin CRUD ---------------------------------------------------------
+
+  listTowers(): Observable<AdminTower[]> {
+    return this.http.get<AdminTower[]>('/api/staff/towers/');
+  }
+
+  updateTower(id: number, patch: Partial<AdminTower>): Observable<AdminTower> {
+    return this.http.patch<AdminTower>(`/api/staff/towers/${id}/`, patch);
+  }
+
+  unassignTower(id: number): Observable<AdminTower> {
+    return this.http.post<AdminTower>(`/api/staff/towers/${id}/unassign/`, {});
+  }
+
+  unassignAllTowers(): Observable<{ unassigned: number[] }> {
+    return this.http.post<{ unassigned: number[] }>(
+      '/api/staff/towers/unassign_all/',
+      {},
+    );
+  }
+
+  listZones(): Observable<AdminZone[]> {
+    return this.http.get<AdminZone[]>('/api/staff/zones/');
+  }
+
+  updateZone(id: number, patch: Partial<AdminZone>): Observable<AdminZone> {
+    return this.http.patch<AdminZone>(`/api/staff/zones/${id}/`, patch);
+  }
+
+  listTeams(): Observable<AdminTeam[]> {
+    return this.http.get<AdminTeam[]>('/api/staff/teams/');
+  }
+
+  updateTeam(id: number, patch: Partial<AdminTeam>): Observable<AdminTeam> {
+    return this.http.patch<AdminTeam>(`/api/staff/teams/${id}/`, patch);
+  }
+
+  listTeamGroups(): Observable<AdminTeamGroup[]> {
+    return this.http.get<AdminTeamGroup[]>('/api/staff/team-groups/');
   }
 }

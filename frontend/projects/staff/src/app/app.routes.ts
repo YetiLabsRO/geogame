@@ -17,6 +17,22 @@ export const routes: Routes = [
       import('./invites/invites.component').then((m) => m.InvitesComponent),
   },
   {
+    path: 'towers',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/towers.component').then((m) => m.TowersComponent),
+  },
+  {
+    path: 'zones',
+    canActivate: [staffGuard],
+    loadComponent: () => import('./admin/zones.component').then((m) => m.ZonesComponent),
+  },
+  {
+    path: 'teams',
+    canActivate: [staffGuard],
+    loadComponent: () => import('./admin/teams.component').then((m) => m.TeamsComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },

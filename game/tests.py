@@ -917,6 +917,100 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P2E.2 — Staff admin CRUD endpoints
+# ---------------------------------------------------------------------------
+
+
+class StaffAdminEndpointsTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, name='Z1')
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.team = _make_team(self.game, self.group, code='T1CODE')
+        self.staff = User.objects.create_user(
+            username='admin', email='a@x.com',
+            password='password123', is_staff=True,
+        )
+        staff_token = Token.objects.create(user=self.staff)
+        self.staff_client = APIClient()
+        self.staff_client.credentials(
+            HTTP_AUTHORIZATION=f'Token {staff_token.key}',
+        )
+        self.player_client, self.player = _authed_client(self.team)
+
+    def test_tower_list_requires_staff(self):
+        resp = self.player_client.get('/api/staff/towers/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_tower_list_returns_all_towers_including_inactive(self):
+        _make_tower(self.game, name='Off', zone=self.zone, is_active=False)
+        resp = self.staff_client.get('/api/staff/towers/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
+
+    def test_tower_patch_toggles_is_active(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/towers/{self.tower.id}/',
+            {'is_active': False},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.tower.refresh_from_db()
+        self.assertFalse(self.tower.is_active)
+
+    def test_tower_unassign_action_closes_ownership(self):
+        self.tower.assign_to_team(self.team)
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{self.tower.id}/unassign/', format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(self.tower.tower_control(self.group))
+
+    def test_tower_unassign_all_closes_every_active_ownership(self):
+        other = _make_tower(
+            self.game, name='T2', zone=self.zone,
+            lng=23.51, lat=46.51,
+        )
+        self.tower.assign_to_team(self.team)
+        other.assign_to_team(self.team)
+        resp = self.staff_client.post(
+            '/api/staff/towers/unassign_all/', format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(self.tower.tower_control(self.group))
+        self.assertIsNone(other.tower_control(self.group))
+
+    def test_zone_patch_updates_color(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/zones/{self.zone.id}/',
+            {'color': '#112233'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.zone.refresh_from_db()
+        self.assertEqual(self.zone.color, '#112233')
+
+    def test_team_patch_updates_name(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/teams/{self.team.id}/',
+            {'name': 'Renamed'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.name, 'Renamed')
+
+    def test_team_groups_list_is_staff_only(self):
+        resp = self.player_client.get('/api/staff/team-groups/')
+        self.assertEqual(resp.status_code, 403)
+        resp = self.staff_client.get('/api/staff/team-groups/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 1)
+        self.assertEqual(resp.json()[0]['slug'], self.group.slug)
+
+
+# ---------------------------------------------------------------------------
 # P2E.1 — Staff submission review endpoints
 # ---------------------------------------------------------------------------
 

@@ -19,6 +19,12 @@ from django.contrib import admin
 from django.urls import include, path
 from rest_framework import routers
 
+from game.admin_api import (
+    AdminTeamGroupList,
+    AdminTeamViewSet,
+    AdminTowerViewSet,
+    AdminZoneViewSet,
+)
 from game.api import (
     StaffSubmissionList,
     StaffSubmissionReview,
@@ -44,6 +50,14 @@ router.register(r'teams', TeamViewSet)
 router.register(r'challenges', ChallengeViewSet)
 router.register(r'team_tower_challenges', TeamTowerChallengeViewSet)
 
+admin_router = routers.DefaultRouter()
+admin_router.register(r'zones', AdminZoneViewSet, basename='admin-zone')
+admin_router.register(r'towers', AdminTowerViewSet, basename='admin-tower')
+admin_router.register(r'teams', AdminTeamViewSet, basename='admin-team')
+admin_router.register(
+    r'team-groups', AdminTeamGroupList, basename='admin-team-group',
+)
+
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('', MapView.as_view()),
@@ -63,6 +77,7 @@ urlpatterns = [
         StaffSubmissionReview.as_view(),
         name='api-staff-submission-review',
     ),
+    path('api/staff/', include(admin_router.urls)),
     path('api/', include('organize.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),
