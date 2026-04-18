@@ -44,7 +44,7 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 class TeamSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Team
-        fields = ["name", "code", "group", "current_score", "color"]
+        fields = ["id", "name", "code", "group", "current_score", "color"]
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):

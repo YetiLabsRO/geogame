@@ -97,4 +97,17 @@ export class GameApiService {
       payload,
     );
   }
+
+  teams(): Observable<TeamSummary[]> {
+    return this.http.get<TeamSummary[]>('/api/teams/');
+  }
+}
+
+export interface TeamSummary {
+  id: number;
+  name: string;
+  code: string;
+  group: string | null;
+  current_score: number;
+  color: string;
 }

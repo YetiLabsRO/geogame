@@ -26,6 +26,29 @@ export interface InviteAcceptPayload {
   last_name?: string;
 }
 
+export type InviteStatus = 'pending' | 'accepted' | 'revoked' | 'expired';
+
+export interface Invite {
+  id: number;
+  token: string;
+  team: number;
+  team_name: string;
+  email: string | null;
+  created_by: number | null;
+  created_by_username: string | null;
+  created_at: string;
+  expires_at: string;
+  accepted_by: number | null;
+  accepted_at: string | null;
+  revoked: boolean;
+  status: InviteStatus;
+}
+
+export interface InviteCreatePayload {
+  team: number;
+  email?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class InvitesService {
   private readonly http = inject(HttpClient);
@@ -39,5 +62,22 @@ export class InvitesService {
     return this.http
       .post<InviteAcceptResponse>(`/api/invites/accept/${encodeURIComponent(token)}/`, payload)
       .pipe(tap((res) => this.auth.setToken(res.token)));
+  }
+
+  list(status?: InviteStatus): Observable<Invite[]> {
+    const query = status ? `?status=${status}` : '';
+    return this.http.get<Invite[]>(`/api/invites/${query}`);
+  }
+
+  create(payload: InviteCreatePayload): Observable<Invite> {
+    return this.http.post<Invite>('/api/invites/', payload);
+  }
+
+  revoke(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/invites/${id}/`);
+  }
+
+  resend(id: number): Observable<void> {
+    return this.http.post<void>(`/api/invites/${id}/resend/`, {});
   }
 }

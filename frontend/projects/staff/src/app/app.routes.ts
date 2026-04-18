@@ -11,6 +11,12 @@ export const routes: Routes = [
       import('./review/pending-queue.component').then((m) => m.PendingQueueComponent),
   },
   {
+    path: 'invites',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./invites/invites.component').then((m) => m.InvitesComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },
