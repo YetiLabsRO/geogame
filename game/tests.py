@@ -917,6 +917,121 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P2E.1 — Staff submission review endpoints
+# ---------------------------------------------------------------------------
+
+
+class StaffSubmissionEndpointsTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text='Prove it', difficulty=1, tower=self.tower,
+        )
+        self.staff = User.objects.create_user(
+            username='review', email='r@x.com',
+            password='password123', is_staff=True,
+        )
+        staff_token = Token.objects.create(user=self.staff)
+        self.staff_client = APIClient()
+        self.staff_client.credentials(
+            HTTP_AUTHORIZATION=f'Token {staff_token.key}',
+        )
+        self.player_client, self.player = _authed_client(self.team)
+        self.list_url = reverse('api-staff-submissions')
+
+    def _make_pending(self):
+        return TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            submitted_by=self.player,
+        )
+
+    def test_list_requires_staff(self):
+        resp = self.player_client.get(self.list_url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_list_defaults_to_pending(self):
+        self._make_pending()
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower, challenge=self.challenge,
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+        resp = self.staff_client.get(self.list_url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 1)
+        self.assertEqual(resp.json()[0]['team_name'], self.team.name)
+        self.assertEqual(resp.json()[0]['tower_name'], self.tower.name)
+        self.assertEqual(resp.json()[0]['challenge_text'], 'Prove it')
+
+    def test_list_outcome_filter_all(self):
+        self._make_pending()
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower, challenge=self.challenge,
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+        resp = self.staff_client.get(self.list_url, {'outcome': 'all'})
+        self.assertEqual(len(resp.json()), 2)
+
+    def test_confirm_triggers_tower_assignment(self):
+        ttc = self._make_pending()
+        url = reverse('api-staff-submission-review', args=[ttc.id])
+        resp = self.staff_client.post(
+            url, {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        ttc.refresh_from_db()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(ttc.checked_by, self.staff)
+        # Tower should now be owned by the team.
+        self.assertEqual(
+            self.tower.tower_control(self.group), self.team,
+        )
+
+    def test_reject_stores_response_text(self):
+        ttc = self._make_pending()
+        url = reverse('api-staff-submission-review', args=[ttc.id])
+        resp = self.staff_client.post(
+            url,
+            {'outcome': 'reject', 'response_text': 'try again'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        ttc.refresh_from_db()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.REJECTED)
+        self.assertEqual(ttc.response_text, 'try again')
+        self.assertEqual(ttc.checked_by, self.staff)
+
+    def test_review_rejects_non_pending(self):
+        ttc = self._make_pending()
+        ttc.outcome = TeamTowerChallenge.CONFIRMED
+        ttc.save()
+        url = reverse('api-staff-submission-review', args=[ttc.id])
+        resp = self.staff_client.post(
+            url, {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_review_rejects_bad_outcome(self):
+        ttc = self._make_pending()
+        url = reverse('api-staff-submission-review', args=[ttc.id])
+        resp = self.staff_client.post(url, {'outcome': 'meh'}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_review_requires_staff(self):
+        ttc = self._make_pending()
+        url = reverse('api-staff-submission-review', args=[ttc.id])
+        resp = self.player_client.post(
+            url, {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+# ---------------------------------------------------------------------------
 # P2C.3 — Tower state endpoint
 # ---------------------------------------------------------------------------
 

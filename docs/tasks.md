@@ -106,7 +106,7 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2D.4: Remove `team_code`-based submission flow; mark `Team.team_code` deprecated (drop in Phase 3). (Plan: P2D.4, Req: 13.2)
 
 ## Phase 2E: Staff UI
-- [ ] T2E.1: Pending review queue with photo preview + one-click confirm/reject. (Plan: P2E.1, Req: 16.2)
+- [x] T2E.1: Pending review queue with photo preview + one-click confirm/reject. (Plan: P2E.1, Req: 16.2)
 - [ ] T2E.2: Tower/Zone/Team CRUD with activate/deactivate toggles and `unassign_all`. (Plan: P2E.2, Req: 16.1)
 - [ ] T2E.3: Challenge management (list + create/edit; tower-specific or generic). (Plan: P2E.3, Req: 16.1)
 - [ ] T2E.4: Invite management UI (list, create, revoke, resend). (Plan: P2E.4, Req: 14.3)

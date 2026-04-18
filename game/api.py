@@ -2,8 +2,8 @@ from datetime import timedelta
 
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework import serializers, status
-from rest_framework.permissions import IsAuthenticated
+from rest_framework import generics, serializers, status
+from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
@@ -98,3 +98,111 @@ class TowerStateView(APIView):
             ),
             'proximity_meters': 50,
         })
+
+
+# ---------------------------------------------------------------------------
+# Staff submission review
+# ---------------------------------------------------------------------------
+
+
+class StaffSubmissionSerializer(serializers.ModelSerializer):
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    team_color = serializers.CharField(source='team.color', read_only=True)
+    tower_name = serializers.CharField(source='tower.name', read_only=True)
+    challenge_text = serializers.SerializerMethodField()
+    challenge_difficulty = serializers.SerializerMethodField()
+    submitted_by_username = serializers.SerializerMethodField()
+    photo_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TeamTowerChallenge
+        fields = (
+            'id', 'team', 'team_name', 'team_color',
+            'tower', 'tower_name',
+            'challenge', 'challenge_text', 'challenge_difficulty',
+            'submitted_by', 'submitted_by_username',
+            'photo_url', 'timestamp_submitted', 'timestamp_verified',
+            'outcome', 'response_text',
+        )
+
+    def get_challenge_text(self, obj):
+        return obj.challenge.text if obj.challenge else None
+
+    def get_challenge_difficulty(self, obj):
+        return obj.challenge.difficulty if obj.challenge else None
+
+    def get_submitted_by_username(self, obj):
+        return obj.submitted_by.username if obj.submitted_by else None
+
+    def get_photo_url(self, obj):
+        if not obj.photo:
+            return None
+        request = self.context.get('request')
+        url = obj.photo.url
+        return request.build_absolute_uri(url) if request else url
+
+
+class StaffSubmissionList(generics.ListAPIView):
+    """Staff-only: list submissions, filterable by outcome.
+
+    Default scope is PENDING submissions so the review queue is the
+    default experience; pass ?outcome=all or a specific integer outcome
+    to see others.
+    """
+
+    permission_classes = [IsAdminUser]
+    serializer_class = StaffSubmissionSerializer
+
+    def get_queryset(self):
+        qs = (
+            TeamTowerChallenge.objects
+            .select_related('team', 'tower', 'challenge', 'submitted_by')
+            .order_by('-timestamp_submitted')
+        )
+        outcome = self.request.query_params.get('outcome', 'pending')
+        if outcome == 'all':
+            return qs
+        if outcome == 'pending':
+            return qs.filter(outcome=TeamTowerChallenge.PENDING)
+        if outcome == 'confirmed':
+            return qs.filter(outcome=TeamTowerChallenge.CONFIRMED)
+        if outcome == 'rejected':
+            return qs.filter(outcome=TeamTowerChallenge.REJECTED)
+        return qs.filter(outcome=TeamTowerChallenge.PENDING)
+
+
+class StaffSubmissionReview(APIView):
+    """Staff-only: confirm or reject a pending submission.
+
+    Accepts {"outcome": "confirm"|"reject", "response_text": "..."}.
+    Sets checked_by to the reviewing staff user. Confirming triggers
+    the model's tower-assignment side-effects via TTC.save().
+    """
+
+    permission_classes = [IsAdminUser]
+
+    def post(self, request, pk):
+        submission = get_object_or_404(TeamTowerChallenge, pk=pk)
+        if submission.outcome != TeamTowerChallenge.PENDING:
+            return Response(
+                {'detail': 'Submission is not pending.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        outcome_str = request.data.get('outcome')
+        if outcome_str == 'confirm':
+            submission.outcome = TeamTowerChallenge.CONFIRMED
+        elif outcome_str == 'reject':
+            submission.outcome = TeamTowerChallenge.REJECTED
+            submission.response_text = request.data.get('response_text', '')
+        else:
+            return Response(
+                {'detail': 'outcome must be "confirm" or "reject".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        submission.checked_by = request.user
+        submission.save()
+        return Response(
+            StaffSubmissionSerializer(
+                submission, context={'request': request},
+            ).data,
+        )
