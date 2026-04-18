@@ -93,7 +93,7 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2B.3: Configure dev proxy (`/api/`, `/admin/` → `:8000`) and production build output paths. (Plan: P2B.3, Req: 15.1)
 
 ## Phase 2C: Player UI
-- [ ] T2C.1: Login, register, password-reset, and invite-accept landing screens. (Plan: P2C.1, Req: 13.1, 14.2)
+- [x] T2C.1: Login, register, password-reset, and invite-accept landing screens. (Plan: P2C.1, Req: 13.1, 14.2)
 - [ ] T2C.2: Main Leaflet map view with zones + active towers, category-colored. (Plan: P2C.2, Req: 15.1)
 - [ ] T2C.3: Tower detail page with live GPS distance, cooloff countdown, challenge submit form with photo capture. (Plan: P2C.3, Req: 15.1, 15.2, 15.3)
 - [ ] T2C.4: Per-TeamGroup score map view at `/map/<slug>/` (dynamic on TeamGroup.slug). (Plan: P2C.4, Req: 15.1)
@@ -102,7 +102,7 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 ## Phase 2D: Accounts & Invites Backend
 - [x] T2D.1: Add `UserProfile`, `TeamMembership`, `Invite` models with migrations. (Plan: P2D.1, Req: 13.1, 14.1)
 - [x] T2D.2: Email templates (HTML + text) for invite emails. (Plan: P2D.2, Req: 14.1)
-- [ ] T2D.3: QR code rendering component for invite tokens in staff UI. (Plan: P2D.3, Req: 14.1)
+- [x] T2D.3: QR code rendering component for invite tokens in staff UI. (Plan: P2D.3, Req: 14.1)
 - [x] T2D.4: Remove `team_code`-based submission flow; mark `Team.team_code` deprecated (drop in Phase 3). (Plan: P2D.4, Req: 13.2)
 
 ## Phase 2E: Staff UI

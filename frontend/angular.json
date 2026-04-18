@@ -45,6 +45,7 @@
             "browser": "projects/player/src/main.ts",
             "tsConfig": "projects/player/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
+            "allowedCommonJsDependencies": ["qrcode"],
             "assets": [
               {
                 "glob": "**/*",
@@ -142,6 +143,7 @@
             "browser": "projects/staff/src/main.ts",
             "tsConfig": "projects/staff/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
+            "allowedCommonJsDependencies": ["qrcode"],
             "assets": [
               {
                 "glob": "**/*",
