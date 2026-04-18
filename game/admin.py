@@ -1,6 +1,5 @@
 from django.conf import settings
 from django.contrib import admin, messages
-from django.urls import reverse
 
 # Register your models here.
 from django.utils.safestring import mark_safe
@@ -64,7 +63,7 @@ class TowerAdmin(LeafletGeoAdmin):
 
     def get_rfid_url(self, obj):
         if obj.category == Tower.CATEGORY_RFID:
-            return settings.BASE_URL + reverse('tower-rfid', kwargs={"rfid_code": obj.rfid_code})
+            return f"{settings.BASE_URL}/tower/rfid/{obj.rfid_code}"
         return "-"
 
     get_rfid_url.short_description = "RFID URL"

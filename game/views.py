@@ -2,12 +2,10 @@ from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 from django.db import OperationalError, connection
 from django.db.models import Count, Q
-from django.http import Http404, HttpResponseBadRequest, HttpResponseRedirect, JsonResponse
-from django.urls import reverse
-from django.views.generic import DetailView, FormView, TemplateView
+from django.http import JsonResponse
+from django.views.generic import TemplateView
 from rest_framework import permissions, viewsets
 
-from game.forms import RFIDTowerForm
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
 from game.serializers import (
     ChallengeSerializer,
@@ -76,7 +74,12 @@ class ChallengeViewSet(viewsets.ModelViewSet):
 class TeamTowerChallengeViewSet(viewsets.ModelViewSet):
     queryset = TeamTowerChallenge.objects.all()
     serializer_class = TeamTowerChallengeSerializer
-    permission_classes = [permissions.AllowAny]
+    permission_classes = [permissions.IsAuthenticated]
+
+    def perform_create(self, serializer):
+        ttc = serializer.save()
+        if ttc.outcome == TeamTowerChallenge.CONFIRMED:
+            ttc.tower.assign_to_team(ttc.team)
 
 
 class MapView(TemplateView):
@@ -98,111 +101,6 @@ class ScoreMapView(TemplateView):
         context = super(ScoreMapView, self).get_context_data(**kwargs)
 
         context['team_group'] = self.team_group
-        return context
-
-
-class TowerChallengeView(TemplateView):
-    template_name = "game/tower_challenge.html"
-
-
-class RFIDChallengeView(FormView):
-    template_name = "game/tower_rfid_error.html"
-    model = TeamTowerChallenge
-    form_class = RFIDTowerForm
-
-    def form_valid(self, form):
-        tower = form.cleaned_data['rfid_code']
-        team = form.cleaned_data['team_code']
-
-        #   creat TTC to be compliant
-        ttc = TeamTowerChallenge.objects.create(tower=form.cleaned_data['rfid_code'],
-                                                team=form.cleaned_data['team_code'],
-                                                outcome=TeamTowerChallenge.CONFIRMED)
-
-        #   assign tower to team
-        tower.assign_to_team(team)
-        return HttpResponseRedirect("{}?team={}".format(reverse("tower-rfid", kwargs={"rfid_code": ttc.tower.rfid_code}), ttc.team.id))
-
-
-class RFIDTowerView(DetailView):
-    template_name = "game/tower_rfid.html"
-    model = Tower
-
-    def dispatch(self, request, *args, **kwargs):
-        try:
-            self.team = Team.objects.get(pk=request.GET.get("team", 0))
-        except Team.DoesNotExist:
-            self.team = None
-
-        return super(RFIDTowerView, self).dispatch(request, *args, **kwargs)
-
-    def get_object(self, queryset=None):
-        try:
-            return Tower.objects.get(is_active=True, category=Tower.CATEGORY_RFID, rfid_code=self.kwargs.get("rfid_code"))
-        except Tower.DoesNotExist as exc:
-            raise Http404("Turn RFID necunoscut") from exc
-
-    def get_context_data(self, **kwargs):
-        context = super(RFIDTowerView, self).get_context_data(**kwargs)
-        context['team'] = self.team
-        if self.team:
-            context['tower_owner'] = self.object.tower_control(group=self.team.group)
-            context['challenge'] = self.object.get_next_challenge(self.team)
-            context['team_has_pending'] = self.object.team_pending(self.team)
-            context['team_in_cooloff'] = self.object.team_in_cooloff(self.team)
-        return context
-
-
-class TowerDetailView(DetailView):
-    model = Tower
-
-    def dispatch(self, request, *args, **kwargs):
-        self.lat = float(request.GET.get("lat", 0.))
-        self.lng = float(request.GET.get("lng", 0.))
-        if not request.user.is_authenticated:
-            if not self.lng or not self.lat:
-                return HttpResponseBadRequest("Nu esti langa obiectiv!")
-
-        self.team = None
-        if "team_id" in request.session:
-            try:
-                self.team = Team.objects.get(code=request.session["team_id"])
-            except Team.DoesNotExist:
-                self.team = None
-
-        if not self.team:
-            self.team_code = request.GET.get("team_code")
-            self.team = None
-            if self.team_code:
-                try:
-                    self.team = Team.objects.get(code=self.team_code)
-                    request.session['team_id'] = self.team.code
-                except Team.DoesNotExist:
-                    raise Http404("Codul tău de echipă nu e corect!")
-        return super(TowerDetailView, self).dispatch(request, *args, **kwargs)
-
-    def get_object(self, queryset=None):
-        obj = super(TowerDetailView, self).get_object(queryset)
-        if not self.request.user.is_authenticated:
-            point = Point(self.lng, self.lat)
-            radius = 50
-            try:
-                Tower.objects.get(pk=obj.id, is_active=True, category=Tower.CATEGORY_NORMAL, location__distance_lt=(point, Distance(m=radius)))
-            except Tower.DoesNotExist:
-                raise Http404("Nu ești lângă obiectiv!")
-
-        return obj
-
-    def get_context_data(self, **kwargs):
-        context = super(TowerDetailView, self).get_context_data(**kwargs)
-        context['lat'] = self.lat
-        context['lng'] = self.lng
-        context['team'] = self.team
-        if self.team:
-            context['tower_owner'] = self.object.tower_control(group=self.team.group)
-            context['challenge'] = self.object.get_next_challenge(self.team)
-            context['team_has_pending'] = self.object.team_pending(self.team)
-            context['team_in_cooloff'] = self.object.team_in_cooloff(self.team)
         return context
 
 

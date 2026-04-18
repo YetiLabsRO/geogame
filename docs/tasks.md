@@ -83,9 +83,9 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 ## Phase 2A: DRF API Expansion
 - [x] T2A.1: Enable DRF token authentication; add `POST /api/auth/login`, `logout`, `register`, `password-reset`. (Plan: P2A.1, Req: 13.1)
 - [x] T2A.2: Add `GET /api/me/`, `PATCH /api/me/`, `GET /api/my-team/`. (Plan: P2A.2, Req: 13.3)
-- [ ] T2A.3: Implement Invites API: `GET/POST/DELETE /api/invites/`, unauth preview, accept, resend. (Plan: P2A.3, Req: 14.1, 14.2, 14.3)
-- [ ] T2A.4: Refactor `POST /api/team_tower_challenges/` to require auth, derive team from user, add `submitted_by` FK. (Plan: P2A.4, Req: 13.2)
-- [ ] T2A.5: Add `GET/POST /api/current-game/` endpoint (stubbed against a default game; fully wired in Phase 3). (Plan: P2A.5, Req: 13.3, 18.1)
+- [x] T2A.3: Implement Invites API: `GET/POST/DELETE /api/invites/`, unauth preview, accept, resend. (Plan: P2A.3, Req: 14.1, 14.2, 14.3)
+- [x] T2A.4: Refactor `POST /api/team_tower_challenges/` to require auth, derive team from user, add `submitted_by` FK. (Plan: P2A.4, Req: 13.2)
+- [x] T2A.5: Add `GET/POST /api/current-game/` endpoint (stubbed against a default game; fully wired in Phase 3). (Plan: P2A.5, Req: 13.3, 18.1)
 
 ## Phase 2B: Angular Scaffold
 - [ ] T2B.1: Initialize Angular v21 workspace at `frontend/` with `player`, `staff`, and `shared` projects. (Plan: P2B.1, Req: 15.1, 16.1)
@@ -101,9 +101,9 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 
 ## Phase 2D: Accounts & Invites Backend
 - [x] T2D.1: Add `UserProfile`, `TeamMembership`, `Invite` models with migrations. (Plan: P2D.1, Req: 13.1, 14.1)
-- [ ] T2D.2: Email templates (HTML + text) for invite emails. (Plan: P2D.2, Req: 14.1)
+- [x] T2D.2: Email templates (HTML + text) for invite emails. (Plan: P2D.2, Req: 14.1)
 - [ ] T2D.3: QR code rendering component for invite tokens in staff UI. (Plan: P2D.3, Req: 14.1)
-- [ ] T2D.4: Remove `team_code`-based submission flow; mark `Team.team_code` deprecated (drop in Phase 3). (Plan: P2D.4, Req: 13.2)
+- [x] T2D.4: Remove `team_code`-based submission flow; mark `Team.team_code` deprecated (drop in Phase 3). (Plan: P2D.4, Req: 13.2)
 
 ## Phase 2E: Staff UI
 - [ ] T2E.1: Pending review queue with photo preview + one-click confirm/reject. (Plan: P2E.1, Req: 16.2)

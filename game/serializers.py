@@ -70,7 +70,7 @@ class Base64ImageField(serializers.ImageField):
             except TypeError:
                 self.fail('invalid_image')
 
-            file_name = str(uuid.uuid4())[:12] # 12 characters are more than enough.
+            file_name = str(uuid.uuid4())[:12]
             file_extension = self.get_file_extension(file_name, decoded_file)
             complete_file_name = "%s.%s" % (file_name, file_extension, )
             data = ContentFile(decoded_file, name=complete_file_name)
@@ -87,33 +87,92 @@ class Base64ImageField(serializers.ImageField):
 
 
 class TeamTowerChallengeSerializer(serializers.ModelSerializer):
+    """Write-side payload for POST /api/team_tower_challenges/.
+
+    Requires an authenticated user with an active TeamMembership. Team is
+    derived from that membership — NEVER sent by the client. RFID captures
+    send `rfid_code` and skip `tower`; the serializer resolves the matching
+    active RFID tower and marks the submission CONFIRMED.
+    """
+
     class Meta:
         model = TeamTowerChallenge
-        fields = ["photo", "team", "challenge", "tower", "lng", "lat", "response_text"]
+        fields = [
+            "id",
+            "photo",
+            "challenge",
+            "tower",
+            "rfid_code",
+            "lng",
+            "lat",
+            "response_text",
+            "outcome",
+            "team",
+            "submitted_by",
+            "timestamp_submitted",
+        ]
+        read_only_fields = ("id", "team", "submitted_by", "outcome", "timestamp_submitted")
 
     photo = Base64ImageField(max_length=None, use_url=True, required=False, allow_empty_file=True, allow_null=True)
+    tower = serializers.PrimaryKeyRelatedField(queryset=Tower.objects.all(), required=False, allow_null=True)
+    rfid_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
     lat = serializers.FloatField(required=True, write_only=True)
     lng = serializers.FloatField(required=True, write_only=True)
 
     def validate(self, attrs):
-        if not attrs['lat'] or not attrs['lng']:
-            raise serializers.ValidationError("Dacă nu ești la turn, nu poți face provocarea!")
+        user = self.context['request'].user
+        membership = user.profile.memberships.filter(is_active=True).select_related('team').first()
+        if membership is None:
+            raise serializers.ValidationError(
+                "Nu ești membru al unei echipe active.",
+            )
+        attrs['_team'] = membership.team
 
-        if not attrs['tower']:
-            raise serializers.ValidationError("Trebuie un turn!")
+        rfid_code = attrs.get('rfid_code') or None
+        tower = attrs.get('tower')
+
+        if rfid_code:
+            try:
+                tower = Tower.objects.get(
+                    rfid_code=rfid_code,
+                    is_active=True,
+                    category=Tower.CATEGORY_RFID,
+                )
+            except Tower.DoesNotExist:
+                raise serializers.ValidationError("Cod RFID necunoscut sau turn inactiv.")
+            attrs['tower'] = tower
+            attrs['_auto_confirm'] = True
+        else:
+            if not tower:
+                raise serializers.ValidationError("Trebuie un turn sau un cod RFID.")
+            attrs['_auto_confirm'] = False
+
+        if not attrs.get('lat') or not attrs.get('lng'):
+            raise serializers.ValidationError("Dacă nu ești la turn, nu poți face provocarea!")
 
         point = Point(attrs['lng'], attrs['lat'])
         if not Tower.objects.filter(
-            pk=attrs['tower'].id,
+            pk=tower.id,
             location__distance_lte=(point, Distance(m=50)),
         ).exists():
             raise serializers.ValidationError(
-                "Trebuie să fii la maxim 50 de metri de turn pentru a putea face provoarea!",
+                "Trebuie să fii la maxim 50 de metri de turn pentru a putea face provocarea!",
             )
 
         return attrs
 
     def create(self, validated_data):
-        validated_data.pop("lat")
-        validated_data.pop("lng")
-        return super(TeamTowerChallengeSerializer, self).create(validated_data)
+        validated_data.pop('lat')
+        validated_data.pop('lng')
+        validated_data.pop('rfid_code', None)
+        team = validated_data.pop('_team')
+        auto_confirm = validated_data.pop('_auto_confirm')
+        user = self.context['request'].user
+
+        ttc = TeamTowerChallenge.objects.create(
+            team=team,
+            submitted_by=user,
+            outcome=TeamTowerChallenge.CONFIRMED if auto_confirm else TeamTowerChallenge.PENDING,
+            **validated_data,
+        )
+        return ttc

@@ -24,10 +24,12 @@ import math
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 
+from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
 from django.test import TestCase
 from django.urls import reverse
 from django.utils import timezone
+from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from game.admin import unassign_all
@@ -39,7 +41,21 @@ from game.models import (
     Tower,
     Zone,
 )
-from organize.models import Game, Team, TeamGroup
+from organize.models import Game, Team, TeamGroup, TeamMembership
+
+User = get_user_model()
+
+
+def _authed_client(team, username='scout'):
+    """Create a user + active membership in `team` and return an authed APIClient."""
+    user = User.objects.create_user(
+        username=username, email=f'{username}@example.com', password='password123',
+    )
+    TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+    token = Token.objects.create(user=user)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+    return client, user
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -320,41 +336,13 @@ class ProximityTest(TestCase):
     def _offset_lat(lat, meters_north):
         return lat + meters_north / 111_111.0
 
-    def test_web_form_within_50m_accepted(self):
-        client = APIClient()
-        lat = self._offset_lat(46.5, 10)  # 10m north, within 50m
-        url = reverse("tower-detail", kwargs={"pk": self.tower.pk})
-        resp = client.get(
-            url, {"lat": lat, "lng": 23.5, "team_code": self.team.code},
-        )
-        self.assertEqual(resp.status_code, 200)
-
-    def test_web_form_outside_50m_rejected(self):
-        client = APIClient()
-        lat = self._offset_lat(46.5, 200)  # 200m north, outside 50m
-        url = reverse("tower-detail", kwargs={"pk": self.tower.pk})
-        resp = client.get(
-            url, {"lat": lat, "lng": 23.5, "team_code": self.team.code},
-        )
-        self.assertEqual(resp.status_code, 404)
-
-    def test_web_form_51m_rejected(self):
-        client = APIClient()
-        lat = self._offset_lat(46.5, 51)  # Just outside the 50m threshold
-        url = reverse("tower-detail", kwargs={"pk": self.tower.pk})
-        resp = client.get(
-            url, {"lat": lat, "lng": 23.5, "team_code": self.team.code},
-        )
-        self.assertEqual(resp.status_code, 404)
-
     def test_api_submission_outside_50m_rejected(self):
         # The serializer's proximity check rejects submissions further than 50m.
-        client = APIClient()
+        client, _ = _authed_client(self.team)
         lat = self._offset_lat(46.5, 200)
         resp = client.post(
             "/api/team_tower_challenges/",
             {
-                "team": self.team.pk,
                 "tower": self.tower.pk,
                 "challenge": self.challenge.pk,
                 "lat": lat,
@@ -367,12 +355,11 @@ class ProximityTest(TestCase):
         self.assertFalse(TeamTowerChallenge.objects.exists())
 
     def test_api_submission_within_50m_accepted(self):
-        client = APIClient()
+        client, user = _authed_client(self.team)
         lat = self._offset_lat(46.5, 10)  # 10m north, well within 50m
         resp = client.post(
             "/api/team_tower_challenges/",
             {
-                "team": self.team.pk,
                 "tower": self.tower.pk,
                 "challenge": self.challenge.pk,
                 "lat": lat,
@@ -382,6 +369,33 @@ class ProximityTest(TestCase):
             format="json",
         )
         self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get()
+        # Team derived from membership, not from payload.
+        self.assertEqual(ttc.team, self.team)
+        self.assertEqual(ttc.submitted_by, user)
+
+    def test_api_submission_requires_auth(self):
+        client = APIClient()
+        resp = client.post(
+            "/api/team_tower_challenges/",
+            {"tower": self.tower.pk, "lat": 46.5, "lng": 23.5},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_api_submission_rejects_user_without_team(self):
+        user = User.objects.create_user(
+            username='loner', email='loner@x.com', password='password123',
+        )
+        token = Token.objects.create(user=user)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = client.post(
+            "/api/team_tower_challenges/",
+            {"tower": self.tower.pk, "lat": 46.5, "lng": 23.5},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
 
 
 # ---------------------------------------------------------------------------
@@ -565,57 +579,42 @@ class RFIDCaptureTest(TestCase):
         )
         self.team = _make_team(self.game, self.group, code="A")
 
-    def test_rfid_view_resolves_by_code(self):
-        client = APIClient()
-        url = reverse("tower-rfid", kwargs={"rfid_code": "ABC123"})
-        resp = client.get(url + f"?team={self.team.pk}")
-        self.assertEqual(resp.status_code, 200)
-
-    def test_rfid_challenge_form_auto_confirms_and_assigns(self):
-        client = APIClient()
-        url = reverse("tower-rfid-challenge")
+    def test_rfid_api_auto_confirms_and_assigns(self):
+        client, user = _authed_client(self.team)
         resp = client.post(
-            url,
-            {
-                "rfid_code": "ABC123",
-                "team_code": self.team.code,
-                "lat": 46.5,
-                "lng": 23.5,
-            },
+            "/api/team_tower_challenges/",
+            {"rfid_code": "ABC123", "lat": 46.5, "lng": 23.5},
+            format="json",
         )
-        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(resp.status_code, 201, resp.content)
         ttc = TeamTowerChallenge.objects.get(
             tower=self.rfid_tower, team=self.team,
         )
         self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(ttc.submitted_by, user)
         self.assertTrue(TeamTowerOwnership.objects.filter(
             tower=self.rfid_tower, team=self.team, timestamp_end__isnull=True,
         ).exists())
         self.assertEqual(Team.objects.get(pk=self.team.pk).score, 10)
 
-    def test_rfid_unknown_code_returns_404(self):
-        # Detail view should 404, not 500, for an unknown RFID code.
-        client = APIClient()
-        url = reverse("tower-rfid", kwargs={"rfid_code": "NOPE"})
-        resp = client.get(url)
-        self.assertEqual(resp.status_code, 404)
-
-    def test_rfid_challenge_outside_50m_rejected(self):
-        # The RFID form's clean() enforces the 50m proximity check.
-        client = APIClient()
-        lat = 46.5 + 200 / 111_111.0  # ~200m north
-        url = reverse("tower-rfid-challenge")
+    def test_rfid_api_unknown_code_returns_400(self):
+        client, _ = _authed_client(self.team)
         resp = client.post(
-            url,
-            {
-                "rfid_code": "ABC123",
-                "team_code": self.team.code,
-                "lat": lat,
-                "lng": 23.5,
-            },
+            "/api/team_tower_challenges/",
+            {"rfid_code": "NOPE", "lat": 46.5, "lng": 23.5},
+            format="json",
         )
-        # Form invalid → renders error template with 200 and no redirect
-        self.assertNotEqual(resp.status_code, 302)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rfid_api_outside_50m_rejected(self):
+        client, _ = _authed_client(self.team)
+        lat = 46.5 + 200 / 111_111.0  # ~200m north
+        resp = client.post(
+            "/api/team_tower_challenges/",
+            {"rfid_code": "ABC123", "lat": lat, "lng": 23.5},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
         self.assertFalse(TeamTowerChallenge.objects.filter(
             team=self.team, tower=self.rfid_tower,
         ).exists())
@@ -688,10 +687,10 @@ class APIEndpointsTest(TestCase):
         self.assertEqual(len(resp.json()), 2)
 
     def test_submission_creates_pending_record(self):
-        resp = self.client.post(
+        client, user = _authed_client(self.team)
+        resp = client.post(
             "/api/team_tower_challenges/",
             {
-                "team": self.team.pk,
                 "tower": self.tower.pk,
                 "challenge": self.challenge.pk,
                 "lat": 46.5,
@@ -705,6 +704,7 @@ class APIEndpointsTest(TestCase):
             team=self.team, tower=self.tower,
         )
         self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        self.assertEqual(ttc.submitted_by, user)
 
 
 # ---------------------------------------------------------------------------
@@ -796,10 +796,6 @@ class TemplateViewsTest(TestCase):
     # (`score-map-teme`, `admin:geogame_...`) that no longer exist after the
     # app rename. Those smoke tests were removed from Phase 0 scope; the
     # templates will be rewritten as Angular components in Phase 2.
-
-    def test_tower_challenge_template(self):
-        resp = self.client.get(reverse("tower-challenge"))
-        self.assertEqual(resp.status_code, 200)
 
 
 # ---------------------------------------------------------------------------

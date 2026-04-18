@@ -299,7 +299,20 @@ class TeamTowerChallenge(models.Model):
     timestamp_submitted = models.DateTimeField(auto_now_add=True)
     timestamp_verified = models.DateTimeField(null=True, blank=True)
     outcome = models.PositiveSmallIntegerField(choices=OUTCOME_CHOICES, default=PENDING)
-    checked_by = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, null=True, blank=True)
+    submitted_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='submitted_challenges',
+    )
+    checked_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='checked_challenges',
+    )
     response_text = models.TextField(null=True, blank=True)
     photo = models.ImageField(upload_to="photos", null=True, blank=True)
 
