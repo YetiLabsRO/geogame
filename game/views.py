@@ -3,7 +3,6 @@ from django.contrib.gis.measure import Distance
 from django.db import OperationalError, connection
 from django.db.models import Count, Q
 from django.http import JsonResponse
-from django.views.generic import TemplateView
 from rest_framework import permissions, viewsets
 
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
@@ -85,41 +84,6 @@ class TeamTowerChallengeViewSet(viewsets.ModelViewSet):
         ttc = serializer.save()
         if ttc.outcome == TeamTowerChallenge.CONFIRMED:
             ttc.tower.assign_to_team(ttc.team)
-
-
-class MapView(TemplateView):
-    template_name = "game/map.html"
-
-
-class ScoreMapView(TemplateView):
-    template_name = "game/map_score.html"
-
-    def dispatch(self, request, *args, **kwargs):
-        try:
-            self.team_group = TeamGroup.objects.get(slug=kwargs.get("team_short"))
-        except TeamGroup.DoesNotExist:
-            self.team_group = None
-
-        return super().dispatch(request, *args, **kwargs)
-
-    def get_context_data(self, **kwargs):
-        context = super(ScoreMapView, self).get_context_data(**kwargs)
-
-        context['team_group'] = self.team_group
-        return context
-
-
-class PendingChallenges(TemplateView):
-    template_name = "game/pending.html"
-
-    def get_context_data(self, **kwargs):
-        context = super(PendingChallenges, self).get_context_data(**kwargs)
-        context['pending_count'] = TeamTowerChallenge.objects.filter(outcome=TeamTowerChallenge.PENDING).count()
-        return context
-
-
-class RulesView(TemplateView):
-    template_name = "game/rules.html"
 
 
 def health(request):

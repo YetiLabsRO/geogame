@@ -790,28 +790,6 @@ class UnassignAllTest(TestCase):
 # ---------------------------------------------------------------------------
 
 
-class TemplateViewsTest(TestCase):
-    def setUp(self):
-        self.client = APIClient()
-        self.game = _make_game()
-        self.group = _make_group(self.game)
-
-    def test_map_view(self):
-        resp = self.client.get("/")
-        self.assertEqual(resp.status_code, 200)
-
-    def test_score_map(self):
-        resp = self.client.get(
-            reverse("score-map", kwargs={"team_short": self.group.slug}),
-        )
-        self.assertEqual(resp.status_code, 200)
-
-    # Note: rules.html and pending.html still reference legacy URL names
-    # (`score-map-teme`, `admin:geogame_...`) that no longer exist after the
-    # app rename. Those smoke tests were removed from Phase 0 scope; the
-    # templates will be rewritten as Angular components in Phase 2.
-
-
 # ---------------------------------------------------------------------------
 # Admin list_display callables (smoke coverage)
 # ---------------------------------------------------------------------------

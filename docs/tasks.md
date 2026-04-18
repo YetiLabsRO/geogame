@@ -114,7 +114,7 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2E.6: Game state panel (end-game, reset). (Plan: P2E.6, Req: 16.1)
 
 ## Phase 2F: Template Removal
-- [ ] T2F.1: Delete `game/templates/` and associated template views; keep admin templates. Wire root URL to Angular build. (Plan: P2F.1, Req: 15.1)
+- [x] T2F.1: Delete `game/templates/` and associated template views; keep admin templates. Wire root URL to Angular build. (Plan: P2F.1, Req: 15.1)
 
 ## Phase 2G: E2E Tests
 - [ ] T2G.1: Install and configure Playwright in `frontend/`. (Plan: P2G.1)

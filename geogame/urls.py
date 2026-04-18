@@ -34,10 +34,6 @@ from game.api import (
 )
 from game.views import (
     ChallengeViewSet,
-    MapView,
-    PendingChallenges,
-    RulesView,
-    ScoreMapView,
     TeamTowerChallengeViewSet,
     TeamViewSet,
     TowerViewSet,
@@ -65,10 +61,6 @@ admin_router.register(
 
 urlpatterns = [
     path('admin/', admin.site.urls),
-    path('', MapView.as_view()),
-    path('map/<str:team_short>/', ScoreMapView.as_view(), name="score-map"),
-    path('pending/', PendingChallenges.as_view()),
-    path('rules/', RulesView.as_view(), name="rules"),
     path('health/', health, name="health"),
     path('api/', include(router.urls)),
     path('api/towers/<int:pk>/state/', TowerStateView.as_view(), name='api-tower-state'),
