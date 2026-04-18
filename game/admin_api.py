@@ -1,9 +1,17 @@
+from django.db import transaction
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from game.models import Challenge, Tower, Zone
+from game.models import (
+    Challenge,
+    TeamTowerOwnership,
+    TeamZoneOwnership,
+    Tower,
+    Zone,
+)
 from organize.models import Team, TeamGroup
 
 
@@ -98,3 +106,30 @@ class AdminChallengeViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAdminUser]
     queryset = Challenge.objects.all().order_by('difficulty', 'id')
     serializer_class = AdminChallengeSerializer
+
+
+class ResetScoresView(APIView):
+    """Staff-only: zero out all Team.score and close every open ownership.
+
+    Intended as a "start a fresh round" button. Distinct from
+    unassign_all (which just closes current tower ownerships) in that
+    this also resets the locked, cumulative Team.score to 0.
+    """
+
+    permission_classes = [IsAdminUser]
+
+    @transaction.atomic
+    def post(self, request):
+        from django.utils import timezone
+        now = timezone.now()
+        TeamTowerOwnership.objects.filter(
+            timestamp_end__isnull=True,
+        ).update(timestamp_end=now)
+        TeamZoneOwnership.objects.filter(
+            timestamp_end__isnull=True,
+        ).update(timestamp_end=now)
+        updated = Team.objects.update(score=0)
+        return Response(
+            {'teams_reset': updated},
+            status=status.HTTP_200_OK,
+        )

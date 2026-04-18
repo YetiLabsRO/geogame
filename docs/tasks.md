@@ -110,8 +110,8 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2E.2: Tower/Zone/Team CRUD with activate/deactivate toggles and `unassign_all`. (Plan: P2E.2, Req: 16.1)
 - [x] T2E.3: Challenge management (list + create/edit; tower-specific or generic). (Plan: P2E.3, Req: 16.1)
 - [x] T2E.4: Invite management UI (list, create, revoke, resend). (Plan: P2E.4, Req: 14.3)
-- [ ] T2E.5: Live scoreboard (per-category tabs, 30s polling). (Plan: P2E.5, Req: 16.3)
-- [ ] T2E.6: Game state panel (end-game, reset). (Plan: P2E.6, Req: 16.1)
+- [x] T2E.5: Live scoreboard (per-category tabs, 30s polling). (Plan: P2E.5, Req: 16.3)
+- [x] T2E.6: Game state panel (end-game, reset). (Plan: P2E.6, Req: 16.1)
 
 ## Phase 2F: Template Removal
 - [ ] T2F.1: Delete `game/templates/` and associated template views; keep admin templates. Wire root URL to Angular build. (Plan: P2F.1, Req: 15.1)

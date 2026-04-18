@@ -25,6 +25,7 @@ from game.admin_api import (
     AdminTeamViewSet,
     AdminTowerViewSet,
     AdminZoneViewSet,
+    ResetScoresView,
 )
 from game.api import (
     StaffSubmissionList,
@@ -82,6 +83,11 @@ urlpatterns = [
         name='api-staff-submission-review',
     ),
     path('api/staff/', include(admin_router.urls)),
+    path(
+        'api/staff/game-state/reset-scores/',
+        ResetScoresView.as_view(),
+        name='api-staff-reset-scores',
+    ),
     path('api/', include('organize.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),

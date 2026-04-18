@@ -1044,6 +1044,24 @@ class StaffAdminEndpointsTest(TestCase):
         resp = self.player_client.get('/api/staff/challenges/')
         self.assertEqual(resp.status_code, 403)
 
+    def test_reset_scores_zeroes_every_team_and_closes_ownerships(self):
+        self.tower.assign_to_team(self.team)
+        self.team.score = 50
+        self.team.save()
+        resp = self.staff_client.post(
+            '/api/staff/game-state/reset-scores/', format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.team.refresh_from_db()
+        self.assertEqual(self.team.score, 0)
+        self.assertIsNone(self.tower.tower_control(self.group))
+
+    def test_reset_scores_requires_staff(self):
+        resp = self.player_client.post(
+            '/api/staff/game-state/reset-scores/', format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
 
 # ---------------------------------------------------------------------------
 # P2E.1 — Staff submission review endpoints

@@ -145,4 +145,11 @@ export class StaffApiService {
   deleteChallenge(id: number): Observable<void> {
     return this.http.delete<void>(`/api/staff/challenges/${id}/`);
   }
+
+  resetScores(): Observable<{ teams_reset: number }> {
+    return this.http.post<{ teams_reset: number }>(
+      '/api/staff/game-state/reset-scores/',
+      {},
+    );
+  }
 }

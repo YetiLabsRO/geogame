@@ -39,6 +39,18 @@ export const routes: Routes = [
       import('./admin/challenges.component').then((m) => m.ChallengesComponent),
   },
   {
+    path: 'scoreboard',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./scoreboard/scoreboard.component').then((m) => m.ScoreboardComponent),
+  },
+  {
+    path: 'game-state',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./game-state/game-state.component').then((m) => m.GameStateComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },

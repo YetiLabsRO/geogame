@@ -107,7 +107,9 @@ export interface TeamSummary {
   id: number;
   name: string;
   code: string;
-  group: string | null;
+  group: number | null;
+  group_name: string | null;
+  group_slug: string | null;
   current_score: number;
   color: string;
 }

@@ -42,9 +42,15 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 
 
 class TeamSerializer(serializers.HyperlinkedModelSerializer):
+    group_name = serializers.CharField(source='group.name', read_only=True, default=None)
+    group_slug = serializers.CharField(source='group.slug', read_only=True, default=None)
+
     class Meta:
         model = Team
-        fields = ["id", "name", "code", "group", "current_score", "color"]
+        fields = [
+            "id", "name", "code", "group", "group_name", "group_slug",
+            "current_score", "color",
+        ]
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
