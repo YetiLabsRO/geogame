@@ -88,9 +88,9 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2A.5: Add `GET/POST /api/current-game/` endpoint (stubbed against a default game; fully wired in Phase 3). (Plan: P2A.5, Req: 13.3, 18.1)
 
 ## Phase 2B: Angular Scaffold
-- [ ] T2B.1: Initialize Angular v21 workspace at `frontend/` with `player`, `staff`, and `shared` projects. (Plan: P2B.1, Req: 15.1, 16.1)
-- [ ] T2B.2: Add `.mcp.json` with `angular-cli` MCP server; document usage in `.claude/guidelines.md`. (Plan: P2B.2)
-- [ ] T2B.3: Configure dev proxy (`/api/`, `/admin/` → `:8000`) and production build output paths. (Plan: P2B.3, Req: 15.1)
+- [x] T2B.1: Initialize Angular v21 workspace at `frontend/` with `player`, `staff`, and `shared` projects. (Plan: P2B.1, Req: 15.1, 16.1)
+- [x] T2B.2: Add `.mcp.json` with `angular-cli` MCP server; document usage in `.claude/guidelines.md`. (Plan: P2B.2)
+- [x] T2B.3: Configure dev proxy (`/api/`, `/admin/` → `:8000`) and production build output paths. (Plan: P2B.3, Req: 15.1)
 
 ## Phase 2C: Player UI
 - [ ] T2C.1: Login, register, password-reset, and invite-accept landing screens. (Plan: P2C.1, Req: 13.1, 14.2)

@@ -25,3 +25,12 @@ cercetador/local_settings*
 .coverage
 coverage.xml
 htmlcov/
+
+# Django collectstatic output
+staticfiles/
+
+# Frontend build artifacts
+frontend/node_modules/
+frontend/dist/
+frontend/.angular/
+frontend/tmp/

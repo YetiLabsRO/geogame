@@ -207,13 +207,38 @@ server {
         access_log off;
     }
 
-    location / {
+    # Django routes that must hit the app server (API + admin only).
+    # Once the Angular apps replace the last template views (Phase 2F), the
+    # catch-all `location /` below will serve the player SPA, and the admin/
+    # api locations below keep routing to gunicorn.
+    location /api/ {
         proxy_pass http://geogame_app;
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_read_timeout 60s;
+        client_max_body_size 20M;
+    }
+
+    location /admin/ {
+        proxy_pass http://geogame_app;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+    }
+
+    # Angular player SPA (fallback to index.html for client-side routes).
+    location / {
+        root /var/app/cercetador/frontend/dist/player/browser;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Angular staff SPA, served under a subpath.
+    location /staff/ {
+        alias /var/app/cercetador/frontend/dist/staff/browser/;
+        try_files $uri $uri/ /staff/index.html;
     }
 }
 NGINX
@@ -224,7 +249,22 @@ sudo nginx -t && sudo systemctl reload nginx
 
 The dedicated `/health/` location block exists so nginx logs stay quiet (`access_log off`) and so the endpoint can be sanity-checked even if you later move the main `location /` to serve a static Angular build. `/health/` must always reach Django — it's the deploy workflow's smoke test.
 
-### 8. TLS via Let's Encrypt
+### 8. Angular build
+
+The deploy workflow only touches Django — the Angular apps are built separately on the VPS and served as static files by nginx. Bootstrap once:
+
+```bash
+cd /var/app/cercetador/frontend
+# Install Node 20.19+ via nvm or apt. For nvm:
+#   curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/master/install.sh | bash
+#   nvm install 20
+npm ci
+npm run build:all   # writes frontend/dist/{player,staff}/browser
+```
+
+Rerun `npm run build:all` after any `git pull` that touches `frontend/`. A future deploy workflow step will do this automatically; for now, it's a manual step or a git hook.
+
+### 9. TLS via Let's Encrypt
 
 ```bash
 sudo certbot --nginx -d cercetador.albascout.ro \

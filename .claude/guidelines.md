@@ -10,13 +10,15 @@ Project-specific guidelines for AI assistants working on the `cercetador` Django
 - Backend: Django 5.1 (Python 3.12)
 - Geospatial: PostGIS + GeoDjango (`django.contrib.gis`), django-leaflet, DRF + `rest_framework_gis`
 - Database: PostgreSQL with PostGIS extension (psycopg2 driver)
-- Frontend: Django templates (being replaced by Angular v21 — see Phase 2 in `docs/plan.md`)
+- Frontend: Angular v21 workspace at `frontend/` — two apps (`player`, `staff`) plus a `shared` library. Bootstrap 5 + bootstrap-icons + Leaflet. Token auth via the `tokenInterceptor` from the `shared` lib.
 - Two Django apps:
   - `game` — Zone, Tower, Challenge, TeamTowerChallenge, ownership records
   - `organize` — Game, TeamGroup, Team, Player (per-game rosters)
 - Project module: `geogame` (settings/urls/wsgi). Despite the repo root being named `cercetador`, the Python project module is `geogame`. `DJANGO_SETTINGS_MODULE=geogame.settings`.
 
 **Python interpreter**: `/home/yeti/.virtualenvs/cercetador/bin/python` (Python 3.12.4, plain virtualenv — NOT pyenv). Runtime deps in `requirements.txt`, dev deps (coverage, ruff, ipython) in `requirements-dev.txt`.
+
+**Node / Angular**: Node 20.19+ / npm 10.8+. Angular CLI v21.2 (dev dependency of `frontend/`).
 
 ## Path Guidelines
 - ALWAYS use Linux-style paths with forward slashes `/`
@@ -53,10 +55,43 @@ VS Code launch configurations in `.vscode/launch.json` wrap these same commands 
 
 ## Tests & CI
 
-- Run the full suite: `coverage run manage.py test game --noinput && coverage report --fail-under=80`
-- Tests live in `game/tests.py`, organized by feature area (see file docstring).
+- Run the full suite: `coverage run manage.py test game organize --noinput && coverage report --fail-under=80`
+- Backend tests live in `game/tests.py` and `organize/tests.py`, organized by feature area.
 - CI workflow: `.github/workflows/ci.yml` — PostGIS 3.4 service container, runs ruff + tests + coverage gate.
-- Deploy workflow: `.github/workflows/deploy-geogame.yaml` — SSHes to prod VPS on push to main.
+- Deploy workflow: `.github/workflows/deploy.yml` — SSHes to prod VPS on push to main, runs the `/health/` smoke test.
+
+## Frontend (Angular v21)
+
+The Angular workspace lives at `frontend/`:
+- **Projects**: `player` (default, port 4200), `staff` (port 4201), `shared` (library — `AuthService`, `tokenInterceptor`, and reusable components).
+- **Styles**: Bootstrap 5 via node_modules, Leaflet CSS, bootstrap-icons. No ng-bootstrap; use plain Bootstrap classes + the bundled JS.
+- **TypeScript path**: `import { AuthService, tokenInterceptor } from 'shared';` — maps to `projects/shared/src/public-api.ts` at build time (see [tsconfig.json](../frontend/tsconfig.json)).
+- **Dev proxy**: [frontend/proxy.conf.json](../frontend/proxy.conf.json) routes `/api/`, `/admin/`, `/media/`, `/static/`, `/health/` to Django on `:8000`. Start Django on 8000 before `npm start`.
+
+Common commands (run from `frontend/`):
+
+```bash
+npm start                 # player on :4200 (proxies to Django on :8000)
+npm run start:staff       # staff on :4201
+npm run build:all         # build both apps → frontend/dist/{player,staff}
+npx ng generate component some-name --project=player
+```
+
+### MCP
+
+[.mcp.json](../.mcp.json) at the repo root registers two MCP servers for Claude Code:
+- `angular-cli` — Angular CLI MCP, exposes `ng generate`, docs lookups, and project introspection.
+- `chrome-devtools` — Chrome DevTools MCP, lets you drive a real browser to exercise the running app.
+
+Both are launched via `npx -y` on demand; no global install needed.
+
+### Angular style
+
+- Use **standalone components** (default in v21). Avoid NgModules.
+- Use **signals** for reactive state; `computed()` / `effect()` instead of RxJS where possible. Keep Observables for HTTP.
+- Template control flow: `@if` / `@for` / `@switch` instead of `*ngIf`/`*ngFor`.
+- Import shared code via `import { ... } from 'shared';` — never relative `../../shared/...`.
+- Prettier config is in `frontend/package.json` (100 char, single quotes).
 
 ## Django Style
 
