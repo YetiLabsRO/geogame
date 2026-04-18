@@ -136,6 +136,9 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/3.1/howto/static-files/
 
 STATIC_URL = '/static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
+
+MEDIA_URL = '/media/'
 
 REST_FRAMEWORK = {
     # Use Django's standard `django.contrib.auth` permiss1ions,
@@ -153,7 +156,7 @@ LEAFLET_CONFIG = {
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8000")
 
-MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_ROOT = BASE_DIR / 'media'
 
 try:
     from .local_settings import *

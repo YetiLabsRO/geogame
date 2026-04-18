@@ -76,9 +76,9 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T0.14: Add `GET /health/` endpoint with DB reachability check. (Plan: P0.6, Req: 12.3)
 
 ## Phase 1: GHA Deploy to VPS
-- [ ] T1.1: Create `.github/workflows/deploy.yml` SSH-to-VPS deploy workflow (pull, install, migrate, collectstatic, reload gunicorn, curl /health/). (Plan: P1.1, Req: 12.1)
-- [ ] T1.2: Write `docs/deployment.md` with gunicorn systemd unit, nginx config template, PostgreSQL+PostGIS provisioning, Let's Encrypt setup. (Plan: P1.2, Req: 12.1)
-- [ ] T1.3: Wire `/health/` through nginx proxy; verify accessible from public domain. (Plan: P1.3, Req: 12.1, 12.3)
+- [x] T1.1: Create `.github/workflows/deploy.yml` SSH-to-VPS deploy workflow (pull, install, migrate, collectstatic, reload gunicorn, curl /health/). (Plan: P1.1, Req: 12.1)
+- [x] T1.2: Write `docs/deployment.md` with gunicorn supervisord unit, nginx config template, PostgreSQL+PostGIS provisioning, Let's Encrypt setup. (Plan: P1.2, Req: 12.1)
+- [x] T1.3: Wire `/health/` through nginx proxy; verify accessible from public domain. (Plan: P1.3, Req: 12.1, 12.3)
 
 ## Phase 2A: DRF API Expansion
 - [ ] T2A.1: Enable DRF token authentication; add `POST /api/auth/login`, `logout`, `register`, `password-reset`. (Plan: P2A.1, Req: 13.1)

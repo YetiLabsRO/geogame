@@ -1,0 +1,73 @@
+name: Deploy to production
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Deploy to VPS
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      APP_DIR: /var/app/cercetador
+      HEALTH_URL: https://cercetador.albascout.ro/health/
+
+    steps:
+      - name: Configure SSH
+        env:
+          SSH_USER: ${{ vars.SSH_USER }}
+          SSH_KEY: ${{ secrets.SSH_KEY }}
+          SSH_HOST: ${{ vars.SSH_HOST }}
+          SSH_PORT: ${{ vars.SSH_PORT }}
+        run: |
+          mkdir -p ~/.ssh/
+          echo "$SSH_KEY" > ~/.ssh/production.key
+          chmod 600 ~/.ssh/production.key
+          cat >>~/.ssh/config <<END
+          Host production
+            HostName $SSH_HOST
+            Port $SSH_PORT
+            User $SSH_USER
+            IdentityFile ~/.ssh/production.key
+            StrictHostKeyChecking no
+          END
+
+      - name: Stop gunicorn
+        run: ssh production 'sudo supervisorctl stop geogame'
+
+      - name: Fetch latest main
+        run: ssh production "cd $APP_DIR && git fetch && git reset --hard origin/main"
+
+      - name: Install Python dependencies
+        run: ssh production "cd $APP_DIR && .venv/bin/pip install -r requirements.txt"
+
+      - name: Run migrations
+        run: ssh production "cd $APP_DIR && .venv/bin/python manage.py migrate --noinput"
+
+      - name: Collect static files
+        run: ssh production "cd $APP_DIR && .venv/bin/python manage.py collectstatic --noinput"
+
+      - name: Start gunicorn
+        if: ${{ always() }}
+        run: ssh production 'sudo supervisorctl start geogame'
+
+      - name: Health check
+        run: |
+          for i in 1 2 3 4 5; do
+            if curl -fsS --max-time 10 "$HEALTH_URL"; then
+              echo
+              echo "Health check passed on attempt $i"
+              exit 0
+            fi
+            echo "Attempt $i failed, retrying in 3s..."
+            sleep 3
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1
