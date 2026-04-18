@@ -19,6 +19,7 @@ from django.contrib import admin
 from django.urls import include, path
 from rest_framework import routers
 
+from game.api import TowerStateView
 from game.views import (
     ChallengeViewSet,
     MapView,
@@ -47,6 +48,7 @@ urlpatterns = [
     path('rules/', RulesView.as_view(), name="rules"),
     path('health/', health, name="health"),
     path('api/', include(router.urls)),
+    path('api/towers/<int:pk>/state/', TowerStateView.as_view(), name='api-tower-state'),
     path('api/', include('organize.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),

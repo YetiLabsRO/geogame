@@ -2,6 +2,35 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
+export interface TowerState {
+  id: number;
+  name: string;
+  category: number;
+  location: { type: 'Point'; coordinates: [number, number] };
+  has_initial_bonus: boolean;
+  ownership: { team_id: number; team_name: string; team_color: string } | null;
+  next_challenge: { id: number; text: string; difficulty: number; tower: number | null } | null;
+  pending_submission: boolean;
+  cooloff_until: string | null;
+  proximity_meters: number;
+}
+
+export interface ChallengeSubmitPayload {
+  tower: number;
+  challenge: number;
+  photo?: string;
+  lat: number;
+  lng: number;
+}
+
+export interface ChallengeSubmitResponse {
+  id: number;
+  tower: number;
+  challenge: number;
+  outcome: number;
+  timestamp_submitted: string;
+}
+
 export interface CurrentGame {
   id: number;
   name: string;
@@ -53,5 +82,16 @@ export class GameApiService {
 
   towers(): Observable<TowerFeature[]> {
     return this.http.get<TowerFeature[]>('/api/towers/');
+  }
+
+  towerState(id: number): Observable<TowerState> {
+    return this.http.get<TowerState>(`/api/towers/${id}/state/`);
+  }
+
+  submitChallenge(payload: ChallengeSubmitPayload): Observable<ChallengeSubmitResponse> {
+    return this.http.post<ChallengeSubmitResponse>(
+      '/api/team_tower_challenges/',
+      payload,
+    );
   }
 }
