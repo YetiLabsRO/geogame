@@ -903,6 +903,109 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P2C.3 — Tower state endpoint
+# ---------------------------------------------------------------------------
+
+
+class TowerStateEndpointTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name="Alpha", zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text="Sing a song", difficulty=1, tower=self.tower,
+        )
+        self.client, self.user = _authed_client(self.team)
+
+    def _url(self, tower_id=None):
+        return reverse('api-tower-state', args=[tower_id or self.tower.id])
+
+    def test_requires_auth(self):
+        anon = APIClient()
+        resp = anon.get(self._url())
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_returns_state_for_active_tower(self):
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data['id'], self.tower.id)
+        self.assertEqual(data['name'], 'Alpha')
+        self.assertEqual(data['proximity_meters'], 50)
+        self.assertEqual(data['next_challenge']['id'], self.challenge.id)
+        self.assertIsNone(data['cooloff_until'])
+        self.assertFalse(data['pending_submission'])
+
+    def test_404_for_inactive_tower(self):
+        self.tower.is_active = False
+        self.tower.save()
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_404_for_user_without_active_team(self):
+        User.objects.filter(username='nomad').delete()
+        user = User.objects.create_user(
+            username='nomad', email='n@x.com', password='password123',
+        )
+        token = Token.objects.create(user=user)
+        bare = APIClient()
+        bare.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = bare.get(self._url())
+        self.assertEqual(resp.status_code, 404)
+
+    def test_pending_submission_hides_next_challenge(self):
+        TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            outcome=TeamTowerChallenge.PENDING,
+        )
+        resp = self.client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertTrue(data['pending_submission'])
+        self.assertIsNone(data['next_challenge'])
+
+    def test_recent_rejection_produces_cooloff_until(self):
+        ttc = TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            outcome=TeamTowerChallenge.REJECTED,
+        )
+        # Manually stamp verified time (save() side-effects won't apply
+        # because we constructed with outcome=REJECTED directly).
+        ttc.timestamp_verified = timezone.now()
+        ttc.save()
+        resp = self.client.get(self._url())
+        data = resp.json()
+        self.assertIsNotNone(data['cooloff_until'])
+
+    def test_old_rejection_does_not_produce_cooloff(self):
+        ttc = TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            outcome=TeamTowerChallenge.REJECTED,
+        )
+        ttc.timestamp_verified = timezone.now() - timedelta(minutes=10)
+        ttc.save()
+        resp = self.client.get(self._url())
+        data = resp.json()
+        self.assertIsNone(data['cooloff_until'])
+
+    def test_ownership_returned_when_team_in_same_group_owns(self):
+        # Assign tower to our team; the ownership lookup is group-scoped.
+        self.tower.assign_to_team(self.team)
+        resp = self.client.get(self._url())
+        data = resp.json()
+        self.assertIsNotNone(data['ownership'])
+        self.assertEqual(data['ownership']['team_id'], self.team.id)
+
+
+# ---------------------------------------------------------------------------
 # P0.14 — /health/ endpoint
 # ---------------------------------------------------------------------------
 

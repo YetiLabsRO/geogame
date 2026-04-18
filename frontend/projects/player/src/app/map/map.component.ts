@@ -131,7 +131,9 @@ export class MapComponent {
     const bonus = tower.has_initial_bonus
       ? '<div class="small text-success">Initial bonus available</div>'
       : '';
-    return `<div class="fw-semibold">${name}</div>${ownerLine}${bonus}`;
+    const detailLink =
+      `<a class="btn btn-sm btn-primary mt-2" href="/tower/${tower.id}">View details</a>`;
+    return `<div class="fw-semibold">${name}</div>${ownerLine}${bonus}${detailLink}`;
   }
 }
 

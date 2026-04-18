@@ -10,6 +10,12 @@ export const routes: Routes = [
     loadComponent: () => import('./map/map.component').then((m) => m.MapComponent),
   },
   {
+    path: 'tower/:id',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./tower/tower-detail.component').then((m) => m.TowerDetailComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },
