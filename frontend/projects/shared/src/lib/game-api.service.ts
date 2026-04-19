@@ -34,11 +34,15 @@ export interface ChallengeSubmitResponse {
 export interface CurrentGame {
   id: number;
   name: string;
+  slug: string;
   is_active: boolean;
   start_time: string;
   end_time: string;
   base_point: { type: 'Point'; coordinates: [number, number] } | null;
   base_zoom_level: number;
+  proximity_meters: number;
+  cooloff_minutes: number;
+  initial_bonus_default: number;
 }
 
 export interface ZoneFeature {

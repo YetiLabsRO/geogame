@@ -129,7 +129,7 @@ Parallel Sessions on the same Game share tower/zone/challenge data but keep
 separate scoreboards. Creating a new Session on an existing Game replaces
 the earlier `clone_game` idea.
 
-- [ ] T3.1: Add Game config fields (`slug` unique, `proximity_meters`, `cooloff_minutes`, `initial_bonus_default`, `created_by`, `created_at`); add `game` FK to `game.Challenge` with backfill from `tower.game`. (Plan: P3.1, Req: 17.1)
+- [x] T3.1: Add Game config fields (`slug` unique, `proximity_meters`, `cooloff_minutes`, `initial_bonus_default`, `created_by`, `created_at`); add `game` FK to `game.Challenge` with backfill from `tower.game`. (Plan: P3.1, Req: 17.1)
 - [ ] T3.2: Add `organize.Session` model (`game`, `slug`, `name`, `start_time`, `end_time`, `is_active`, `created_by`, `created_at`); data migration creates a default Session per existing Game inheriting its dates/flags, re-parents every `Team` off `Game` onto `Session`, drops `Team.game` + `Game.start_time` + `Game.end_time`. (Plan: P3.2, Req: 18.1)
 - [ ] T3.3: Rename `UserProfile.current_game` → `current_session`; replace `/api/current-game/` with `/api/current-session/` (returns session + nested game). (Plan: P3.3, Req: 18.2)
 - [ ] T3.4: Denormalize `TeamMembership.game` (kept in sync with `team.session.game`); add conditional unique constraint `(user, game) where is_active=True`; surface friendly errors on conflict in invite-accept + admin flows. (Plan: P3.4, Req: 18.3)

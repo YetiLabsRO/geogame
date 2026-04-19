@@ -232,11 +232,15 @@ class MyTeamView(APIView):
 class GameStubSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     name = serializers.CharField()
+    slug = serializers.CharField()
     is_active = serializers.BooleanField()
     start_time = serializers.DateTimeField()
     end_time = serializers.DateTimeField()
     base_point = serializers.SerializerMethodField()
     base_zoom_level = serializers.IntegerField()
+    proximity_meters = serializers.IntegerField()
+    cooloff_minutes = serializers.IntegerField()
+    initial_bonus_default = serializers.IntegerField()
 
     def get_base_point(self, game):
         if game.base_point is None:

@@ -221,6 +221,9 @@ export class ChallengesComponent {
         text: raw.text,
         tower: raw.tower,
         difficulty: raw.difficulty,
+        // game is derived server-side once T3.5 scoping lands; in the
+        // meantime the backfill migration covers existing rows.
+        game: null,
       })
       .subscribe({
         next: () => {

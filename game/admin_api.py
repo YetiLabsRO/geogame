@@ -45,7 +45,7 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
 class AdminChallengeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Challenge
-        fields = ('id', 'text', 'tower', 'difficulty')
+        fields = ('id', 'game', 'text', 'tower', 'difficulty')
 
 
 class AdminZoneViewSet(viewsets.ModelViewSet):

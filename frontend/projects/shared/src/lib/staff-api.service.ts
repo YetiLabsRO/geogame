@@ -62,6 +62,7 @@ export interface AdminTeamGroup {
 
 export interface AdminChallenge {
   id: number;
+  game: number | null;
   text: string;
   tower: number | null;
   difficulty: number;

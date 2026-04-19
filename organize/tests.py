@@ -23,10 +23,18 @@ from organize.models import (
 User = get_user_model()
 
 
-def _make_game(name='Game A'):
+def _make_game(name='Game A', slug=None):
     now = timezone.now()
+    if slug is None:
+        from django.utils.text import slugify
+        base = slugify(name) or 'game'
+        slug, counter = base, 2
+        while Game.objects.filter(slug=slug).exists():
+            slug = f'{base}-{counter}'
+            counter += 1
     return Game.objects.create(
         name=name,
+        slug=slug,
         start_time=now,
         end_time=now + timedelta(hours=1),
     )
@@ -263,17 +271,22 @@ class CurrentGameTest(TestCase):
     def test_returns_active_game(self):
         now = timezone.now()
         Game.objects.create(
-            name='Inactive', is_active=False,
+            name='Inactive', slug='inactive', is_active=False,
             start_time=now, end_time=now + timedelta(hours=1),
         )
         active = Game.objects.create(
-            name='Live', is_active=True,
+            name='Live', slug='live', is_active=True,
             start_time=now, end_time=now + timedelta(hours=1),
         )
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()['id'], active.id)
-        self.assertEqual(resp.json()['name'], 'Live')
+        body = resp.json()
+        self.assertEqual(body['id'], active.id)
+        self.assertEqual(body['name'], 'Live')
+        self.assertEqual(body['slug'], 'live')
+        self.assertEqual(body['proximity_meters'], 50)
+        self.assertEqual(body['cooloff_minutes'], 5)
+        self.assertEqual(body['initial_bonus_default'], 0)
 
     def test_returns_404_when_no_active_game(self):
         resp = self.client.get(self.url)

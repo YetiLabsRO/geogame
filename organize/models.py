@@ -11,14 +11,32 @@ from smart_selects.db_fields import ChainedForeignKey
 
 class Game(models.Model):
     name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=64, unique=True)
 
     base_point = PointField(null=True, blank=True)
     base_zoom_level = models.PositiveSmallIntegerField(default=15)
 
+    # start_time / end_time stay on Game through T3.1 to keep the migration
+    # incremental; they move onto Session in T3.2.
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
 
     is_active = models.BooleanField(default=False)
+
+    # Per-game rule defaults. Existing callers hardcode 50m / 5min;
+    # T3.6 will wire these through the request path.
+    proximity_meters = models.PositiveSmallIntegerField(default=50)
+    cooloff_minutes = models.PositiveSmallIntegerField(default=5)
+    initial_bonus_default = models.PositiveIntegerField(default=0)
+
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='games_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
 
     def __str__(self):
         return self.name

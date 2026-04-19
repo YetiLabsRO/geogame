@@ -62,10 +62,18 @@ def _authed_client(team, username='scout'):
 # ---------------------------------------------------------------------------
 
 
-def _make_game(name="Game A"):
+def _make_game(name="Game A", slug=None):
     now = timezone.now()
+    if slug is None:
+        from django.utils.text import slugify
+        base = slugify(name) or 'game'
+        slug, counter = base, 2
+        while Game.objects.filter(slug=slug).exists():
+            slug = f'{base}-{counter}'
+            counter += 1
     return Game.objects.create(
         name=name,
+        slug=slug,
         start_time=now,
         end_time=now + timedelta(hours=1),
     )
@@ -895,6 +903,58 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P3.1 — Game config fields + Challenge.game FK
+# ---------------------------------------------------------------------------
+
+
+class GameConfigFieldsTest(TestCase):
+    def test_defaults_match_legacy_constants(self):
+        game = _make_game(name='Default Defaults')
+        self.assertEqual(game.proximity_meters, 50)
+        self.assertEqual(game.cooloff_minutes, 5)
+        self.assertEqual(game.initial_bonus_default, 0)
+
+    def test_slug_is_unique(self):
+        from django.db import IntegrityError
+        _make_game(name='Event One', slug='shared')
+        with self.assertRaises(IntegrityError):
+            _make_game(name='Event Two', slug='shared')
+
+    def test_created_by_optional(self):
+        staff = User.objects.create_user(
+            username='founder', email='f@x.com', password='pw',
+        )
+        game = _make_game(name='With Founder')
+        game.created_by = staff
+        game.save()
+        game.refresh_from_db()
+        self.assertEqual(game.created_by, staff)
+
+
+class ChallengeGameFKTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+
+    def test_challenge_can_be_attached_to_game(self):
+        c = Challenge.objects.create(
+            text='demo', difficulty=1, tower=self.tower, game=self.game,
+        )
+        self.assertEqual(c.game, self.game)
+        # And it flows through the reverse relation on Game.
+        self.assertIn(c, list(self.game.challenges.all()))
+
+    def test_challenge_game_still_nullable_this_phase(self):
+        # T3.1 keeps challenge.game nullable so the data migration can
+        # run cleanly; a later phase will tighten the constraint.
+        c = Challenge.objects.create(
+            text='orphan', difficulty=1, tower=None, game=None,
+        )
+        self.assertIsNone(c.game)
+
+
+# ---------------------------------------------------------------------------
 # P2E.2 — Staff admin CRUD endpoints
 # ---------------------------------------------------------------------------
 
@@ -988,14 +1048,20 @@ class StaffAdminEndpointsTest(TestCase):
         self.assertEqual(resp.json()[0]['slug'], self.group.slug)
 
     def test_challenge_crud(self):
-        # Create
+        # Create — pin to the game so scoping (T3.5) will surface it.
         resp = self.staff_client.post(
             '/api/staff/challenges/',
-            {'text': 'Do a thing', 'tower': self.tower.id, 'difficulty': 2},
+            {
+                'game': self.game.id,
+                'text': 'Do a thing',
+                'tower': self.tower.id,
+                'difficulty': 2,
+            },
             format='json',
         )
         self.assertEqual(resp.status_code, 201, resp.content)
         challenge_id = resp.json()['id']
+        self.assertEqual(resp.json()['game'], self.game.id)
 
         # List
         resp = self.staff_client.get('/api/staff/challenges/')

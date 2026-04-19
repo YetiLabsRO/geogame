@@ -54,6 +54,7 @@ class Command(BaseCommand):
         now = timezone.now()
         game = Game.objects.create(
             name=f'{MARKER}-game',
+            slug=f'{MARKER}-game',
             is_active=True,
             start_time=now - timedelta(hours=1),
             end_time=now + timedelta(hours=4),

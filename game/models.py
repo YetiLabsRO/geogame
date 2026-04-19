@@ -272,6 +272,16 @@ class Tower(models.Model):
 
 
 class Challenge(models.Model):
+    # game is nullable at the column level through T3.1 so the data
+    # migration can backfill; T3.2 tightens to NOT NULL once every row
+    # is attached to a Game.
+    game = models.ForeignKey(
+        "organize.Game",
+        null=True,
+        blank=True,
+        on_delete=models.CASCADE,
+        related_name='challenges',
+    )
     text = models.TextField(null=False, blank=False)
     tower = models.ForeignKey(Tower, null=True, blank=True, on_delete=models.CASCADE)
     difficulty = models.PositiveSmallIntegerField(default=1)
