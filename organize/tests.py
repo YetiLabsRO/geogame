@@ -40,8 +40,28 @@ def _make_game(name='Game A', slug=None):
     )
 
 
+def _default_session(game):
+    from organize.models import Session
+    session = Session.objects.filter(game=game, slug='default').first()
+    if session is None:
+        session = Session.objects.create(
+            game=game,
+            slug='default',
+            name='Default session',
+            start_time=game.start_time,
+            end_time=game.end_time,
+            is_active=game.is_active,
+        )
+    return session
+
+
 def _make_team(game, name='Lynx', code='LYNX'):
-    return Team.objects.create(name=name, game=game, code=code, color='#ff0000')
+    return Team.objects.create(
+        name=name,
+        session=_default_session(game),
+        code=code,
+        color='#ff0000',
+    )
 
 
 class UserProfileSignalTest(TestCase):
@@ -263,6 +283,86 @@ class MyTeamEndpointTest(TestCase):
         )
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 404)
+
+
+class SessionModelTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+
+    def test_can_host_multiple_sessions_per_game(self):
+        from organize.models import Session
+        now = timezone.now()
+        s1 = Session.objects.create(
+            game=self.game, slug='morning', name='Morning',
+            start_time=now, end_time=now + timedelta(hours=2),
+            is_active=True,
+        )
+        s2 = Session.objects.create(
+            game=self.game, slug='afternoon', name='Afternoon',
+            start_time=now + timedelta(hours=3),
+            end_time=now + timedelta(hours=5),
+            is_active=True,
+        )
+        self.assertEqual(self.game.sessions.count(), 2)
+        self.assertNotEqual(s1.pk, s2.pk)
+
+    def test_session_slug_unique_per_game_not_global(self):
+        from django.db import IntegrityError
+
+        from organize.models import Session
+
+        other_game = _make_game(name='Other', slug='other')
+        now = timezone.now()
+        Session.objects.create(
+            game=self.game, slug='default', name='A',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        # Same slug, different game — OK.
+        Session.objects.create(
+            game=other_game, slug='default', name='B',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        # Same slug, same game — IntegrityError.
+        with self.assertRaises(IntegrityError):
+            Session.objects.create(
+                game=self.game, slug='default', name='A-dup',
+                start_time=now, end_time=now + timedelta(hours=1),
+            )
+
+
+class TeamSessionReparentingTest(TestCase):
+    def test_team_attaches_to_session_and_game_is_derived(self):
+        game = _make_game()
+        team = _make_team(game)
+        # _make_team auto-creates a default session for this game.
+        self.assertIsNotNone(team.session)
+        self.assertEqual(team.session.game, game)
+        # The convenience accessor also works.
+        self.assertEqual(team.game, game)
+
+    def test_two_sessions_same_game_keep_separate_teams(self):
+        from organize.models import Session, Team
+        game = _make_game()
+        now = timezone.now()
+        session_a = Session.objects.create(
+            game=game, slug='A', name='A',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        session_b = Session.objects.create(
+            game=game, slug='B', name='B',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        Team.objects.create(
+            name='a-team', session=session_a, code='ATEAM', color='#111',
+        )
+        Team.objects.create(
+            name='b-team', session=session_b, code='BTEAM', color='#222',
+        )
+        self.assertEqual(session_a.teams.count(), 1)
+        self.assertEqual(session_b.teams.count(), 1)
+        self.assertNotEqual(
+            session_a.teams.first(), session_b.teams.first(),
+        )
 
 
 class CurrentGameTest(TestCase):

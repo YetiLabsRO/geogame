@@ -31,9 +31,16 @@ class AdminTowerSerializer(serializers.ModelSerializer):
 
 
 class AdminTeamSerializer(serializers.ModelSerializer):
+    # Read-only `game` derived from session.game for convenience in the
+    # staff UI. Writes always go through `session`.
+    game = serializers.IntegerField(source='session.game_id', read_only=True)
+
     class Meta:
         model = Team
-        fields = ('id', 'name', 'game', 'code', 'group', 'color', 'description')
+        fields = (
+            'id', 'name', 'session', 'game',
+            'code', 'group', 'color', 'description',
+        )
 
 
 class AdminTeamGroupSerializer(serializers.ModelSerializer):

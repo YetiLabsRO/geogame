@@ -6,7 +6,6 @@ from django.contrib.gis.db.models import PointField
 from django.db import models
 from django.db.models import ManyToManyField
 from django.utils import timezone
-from smart_selects.db_fields import ChainedForeignKey
 
 
 class Game(models.Model):
@@ -63,17 +62,55 @@ class TeamGroup(models.Model):
         unique_together = (('game', 'slug'),)
 
 
+class Session(models.Model):
+    """A single run of a Game with its own roster and scoreboard.
+
+    Multiple sessions on the same Game share Zone / Tower / Challenge /
+    TeamGroup configuration but keep separate Teams and ownership
+    state. Each session carries its own clock; shared-clock
+    SessionGroups are a future phase.
+    """
+
+    game = models.ForeignKey(
+        Game, on_delete=models.CASCADE, related_name='sessions',
+    )
+    slug = models.SlugField(max_length=64)
+    name = models.CharField(max_length=255)
+    start_time = models.DateTimeField()
+    end_time = models.DateTimeField()
+    is_active = models.BooleanField(default=False)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='sessions_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True, null=True)
+
+    class Meta:
+        unique_together = (('game', 'slug'),)
+
+    def __str__(self):
+        return f'{self.game.slug}/{self.slug}'
+
+
 class Team(models.Model):
     name = models.CharField(max_length=255)
-    game = models.ForeignKey(Game, on_delete=models.CASCADE)
+    session = models.ForeignKey(
+        Session, on_delete=models.CASCADE, related_name='teams',
+    )
+    # `code` is globally unique through Phase 3; T3.4 may move it to
+    # unique-per-session once the team-onboarding flow is revisited.
     code = models.CharField(max_length=8, unique=True)
-    group = ChainedForeignKey(
+    # ChainedForeignKey dropped in T3.2 — with Team.game removed, a
+    # single-hop chain from Team to TeamGroup would have to traverse
+    # session.game, which smart_selects cannot express.
+    group = models.ForeignKey(
         TeamGroup,
         on_delete=models.CASCADE,
-        chained_field="game",
-        chained_model_field="game",
         blank=True,
-        null=True
+        null=True,
     )
     color = ColorField()
     description = models.TextField(null=True, blank=True)
@@ -82,6 +119,11 @@ class Team(models.Model):
     )
 
     score = models.PositiveIntegerField(default=0)
+
+    @property
+    def game(self):
+        """Convenience accessor: a Team's Game is its Session's Game."""
+        return self.session.game
 
     def __str__(self):
         return self.name

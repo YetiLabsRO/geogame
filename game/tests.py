@@ -100,9 +100,29 @@ def _make_tower(game, name="T", zone=None, lng=23.5, lat=46.5, is_active=True,
     )
 
 
+def _default_session(game):
+    """Helper: return (creating if missing) the default Session for a Game."""
+    from organize.models import Session
+    session = Session.objects.filter(game=game, slug='default').first()
+    if session is None:
+        session = Session.objects.create(
+            game=game,
+            slug='default',
+            name='Default session',
+            start_time=game.start_time,
+            end_time=game.end_time,
+            is_active=game.is_active,
+        )
+    return session
+
+
 def _make_team(game, group, name="explo1", code="EXPLO1", color="#003366"):
     return Team.objects.create(
-        name=name, code=code, color=color, game=game, group=group,
+        name=name,
+        code=code,
+        color=color,
+        session=_default_session(game),
+        group=group,
     )
 
 

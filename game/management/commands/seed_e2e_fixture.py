@@ -19,7 +19,7 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
 from game.models import Challenge, Tower, Zone
-from organize.models import Game, Invite, Team, TeamGroup
+from organize.models import Game, Invite, Session, Team, TeamGroup
 
 User = get_user_model()
 
@@ -47,10 +47,11 @@ class Command(BaseCommand):
         Zone.objects.filter(name__startswith=MARKER).delete()
         Team.objects.filter(name__startswith=MARKER).delete()
         TeamGroup.objects.filter(slug__startswith=MARKER).delete()
+        Session.objects.filter(game__name__startswith=MARKER).delete()
         Game.objects.filter(name__startswith=MARKER).delete()
         User.objects.filter(username__startswith=MARKER).delete()
 
-        # ---- Game / group / team -----------------------------------------
+        # ---- Game / session / group / team -------------------------------
         now = timezone.now()
         game = Game.objects.create(
             name=f'{MARKER}-game',
@@ -61,12 +62,20 @@ class Command(BaseCommand):
             base_point=Point(23.571797, 46.068374),
             base_zoom_level=17,
         )
+        session = Session.objects.create(
+            game=game,
+            slug='default',
+            name=f'{MARKER}-default-session',
+            start_time=now - timedelta(hours=1),
+            end_time=now + timedelta(hours=4),
+            is_active=True,
+        )
         group = TeamGroup.objects.create(
             name=f'{MARKER} Explorers', game=game, slug=f'{MARKER}-explo',
         )
         team = Team.objects.create(
             name=f'{MARKER} team alpha',
-            game=game,
+            session=session,
             code=f'{MARKER[:4].upper()}A1',
             group=group,
             color='#ff3366',
@@ -117,6 +126,8 @@ class Command(BaseCommand):
         manifest = {
             'base_url': base_url,
             'game_id': game.id,
+            'session_id': session.id,
+            'session_slug': session.slug,
             'team_id': team.id,
             'team_name': team.name,
             'group_slug': group.slug,
