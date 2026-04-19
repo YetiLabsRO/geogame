@@ -31,18 +31,26 @@ export interface ChallengeSubmitResponse {
   timestamp_submitted: string;
 }
 
-export interface CurrentGame {
+export interface GameConfig {
   id: number;
   name: string;
   slug: string;
   is_active: boolean;
-  start_time: string;
-  end_time: string;
   base_point: { type: 'Point'; coordinates: [number, number] } | null;
   base_zoom_level: number;
   proximity_meters: number;
   cooloff_minutes: number;
   initial_bonus_default: number;
+}
+
+export interface CurrentSession {
+  id: number;
+  slug: string;
+  name: string;
+  is_active: boolean;
+  start_time: string;
+  end_time: string;
+  game: GameConfig;
 }
 
 export interface ZoneFeature {
@@ -75,8 +83,14 @@ export interface TowerFeature {
 export class GameApiService {
   private readonly http = inject(HttpClient);
 
-  currentGame(): Observable<CurrentGame> {
-    return this.http.get<CurrentGame>('/api/current-game/');
+  currentSession(): Observable<CurrentSession> {
+    return this.http.get<CurrentSession>('/api/current-session/');
+  }
+
+  setCurrentSession(sessionId: number): Observable<CurrentSession> {
+    return this.http.post<CurrentSession>('/api/current-session/', {
+      session_id: sessionId,
+    });
   }
 
   zones(params?: { group?: number; groupSlug?: string }): Observable<ZoneFeature[]> {

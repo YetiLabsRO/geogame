@@ -9,16 +9,17 @@ from django.utils import timezone
 
 
 class Game(models.Model):
+    """Reusable event configuration — map, rules, challenge bank.
+
+    Runtime state (dates, teams, ownership) lives on `Session` so that
+    multiple independent runs can share the same Game.
+    """
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=64, unique=True)
 
     base_point = PointField(null=True, blank=True)
     base_zoom_level = models.PositiveSmallIntegerField(default=15)
-
-    # start_time / end_time stay on Game through T3.1 to keep the migration
-    # incremental; they move onto Session in T3.2.
-    start_time = models.DateTimeField()
-    end_time = models.DateTimeField()
 
     is_active = models.BooleanField(default=False)
 
@@ -43,8 +44,14 @@ class Game(models.Model):
 
 class UserProfile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
-    current_game = models.ForeignKey(
-        Game, on_delete=models.SET_NULL, null=True, blank=True, related_name='+',
+    # Renamed from current_game in T3.3: scope is the runtime Session,
+    # not the static Game. The Game is reachable via current_session.game.
+    current_session = models.ForeignKey(
+        'organize.Session',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='+',
     )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

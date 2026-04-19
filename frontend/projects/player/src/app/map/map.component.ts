@@ -101,11 +101,12 @@ export class MapComponent {
 
     const slug = this.groupSlug();
     forkJoin({
-      game: this.api.currentGame(),
+      session: this.api.currentSession(),
       zones: this.api.zones(slug ? { groupSlug: slug } : undefined),
       towers: this.api.towers(),
     }).subscribe({
-      next: ({ game, zones, towers }) => {
+      next: ({ session, zones, towers }) => {
+        const game = session.game;
         if (game.base_point) {
           const [lng, lat] = game.base_point.coordinates;
           this.map?.setView([lat, lng], game.base_zoom_level || FALLBACK_ZOOM);

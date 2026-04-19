@@ -57,8 +57,6 @@ class Command(BaseCommand):
             name=f'{MARKER}-game',
             slug=f'{MARKER}-game',
             is_active=True,
-            start_time=now - timedelta(hours=1),
-            end_time=now + timedelta(hours=4),
             base_point=Point(23.571797, 46.068374),
             base_zoom_level=17,
         )

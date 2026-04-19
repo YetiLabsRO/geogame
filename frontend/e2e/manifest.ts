@@ -4,6 +4,8 @@ import { join } from 'node:path';
 export interface E2EManifest {
   base_url: string;
   game_id: number;
+  session_id: number;
+  session_slug: string;
   team_id: number;
   team_name: string;
   group_slug: string;

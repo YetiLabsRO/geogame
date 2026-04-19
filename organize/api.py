@@ -15,7 +15,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from organize.emails import send_invite_email
-from organize.models import Game, Invite, TeamMembership
+from organize.models import Invite, TeamMembership
 
 User = get_user_model()
 
@@ -62,9 +62,14 @@ class UserProfileSerializer(serializers.Serializer):
     email = serializers.EmailField(source='user.email')
     first_name = serializers.CharField(source='user.first_name', required=False, allow_blank=True)
     last_name = serializers.CharField(source='user.last_name', required=False, allow_blank=True)
-    current_game = serializers.PrimaryKeyRelatedField(read_only=True)
+    current_session = serializers.PrimaryKeyRelatedField(read_only=True)
+    current_game = serializers.SerializerMethodField()
     active_team_id = serializers.SerializerMethodField()
     is_staff = serializers.BooleanField(source='user.is_staff', read_only=True)
+
+    def get_current_game(self, profile):
+        session = profile.current_session
+        return session.game_id if session is not None else None
 
     def get_active_team_id(self, profile):
         membership = profile.memberships.filter(is_active=True).select_related('team').first()
@@ -229,13 +234,17 @@ class MyTeamView(APIView):
         return Response(MyTeamSerializer(membership.team).data)
 
 
-class GameStubSerializer(serializers.Serializer):
+class GameConfigSerializer(serializers.Serializer):
+    """Read-only config payload nested under a Session.
+
+    Separate from any write-side Game serializer so clients have a
+    stable shape without needing to know Session internals.
+    """
+
     id = serializers.IntegerField()
     name = serializers.CharField()
     slug = serializers.CharField()
     is_active = serializers.BooleanField()
-    start_time = serializers.DateTimeField()
-    end_time = serializers.DateTimeField()
     base_point = serializers.SerializerMethodField()
     base_zoom_level = serializers.IntegerField()
     proximity_meters = serializers.IntegerField()
@@ -251,26 +260,73 @@ class GameStubSerializer(serializers.Serializer):
         }
 
 
-class CurrentGameView(APIView):
-    """Stub for Phase 2. Returns the single active game.
+class CurrentSessionSerializer(serializers.Serializer):
+    id = serializers.IntegerField()
+    slug = serializers.CharField()
+    name = serializers.CharField()
+    is_active = serializers.BooleanField()
+    start_time = serializers.DateTimeField()
+    end_time = serializers.DateTimeField()
+    game = GameConfigSerializer()
 
-    In Phase 3, POST will persist `current_game` on the user's profile and
-    the returned game will be per-user. Today, the frontend should treat the
-    shape of the response as stable but ignore any POST side-effects.
+
+class CurrentSessionView(APIView):
+    """Read / write the authenticated user's active Session.
+
+    GET returns the Session the user is currently scoped to, with the
+    Game config nested inline. If no session is set explicitly, we
+    fall back to the single newest active Session on the system — this
+    keeps the Phase-2 callers (who never POST) working. T3.9 will
+    replace this heuristic with the player default-selection logic.
+
+    POST accepts `{session_id: <int>}` and updates
+    profile.current_session. 404 when the session does not exist.
     """
-    permission_classes = [AllowAny]
+
+    permission_classes = [IsAuthenticated]
+
+    def _current_for(self, user):
+        from organize.models import Session
+        profile = user.profile
+        if profile.current_session is not None:
+            return profile.current_session
+        return (
+            Session.objects
+            .filter(is_active=True)
+            .select_related('game')
+            .order_by('-start_time')
+            .first()
+        )
 
     def get(self, request):
-        game = Game.objects.filter(is_active=True).order_by('-start_time').first()
-        if game is None:
+        session = self._current_for(request.user)
+        if session is None:
             return Response(
-                {'detail': 'No active game.'}, status=status.HTTP_404_NOT_FOUND,
+                {'detail': 'No active session.'},
+                status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(GameStubSerializer(game).data)
+        return Response(CurrentSessionSerializer(session).data)
 
     def post(self, request):
-        # Stubbed: Phase 3 will store request.data['game_id'] on the profile.
-        return self.get(request)
+        from organize.models import Session
+        session_id = request.data.get('session_id')
+        if not session_id:
+            return Response(
+                {'detail': 'session_id is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        session = (
+            Session.objects.select_related('game').filter(pk=session_id).first()
+        )
+        if session is None:
+            return Response(
+                {'detail': 'Session not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        profile = request.user.profile
+        profile.current_session = session
+        profile.save(update_fields=['current_session'])
+        return Response(CurrentSessionSerializer(session).data)
 
 
 # ---------- Invites ----------

@@ -63,7 +63,6 @@ def _authed_client(team, username='scout'):
 
 
 def _make_game(name="Game A", slug=None):
-    now = timezone.now()
     if slug is None:
         from django.utils.text import slugify
         base = slugify(name) or 'game'
@@ -71,12 +70,7 @@ def _make_game(name="Game A", slug=None):
         while Game.objects.filter(slug=slug).exists():
             slug = f'{base}-{counter}'
             counter += 1
-    return Game.objects.create(
-        name=name,
-        slug=slug,
-        start_time=now,
-        end_time=now + timedelta(hours=1),
-    )
+    return Game.objects.create(name=name, slug=slug)
 
 
 def _make_group(game, name="Explo", slug="explo"):
@@ -105,12 +99,13 @@ def _default_session(game):
     from organize.models import Session
     session = Session.objects.filter(game=game, slug='default').first()
     if session is None:
+        now = timezone.now()
         session = Session.objects.create(
             game=game,
             slug='default',
             name='Default session',
-            start_time=game.start_time,
-            end_time=game.end_time,
+            start_time=now,
+            end_time=now + timedelta(hours=1),
             is_active=game.is_active,
         )
     return session

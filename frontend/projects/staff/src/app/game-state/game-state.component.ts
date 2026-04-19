@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { DatePipe } from '@angular/common';
 
-import { CurrentGame, GameApiService, StaffApiService } from 'shared';
+import { CurrentSession, GameApiService, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -13,16 +13,18 @@ import { extractErrorMessage } from '../auth/form-error';
   template: `
     <h1 class="h3 mb-3">Game state</h1>
 
-    @if (game(); as g) {
+    @if (session(); as s) {
       <div class="card mb-4">
         <div class="card-body">
-          <h2 class="h6 text-body-secondary">Current game</h2>
-          <div class="fs-4 fw-semibold">{{ g.name }}</div>
+          <h2 class="h6 text-body-secondary">
+            Current session · <span class="fw-normal">{{ s.game.name }}</span>
+          </h2>
+          <div class="fs-4 fw-semibold">{{ s.name }}</div>
           <div class="small text-body-secondary">
-            {{ g.start_time | date: 'medium' }} — {{ g.end_time | date: 'medium' }}
+            {{ s.start_time | date: 'medium' }} — {{ s.end_time | date: 'medium' }}
           </div>
-          <span class="badge mt-1" [class]="g.is_active ? 'text-bg-success' : 'text-bg-secondary'">
-            {{ g.is_active ? 'Active' : 'Inactive' }}
+          <span class="badge mt-1" [class]="s.is_active ? 'text-bg-success' : 'text-bg-secondary'">
+            {{ s.is_active ? 'Active' : 'Inactive' }}
           </span>
         </div>
       </div>
@@ -84,15 +86,15 @@ export class GameStateComponent {
   private readonly gameApi = inject(GameApiService);
   private readonly staffApi = inject(StaffApiService);
 
-  protected readonly game = signal<CurrentGame | null>(null);
+  protected readonly session = signal<CurrentSession | null>(null);
   protected readonly loadError = signal<string | null>(null);
   protected readonly acting = signal<'end-round' | 'reset-scores' | null>(null);
   protected readonly notice = signal<string | null>(null);
   protected readonly actionError = signal<string | null>(null);
 
   constructor() {
-    this.gameApi.currentGame().subscribe({
-      next: (g) => this.game.set(g),
+    this.gameApi.currentSession().subscribe({
+      next: (s) => this.session.set(s),
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
   }

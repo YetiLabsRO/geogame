@@ -24,7 +24,6 @@ User = get_user_model()
 
 
 def _make_game(name='Game A', slug=None):
-    now = timezone.now()
     if slug is None:
         from django.utils.text import slugify
         base = slugify(name) or 'game'
@@ -32,24 +31,20 @@ def _make_game(name='Game A', slug=None):
         while Game.objects.filter(slug=slug).exists():
             slug = f'{base}-{counter}'
             counter += 1
-    return Game.objects.create(
-        name=name,
-        slug=slug,
-        start_time=now,
-        end_time=now + timedelta(hours=1),
-    )
+    return Game.objects.create(name=name, slug=slug)
 
 
 def _default_session(game):
     from organize.models import Session
     session = Session.objects.filter(game=game, slug='default').first()
     if session is None:
+        now = timezone.now()
         session = Session.objects.create(
             game=game,
             slug='default',
             name='Default session',
-            start_time=game.start_time,
-            end_time=game.end_time,
+            start_time=now,
+            end_time=now + timedelta(hours=1),
             is_active=game.is_active,
         )
     return session
@@ -365,40 +360,76 @@ class TeamSessionReparentingTest(TestCase):
         )
 
 
-class CurrentGameTest(TestCase):
-    url = reverse('api-current-game')
+class CurrentSessionTest(TestCase):
+    url = reverse('api-current-session')
 
-    def test_returns_active_game(self):
+    def setUp(self):
+        from organize.models import Session
+        self.user = User.objects.create_user(
+            username='tester', email='t@x.com', password='password123',
+        )
+        token = Token.objects.create(user=self.user)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+        self.game = _make_game(name='Live', slug='live')
+        self.game.is_active = True
+        self.game.save()
         now = timezone.now()
-        Game.objects.create(
-            name='Inactive', slug='inactive', is_active=False,
+        self.session = Session.objects.create(
+            game=self.game, slug='default', name='Live default',
             start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
         )
-        active = Game.objects.create(
-            name='Live', slug='live', is_active=True,
-            start_time=now, end_time=now + timedelta(hours=1),
-        )
+
+    def test_requires_auth(self):
+        anon = APIClient()
+        resp = anon.get(self.url)
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_get_falls_back_to_newest_active_session_when_unset(self):
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
-        self.assertEqual(body['id'], active.id)
-        self.assertEqual(body['name'], 'Live')
-        self.assertEqual(body['slug'], 'live')
-        self.assertEqual(body['proximity_meters'], 50)
-        self.assertEqual(body['cooloff_minutes'], 5)
-        self.assertEqual(body['initial_bonus_default'], 0)
+        self.assertEqual(body['id'], self.session.id)
+        self.assertEqual(body['slug'], 'default')
+        # Nested game config has the full shape.
+        self.assertEqual(body['game']['id'], self.game.id)
+        self.assertEqual(body['game']['slug'], 'live')
+        self.assertEqual(body['game']['proximity_meters'], 50)
+        self.assertEqual(body['game']['cooloff_minutes'], 5)
 
-    def test_returns_404_when_no_active_game(self):
+    def test_get_404_when_no_active_session(self):
+        self.session.is_active = False
+        self.session.save()
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 404)
 
-    def test_post_is_accepted_but_stubbed(self):
-        active = _make_game()
-        active.is_active = True
-        active.save()
-        resp = self.client.post(self.url, {'game_id': active.id}, content_type='application/json')
+    def test_post_sets_current_session_on_profile(self):
+        resp = self.client.post(
+            self.url,
+            {'session_id': self.session.id},
+            content_type='application/json',
+        )
         self.assertEqual(resp.status_code, 200)
-        self.assertEqual(resp.json()['id'], active.id)
+        self.user.profile.refresh_from_db()
+        self.assertEqual(
+            self.user.profile.current_session_id, self.session.id,
+        )
+
+    def test_post_404_for_unknown_session(self):
+        resp = self.client.post(
+            self.url,
+            {'session_id': 99999},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_post_requires_session_id(self):
+        resp = self.client.post(
+            self.url, {}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 400)
 
 
 class InviteAPITest(TestCase):

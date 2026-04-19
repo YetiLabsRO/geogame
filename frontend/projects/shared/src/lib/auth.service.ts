@@ -16,6 +16,7 @@ export interface UserProfile {
   email: string;
   first_name: string;
   last_name: string;
+  current_session: number | null;
   current_game: number | null;
   active_team_id: number | null;
   is_staff: boolean;
