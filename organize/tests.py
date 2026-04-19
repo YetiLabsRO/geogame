@@ -280,6 +280,91 @@ class MyTeamEndpointTest(TestCase):
         self.assertEqual(resp.status_code, 404)
 
 
+class TeamMembershipUniquenessTest(TestCase):
+    """P3.4 — one active membership per (user, game), across sessions."""
+
+    def setUp(self):
+        from organize.models import Session
+        self.game = _make_game()
+        now = timezone.now()
+        self.session_a = Session.objects.create(
+            game=self.game, slug='morning', name='Morning',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+        self.session_b = Session.objects.create(
+            game=self.game, slug='afternoon', name='Afternoon',
+            start_time=now + timedelta(hours=2),
+            end_time=now + timedelta(hours=4),
+            is_active=True,
+        )
+        self.team_a = Team.objects.create(
+            name='a', session=self.session_a, code='AAA', color='#111',
+        )
+        self.team_b = Team.objects.create(
+            name='b', session=self.session_b, code='BBB', color='#222',
+        )
+        self.user = User.objects.create_user(
+            username='scout', email='s@x.com', password='password123',
+        )
+
+    def test_save_denormalises_game_from_session(self):
+        membership = TeamMembership.objects.create(
+            team=self.team_a, user=self.user.profile, is_active=True,
+        )
+        self.assertEqual(membership.game_id, self.game.id)
+
+    def test_second_active_membership_on_same_game_blocked(self):
+        from django.db import IntegrityError
+        TeamMembership.objects.create(
+            team=self.team_a, user=self.user.profile, is_active=True,
+        )
+        with self.assertRaises(IntegrityError):
+            TeamMembership.objects.create(
+                team=self.team_b, user=self.user.profile, is_active=True,
+            )
+
+    def test_inactive_memberships_do_not_collide(self):
+        """An archived (left) team doesn't block a new active one."""
+        TeamMembership.objects.create(
+            team=self.team_a,
+            user=self.user.profile,
+            is_active=False,
+            left_at=timezone.now(),
+        )
+        # Now the user can join team_b in the same game, actively.
+        new_m = TeamMembership.objects.create(
+            team=self.team_b, user=self.user.profile, is_active=True,
+        )
+        self.assertEqual(new_m.game_id, self.game.id)
+
+    def test_active_memberships_across_different_games_ok(self):
+        from organize.models import Session
+        other_game = _make_game(name='Other', slug='other')
+        now = timezone.now()
+        other_session = Session.objects.create(
+            game=other_game, slug='default', name='O',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+        other_team = Team.objects.create(
+            name='o', session=other_session, code='OO', color='#333',
+        )
+        TeamMembership.objects.create(
+            team=self.team_a, user=self.user.profile, is_active=True,
+        )
+        # Second active membership on a different game — must succeed.
+        TeamMembership.objects.create(
+            team=other_team, user=self.user.profile, is_active=True,
+        )
+        self.assertEqual(
+            TeamMembership.objects
+            .filter(user=self.user.profile, is_active=True)
+            .count(),
+            2,
+        )
+
+
 class SessionModelTest(TestCase):
     def setUp(self):
         self.game = _make_game()
@@ -538,6 +623,36 @@ class InviteAPITest(TestCase):
         resp = client.post(reverse('api-invite-accept', args=[invite.token]))
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['team_id'], self.team.id)
+
+    def test_accept_conflicts_when_already_on_another_team_same_game(self):
+        """P3.4 — invite-accept returns 409 when the user already has an
+        active membership on a different team in the same game."""
+        from organize.models import Session
+        now = timezone.now()
+        second_session = Session.objects.create(
+            game=self.team.session.game,
+            slug='second', name='Second',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+        second_team = Team.objects.create(
+            name='rival', session=second_session, code='RIVAL', color='#888',
+        )
+        existing = User.objects.create_user(
+            username='double', email='d@x.com', password='password123',
+        )
+        TeamMembership.objects.create(
+            team=self.team, user=existing.profile, is_active=True,
+        )
+        client = APIClient()
+        token = Token.objects.create(user=existing).key
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token}')
+        invite = Invite.objects.create(
+            team=second_team, email='', created_by=self.staff,
+        )
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('already on team', resp.json()['detail'])
 
     def test_accept_twice_returns_410(self):
         invite = self._create_invite()

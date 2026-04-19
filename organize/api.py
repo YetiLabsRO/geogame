@@ -484,6 +484,28 @@ def invite_accept(request, token):
             last_name=data.get('last_name', ''),
         )
 
+    # One active membership per game per player. Surface a friendly 409
+    # before letting the DB constraint trip.
+    invite_game = invite.team.session.game
+    existing = (
+        TeamMembership.objects
+        .filter(user=user.profile, is_active=True, game=invite_game)
+        .exclude(team=invite.team)
+        .select_related('team')
+        .first()
+    )
+    if existing is not None:
+        return Response(
+            {
+                'detail': (
+                    f'You are already on team "{existing.team.name}" in '
+                    f'"{invite_game.name}". Leave that team before joining '
+                    'another in the same game.'
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+
     membership, _ = TeamMembership.objects.get_or_create(
         team=invite.team, user=user.profile, is_active=True,
     )

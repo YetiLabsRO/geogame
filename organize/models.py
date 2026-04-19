@@ -152,6 +152,13 @@ class Team(models.Model):
 class TeamMembership(models.Model):
     team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name='memberships')
     user = models.ForeignKey(UserProfile, on_delete=models.CASCADE, related_name='memberships')
+    # Denormalized from team.session.game so the DB can enforce the
+    # "one session per game per player" rule directly. Kept in sync
+    # via save(); Teams don't move between sessions so drift is a
+    # non-issue in normal operation.
+    game = models.ForeignKey(
+        Game, on_delete=models.CASCADE, related_name='memberships',
+    )
     is_active = models.BooleanField(default=True)
     joined_at = models.DateTimeField(auto_now_add=True)
     left_at = models.DateTimeField(null=True, blank=True)
@@ -163,10 +170,21 @@ class TeamMembership(models.Model):
                 condition=models.Q(is_active=True),
                 name='unique_active_team_membership',
             ),
+            models.UniqueConstraint(
+                fields=['user', 'game'],
+                condition=models.Q(is_active=True),
+                name='unique_active_membership_per_game',
+            ),
         ]
 
     def __str__(self):
         return f'{self.user} in {self.team}'
+
+    def save(self, *args, **kwargs):
+        # Keep the denormalized game FK in sync with the team's session.
+        if self.team_id is not None:
+            self.game_id = self.team.session.game_id
+        super().save(*args, **kwargs)
 
 
 def _default_invite_expiry():
