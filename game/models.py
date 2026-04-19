@@ -249,7 +249,8 @@ class Tower(models.Model):
 
     def team_in_cooloff(self, team):
         ttc = TeamTowerChallenge.objects.filter(team=team, tower=self).order_by("-timestamp_submitted").first()
-        if ttc and ttc.outcome == TeamTowerChallenge.REJECTED and (datetime.now(timezone.utc) - ttc.timestamp_verified).seconds < (60 * 5):
+        cooloff_seconds = self.game.cooloff_minutes * 60
+        if ttc and ttc.outcome == TeamTowerChallenge.REJECTED and (datetime.now(timezone.utc) - ttc.timestamp_verified).seconds < cooloff_seconds:
             return True
 
     def save(self, *args, **kwargs):

@@ -10,8 +10,6 @@ from rest_framework.views import APIView
 from game.models import Challenge, TeamTowerChallenge, Tower
 from game.scoping import SessionScopedViewSetMixin
 
-COOLOFF_MINUTES = 5
-
 
 class ChallengeSummarySerializer(serializers.ModelSerializer):
     class Meta:
@@ -59,7 +57,7 @@ class TowerStateView(APIView):
         cooloff_until = None
         if last_rejected and last_rejected.timestamp_verified:
             candidate = last_rejected.timestamp_verified + timedelta(
-                minutes=COOLOFF_MINUTES,
+                minutes=tower.game.cooloff_minutes,
             )
             if candidate > timezone.now():
                 cooloff_until = candidate
@@ -97,7 +95,7 @@ class TowerStateView(APIView):
             'cooloff_until': (
                 cooloff_until.isoformat() if cooloff_until else None
             ),
-            'proximity_meters': 50,
+            'proximity_meters': tower.game.proximity_meters,
         })
 
 

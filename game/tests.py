@@ -943,6 +943,95 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P3.6 — Per-game proximity / cooloff config is respected
+# ---------------------------------------------------------------------------
+
+
+class PerGameConfigTest(TestCase):
+    def setUp(self):
+        # Use a non-default proximity so we can see it in action.
+        self.game = _make_game()
+        self.game.proximity_meters = 20
+        self.game.cooloff_minutes = 1
+        self.game.save()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(
+            self.game, zone=self.zone, lng=23.5, lat=46.5,
+        )
+        self.team = _make_team(self.game, self.group, code='T1')
+        self.challenge = Challenge.objects.create(
+            text='c', tower=self.tower, game=self.game, difficulty=1,
+        )
+
+    def test_submission_uses_per_game_proximity(self):
+        # 40m north — outside 20m, inside the legacy 50m default.
+        lat = 46.5 + 40 / 111_111.0
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': lat,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('20 de metri', str(resp.json()))
+
+    def test_submission_within_per_game_proximity_accepted(self):
+        # 10m north — well within 20m.
+        lat = 46.5 + 10 / 111_111.0
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': lat,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_tower_state_reports_game_proximity(self):
+        client, _ = _authed_client(self.team)
+        resp = client.get(
+            reverse('api-tower-state', args=[self.tower.id]),
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['proximity_meters'], 20)
+
+    def test_cooloff_uses_per_game_minutes(self):
+        # cooloff_minutes=1 on this game.
+        ttc = TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            outcome=TeamTowerChallenge.REJECTED,
+        )
+        ttc.timestamp_verified = timezone.now()
+        ttc.save()
+        # Within 1-minute window.
+        self.assertTrue(self.tower.team_in_cooloff(self.team))
+
+    def test_cooloff_expires_within_shorter_custom_minutes(self):
+        ttc = TeamTowerChallenge.objects.create(
+            team=self.team,
+            tower=self.tower,
+            challenge=self.challenge,
+            outcome=TeamTowerChallenge.REJECTED,
+        )
+        # 90 seconds ago — past the 1-minute window.
+        ttc.timestamp_verified = timezone.now() - timedelta(seconds=90)
+        ttc.save()
+        self.assertFalse(self.tower.team_in_cooloff(self.team))
+
+
+# ---------------------------------------------------------------------------
 # P3.5 — Scoping mixins isolate data by current_session / current_session.game
 # ---------------------------------------------------------------------------
 
