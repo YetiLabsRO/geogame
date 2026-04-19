@@ -1,4 +1,6 @@
+from django.contrib.gis.geos import Point
 from django.db import transaction
+from django.utils import timezone
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAdminUser
@@ -13,7 +15,7 @@ from game.models import (
     Zone,
 )
 from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
-from organize.models import Team, TeamGroup
+from organize.models import Game, Session, Team, TeamGroup
 
 
 class AdminZoneSerializer(serializers.ModelSerializer):
@@ -135,7 +137,6 @@ class ResetScoresView(APIView):
 
     @transaction.atomic
     def post(self, request):
-        from django.utils import timezone
         now = timezone.now()
         TeamTowerOwnership.objects.filter(
             timestamp_end__isnull=True,
@@ -148,3 +149,144 @@ class ResetScoresView(APIView):
             {'teams_reset': updated},
             status=status.HTTP_200_OK,
         )
+
+
+# ---------------------------------------------------------------------------
+# Games + Sessions admin CRUD (T3.7)
+# ---------------------------------------------------------------------------
+
+
+class AdminGameSerializer(serializers.ModelSerializer):
+    """Staff-writable Game payload.
+
+    `base_point` reads as GeoJSON; writes accept {lat, lng} via
+    write-only helper fields so clients don't need to know the PointField
+    wire format.
+    """
+
+    base_point = serializers.SerializerMethodField(read_only=True)
+    base_lat = serializers.FloatField(
+        write_only=True, required=False, allow_null=True,
+    )
+    base_lng = serializers.FloatField(
+        write_only=True, required=False, allow_null=True,
+    )
+
+    class Meta:
+        model = Game
+        fields = (
+            'id', 'slug', 'name',
+            'base_point', 'base_lat', 'base_lng',
+            'base_zoom_level', 'is_active',
+            'proximity_meters', 'cooloff_minutes', 'initial_bonus_default',
+            'created_at',
+        )
+        read_only_fields = ('created_at',)
+
+    def get_base_point(self, game):
+        if game.base_point is None:
+            return None
+        return {
+            'type': 'Point',
+            'coordinates': [game.base_point.x, game.base_point.y],
+        }
+
+    def _absorb_coords(self, validated):
+        lat = validated.pop('base_lat', None)
+        lng = validated.pop('base_lng', None)
+        if lat is not None and lng is not None:
+            validated['base_point'] = Point(lng, lat)
+
+    def create(self, validated_data):
+        self._absorb_coords(validated_data)
+        return super().create(validated_data)
+
+    def update(self, instance, validated_data):
+        self._absorb_coords(validated_data)
+        return super().update(instance, validated_data)
+
+
+class AdminGameViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for Games.
+
+    Not session-scoped — admins need to list every Game to switch
+    between them in the UI. Attaches `created_by` on create.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = Game.objects.all().order_by('name')
+    serializer_class = AdminGameSerializer
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+
+class AdminSessionSerializer(serializers.ModelSerializer):
+    game_slug = serializers.CharField(source='game.slug', read_only=True)
+    game_name = serializers.CharField(source='game.name', read_only=True)
+
+    class Meta:
+        model = Session
+        fields = (
+            'id', 'game', 'game_slug', 'game_name',
+            'slug', 'name', 'start_time', 'end_time', 'is_active',
+            'created_at',
+        )
+        read_only_fields = ('created_at', 'game_slug', 'game_name')
+
+
+class AdminSessionViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for Sessions.
+
+    Not session-scoped for the same reason as AdminGameViewSet.
+    Accepts ?game=<id> to filter to one Game's sessions for the UI.
+
+    Deactivating a session (is_active True → False) closes every open
+    TeamTowerOwnership / TeamZoneOwnership for teams in that session
+    and locks in floating scores. Mirrors unassign_all but scoped to
+    the session.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = Session.objects.select_related('game').order_by('-start_time')
+    serializer_class = AdminSessionSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        game_id = self.request.query_params.get('game')
+        if game_id:
+            qs = qs.filter(game_id=game_id)
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @transaction.atomic
+    def perform_update(self, serializer):
+        # Read is_active straight from the DB so we're not sensitive to
+        # when the serializer mutates its own instance.
+        was_active = Session.objects.filter(pk=serializer.instance.pk).values_list(
+            'is_active', flat=True,
+        ).first()
+        session = serializer.save()
+        if was_active and not session.is_active:
+            self._close_ownerships(session)
+
+    def _close_ownerships(self, session):
+        now = timezone.now()
+        team_ids = list(session.teams.values_list('id', flat=True))
+
+        TeamTowerOwnership.objects.filter(
+            team_id__in=team_ids, timestamp_end__isnull=True,
+        ).update(timestamp_end=now)
+
+        # Zone ownerships lock in floating scores before they close.
+        zone_ownerships = list(
+            TeamZoneOwnership.objects
+            .filter(team_id__in=team_ids, timestamp_end__isnull=True)
+            .select_related('team', 'zone')
+        )
+        for zo in zone_ownerships:
+            zo.timestamp_end = now
+            zo.save()
+            zo.team.update_score(zo.get_score())

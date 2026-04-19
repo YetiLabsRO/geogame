@@ -21,6 +21,8 @@ from rest_framework import routers
 
 from game.admin_api import (
     AdminChallengeViewSet,
+    AdminGameViewSet,
+    AdminSessionViewSet,
     AdminTeamGroupList,
     AdminTeamViewSet,
     AdminTowerViewSet,
@@ -57,6 +59,10 @@ admin_router.register(
 )
 admin_router.register(
     r'challenges', AdminChallengeViewSet, basename='admin-challenge',
+)
+admin_router.register(r'games', AdminGameViewSet, basename='admin-game')
+admin_router.register(
+    r'sessions', AdminSessionViewSet, basename='admin-session',
 )
 
 urlpatterns = [

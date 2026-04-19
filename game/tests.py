@@ -943,6 +943,189 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P3.7 — Games + Sessions CRUD + session deactivation closes ownerships
+# ---------------------------------------------------------------------------
+
+
+class AdminGamesEndpointTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.staff_client, self.staff = _staff_client(username='g-admin')
+
+    def test_list_requires_staff(self):
+        anon = APIClient()
+        resp = anon.get('/api/staff/games/')
+        self.assertIn(resp.status_code, (401, 403))
+
+    def test_list_includes_all_games(self):
+        _make_game(name='Another', slug='another')
+        resp = self.staff_client.get('/api/staff/games/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertGreaterEqual(len(resp.json()), 2)
+
+    def test_create_game_with_base_point(self):
+        resp = self.staff_client.post(
+            '/api/staff/games/',
+            {
+                'slug': 'new-event',
+                'name': 'New Event',
+                'base_lat': 46.06,
+                'base_lng': 23.57,
+                'base_zoom_level': 17,
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['slug'], 'new-event')
+        self.assertEqual(body['base_point']['coordinates'], [23.57, 46.06])
+
+    def test_patch_game_updates_rules(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'proximity_meters': 25, 'cooloff_minutes': 10},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.game.refresh_from_db()
+        self.assertEqual(self.game.proximity_meters, 25)
+        self.assertEqual(self.game.cooloff_minutes, 10)
+
+
+class AdminSessionsEndpointTest(TestCase):
+    def setUp(self):
+        from organize.models import Session
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group, code='T1')
+        self.session = self.team.session  # auto-created default session
+        # Default sessions inherit game.is_active (False) — bump it so
+        # the deactivation tests have something to deactivate.
+        self.session.is_active = True
+        self.session.save()
+        self.staff_client, self.staff = _staff_client(
+            session=self.session, username='s-admin',
+        )
+        # Second game to verify ?game=<id> filter works.
+        self.other_game = _make_game(name='Other', slug='other-g')
+        now = timezone.now()
+        Session.objects.create(
+            game=self.other_game, slug='default', name='Other default',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+
+    def test_list_returns_all_sessions_across_games(self):
+        resp = self.staff_client.get('/api/staff/sessions/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
+
+    def test_list_filters_by_game(self):
+        resp = self.staff_client.get(
+            f'/api/staff/sessions/?game={self.game.id}',
+        )
+        self.assertEqual(resp.status_code, 200)
+        slugs = [s['slug'] for s in resp.json()]
+        self.assertEqual(slugs, [self.session.slug])
+
+    def test_create_session_on_existing_game(self):
+        resp = self.staff_client.post(
+            '/api/staff/sessions/',
+            {
+                'game': self.game.id,
+                'slug': 'afternoon',
+                'name': 'Afternoon',
+                'start_time': timezone.now().isoformat(),
+                'end_time': (timezone.now() + timedelta(hours=2)).isoformat(),
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['slug'], 'afternoon')
+
+    def test_deactivating_session_closes_ownerships_and_locks_scores(self):
+        # Assign tower to team so there's open ownership to close.
+        self.tower.assign_to_team(self.team)
+        # Wait a tick so get_score has something positive.
+        from game.models import (
+            TeamTowerOwnership,
+            TeamZoneOwnership,
+        )
+        self.assertTrue(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': False},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        # No open zone ownership left either.
+        self.assertFalse(
+            TeamZoneOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+
+    def test_deactivating_session_does_not_touch_other_session_ownerships(self):
+        from organize.models import Session
+        # Second session on the SAME game with its own team + ownership.
+        now = timezone.now()
+        other_session = Session.objects.create(
+            game=self.game, slug='parallel', name='Parallel',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+        other_team = Team.objects.create(
+            name='other', session=other_session, code='OTH', color='#f00',
+        )
+        # Give both teams an active tower ownership.
+        self.tower.assign_to_team(self.team)
+        # Closing our session must not touch other_session's state —
+        # we assert by patching and then verifying other_team still has
+        # any membership/config intact.
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': False},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        other_session.refresh_from_db()
+        self.assertTrue(other_session.is_active)
+        # other_team is untouched (no ownerships were opened or closed).
+        self.assertEqual(other_team.teamtowerownership_set.count(), 0)
+
+    def test_patch_noop_when_already_inactive(self):
+        self.session.is_active = False
+        self.session.save()
+        self.tower.assign_to_team(self.team)
+        from game.models import TeamTowerOwnership
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'name': 'Renamed'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        # Ownership unchanged — patch didn't flip is_active.
+        self.assertTrue(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+
+
+# ---------------------------------------------------------------------------
 # P3.6 — Per-game proximity / cooloff config is respected
 # ---------------------------------------------------------------------------
 

@@ -135,7 +135,7 @@ the earlier `clone_game` idea.
 - [x] T3.4: Denormalize `TeamMembership.game` (kept in sync with `team.session.game`); add conditional unique constraint `(user, game) where is_active=True`; surface friendly errors on conflict in invite-accept + admin flows. (Plan: P3.4, Req: 18.3)
 - [x] T3.5: Implement `SessionScopedViewSet` + `GameScopedViewSet` mixins and apply to every existing viewset (player API, staff admin API, submissions, invites). (Plan: P3.5, Req: 17.1, 18.4)
 - [x] T3.6: Replace hardcoded 50m proximity and 5min cooloff with reads from `session.game.proximity_meters` / `cooloff_minutes` (tower state endpoint, submission serializer, `Tower.team_in_cooloff`). (Plan: P3.6, Req: 17.2)
-- [ ] T3.7: Games + Sessions CRUD API at `/api/staff/games/` and `/api/staff/sessions/`; deactivating a Session SHALL close its open ownerships (mirrors `unassign_all`). (Plan: P3.7, Req: 18.5)
+- [x] T3.7: Games + Sessions CRUD API at `/api/staff/games/` and `/api/staff/sessions/`; deactivating a Session SHALL close its open ownerships (mirrors `unassign_all`). (Plan: P3.7, Req: 18.5)
 - [ ] T3.8: Staff UI — Games list/edit, Sessions list/edit grouped by Game, navbar current-session switcher grouped by Game. (Plan: P3.8, Req: 18.2, 18.5)
 - [ ] T3.9: Player default-session selection: if exactly one active membership on an active session, auto-select; otherwise surface a picker. (Plan: P3.9, Req: 18.2)
 - [ ] T3.10: Session history — staff "Past sessions" list with read-only final scoreboard + ownership timeline; player list of own past sessions with read-only views. (Plan: P3.10, Req: 19.1, 19.2)
