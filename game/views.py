@@ -6,6 +6,7 @@ from django.http import JsonResponse
 from rest_framework import permissions, viewsets
 
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
+from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
 from game.serializers import (
     ChallengeSerializer,
     TeamSerializer,
@@ -16,13 +17,17 @@ from game.serializers import (
 from organize.models import Team, TeamGroup
 
 
-class ZoneViewSet(viewsets.ModelViewSet):
+class ZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Zone.objects.all()
     serializer_class = ZoneSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
+    game_scope_field = 'game'
 
     def get_queryset(self):
-        return Zone.objects.annotate(num_towers=Count('tower', Q(tower__is_active=True))).filter(num_towers__gte=1)
+        qs = super().get_queryset()
+        return qs.annotate(
+            num_towers=Count('tower', Q(tower__is_active=True)),
+        ).filter(num_towers__gte=1)
 
     def get_serializer_context(self):
         context = super(ZoneViewSet, self).get_serializer_context()
@@ -35,13 +40,14 @@ class ZoneViewSet(viewsets.ModelViewSet):
         return context
 
 
-class TowerViewSet(viewsets.ModelViewSet):
+class TowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Tower.objects.exclude(is_active=False).exclude(category=Tower.CATEGORY_RFID)
     serializer_class = TowerSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
+    game_scope_field = 'game'
 
     def get_queryset(self):
-        queryset = super(TowerViewSet, self).get_queryset()
+        queryset = super().get_queryset()
         if self.request.query_params.get("lat") and self.request.query_params.get("lng"):
             lat = float(self.request.query_params.get("lat"))
             lng = float(self.request.query_params.get("lng"))
@@ -52,16 +58,18 @@ class TowerViewSet(viewsets.ModelViewSet):
         return queryset
 
 
-class TeamViewSet(viewsets.ModelViewSet):
+class TeamViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Team.objects.all()
     serializer_class = TeamSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
+    session_scope_field = 'session'
 
     def get_queryset(self):
+        qs = super().get_queryset()
         category = int(self.request.query_params.get("category", 0))
         if category:
-            return Team.objects.filter(category=category)
-        return self.queryset
+            qs = qs.filter(category=category)
+        return qs
 
     def get_serializer_context(self):
         context = super(TeamViewSet, self).get_serializer_context()
@@ -69,16 +77,18 @@ class TeamViewSet(viewsets.ModelViewSet):
         return context
 
 
-class ChallengeViewSet(viewsets.ModelViewSet):
+class ChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Challenge.objects.all()
     serializer_class = ChallengeSerializer
-    permission_classes = [permissions.IsAuthenticatedOrReadOnly]
+    permission_classes = [permissions.IsAuthenticated]
+    game_scope_field = 'game'
 
 
-class TeamTowerChallengeViewSet(viewsets.ModelViewSet):
+class TeamTowerChallengeViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = TeamTowerChallenge.objects.all()
     serializer_class = TeamTowerChallengeSerializer
     permission_classes = [permissions.IsAuthenticated]
+    session_scope_field = 'team__session'
 
     def perform_create(self, serializer):
         ttc = serializer.save()

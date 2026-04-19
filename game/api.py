@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.models import Challenge, TeamTowerChallenge, Tower
+from game.scoping import SessionScopedViewSetMixin
 
 COOLOFF_MINUTES = 5
 
@@ -142,7 +143,7 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
         return request.build_absolute_uri(url) if request else url
 
 
-class StaffSubmissionList(generics.ListAPIView):
+class StaffSubmissionList(SessionScopedViewSetMixin, generics.ListAPIView):
     """Staff-only: list submissions, filterable by outcome.
 
     Default scope is PENDING submissions so the review queue is the
@@ -152,13 +153,15 @@ class StaffSubmissionList(generics.ListAPIView):
 
     permission_classes = [IsAdminUser]
     serializer_class = StaffSubmissionSerializer
+    session_scope_field = 'team__session'
+    queryset = (
+        TeamTowerChallenge.objects
+        .select_related('team', 'tower', 'challenge', 'submitted_by')
+        .order_by('-timestamp_submitted')
+    )
 
     def get_queryset(self):
-        qs = (
-            TeamTowerChallenge.objects
-            .select_related('team', 'tower', 'challenge', 'submitted_by')
-            .order_by('-timestamp_submitted')
-        )
+        qs = super().get_queryset()
         outcome = self.request.query_params.get('outcome', 'pending')
         if outcome == 'all':
             return qs

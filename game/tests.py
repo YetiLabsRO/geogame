@@ -47,11 +47,34 @@ User = get_user_model()
 
 
 def _authed_client(team, username='scout'):
-    """Create a user + active membership in `team` and return an authed APIClient."""
+    """Create a user + active membership in `team` and return an authed APIClient.
+
+    Also pins the new user's current_session to the team's session so the
+    Phase-3 scoping mixins resolve correctly without extra setup.
+    """
     user = User.objects.create_user(
         username=username, email=f'{username}@example.com', password='password123',
     )
     TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+    user.profile.current_session = team.session
+    user.profile.save(update_fields=['current_session'])
+    token = Token.objects.create(user=user)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+    return client, user
+
+
+def _staff_client(session=None, username='staff'):
+    """Create a staff user + token. Optionally pin current_session."""
+    user = User.objects.create_user(
+        username=username,
+        email=f'{username}@example.com',
+        password='password123',
+        is_staff=True,
+    )
+    if session is not None:
+        user.profile.current_session = session
+        user.profile.save(update_fields=['current_session'])
     token = Token.objects.create(user=user)
     client = APIClient()
     client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
@@ -650,7 +673,6 @@ class RFIDCaptureTest(TestCase):
 
 class APIEndpointsTest(TestCase):
     def setUp(self):
-        self.client = APIClient()
         self.game = _make_game()
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game)
@@ -667,8 +689,11 @@ class APIEndpointsTest(TestCase):
         )
         self.team = _make_team(self.game, self.group, code="E1")
         self.challenge = Challenge.objects.create(
-            text="c", tower=self.tower, difficulty=1,
+            text="c", tower=self.tower, game=self.game, difficulty=1,
         )
+        # Phase-3 scoping mixins require an authenticated caller with a
+        # current_session. _authed_client handles both.
+        self.client, self.user = _authed_client(self.team, username='viewer')
 
     def test_zones_endpoint_lists_zones_with_active_towers(self):
         resp = self.client.get("/api/zones/")
@@ -718,7 +743,7 @@ class APIEndpointsTest(TestCase):
         self.assertNotIn(self.tower.id, ids)
 
     def test_challenges_endpoint_lists_all(self):
-        Challenge.objects.create(text="g", difficulty=1)
+        Challenge.objects.create(text="g", game=self.game, difficulty=1)
         resp = self.client.get("/api/challenges/")
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.json()), 2)
@@ -918,6 +943,137 @@ class AdminCallableTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# P3.5 — Scoping mixins isolate data by current_session / current_session.game
+# ---------------------------------------------------------------------------
+
+
+class ScopingIsolationTest(TestCase):
+    """Two parallel sessions in two different games — neither leaks."""
+
+    def setUp(self):
+        # Game A + one session
+        self.game_a = _make_game(name='GameA', slug='game-a')
+        self.group_a = _make_group(self.game_a, slug='ga')
+        self.zone_a = _make_zone(self.game_a, name='ZA')
+        self.tower_a = _make_tower(
+            self.game_a, zone=self.zone_a, name='TA',
+            lng=23.5, lat=46.5,
+        )
+        Challenge.objects.create(
+            text='ca', tower=self.tower_a, game=self.game_a, difficulty=1,
+        )
+        self.team_a = _make_team(
+            self.game_a, self.group_a, name='ta', code='TA1',
+        )
+
+        # Game B + its own session, zone, tower, team
+        self.game_b = _make_game(name='GameB', slug='game-b')
+        self.group_b = _make_group(self.game_b, slug='gb')
+        self.zone_b = _make_zone(self.game_b, name='ZB')
+        self.tower_b = _make_tower(
+            self.game_b, zone=self.zone_b, name='TB',
+            lng=23.6, lat=46.6,
+        )
+        Challenge.objects.create(
+            text='cb', tower=self.tower_b, game=self.game_b, difficulty=1,
+        )
+        self.team_b = _make_team(
+            self.game_b, self.group_b, name='tb', code='TB1',
+        )
+
+        # Two clients, one per session.
+        self.client_a, _ = _authed_client(self.team_a, username='ua')
+        self.client_b, _ = _authed_client(self.team_b, username='ub')
+
+    def test_zones_are_game_scoped(self):
+        resp = self.client_a.get('/api/zones/')
+        names = [z['name'] for z in resp.json()]
+        self.assertEqual(names, ['ZA'])
+
+        resp = self.client_b.get('/api/zones/')
+        names = [z['name'] for z in resp.json()]
+        self.assertEqual(names, ['ZB'])
+
+    def test_towers_are_game_scoped(self):
+        ids_a = {t['id'] for t in self.client_a.get('/api/towers/').json()}
+        ids_b = {t['id'] for t in self.client_b.get('/api/towers/').json()}
+        self.assertEqual(ids_a, {self.tower_a.id})
+        self.assertEqual(ids_b, {self.tower_b.id})
+
+    def test_teams_are_session_scoped(self):
+        resp_a = self.client_a.get('/api/teams/')
+        resp_b = self.client_b.get('/api/teams/')
+        self.assertEqual(
+            [t['code'] for t in resp_a.json()], [self.team_a.code],
+        )
+        self.assertEqual(
+            [t['code'] for t in resp_b.json()], [self.team_b.code],
+        )
+
+    def test_user_with_no_current_session_sees_nothing(self):
+        bare = User.objects.create_user(
+            username='nomad', email='n@x.com', password='password123',
+        )
+        token = Token.objects.create(user=bare)
+        nomad = APIClient()
+        nomad.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        # Authenticated but no current_session → empty results.
+        self.assertEqual(nomad.get('/api/zones/').json(), [])
+        self.assertEqual(nomad.get('/api/towers/').json(), [])
+        self.assertEqual(nomad.get('/api/teams/').json(), [])
+
+
+class ScopingTwoSessionsOneGameTest(TestCase):
+    """Two sessions on the SAME game — share tower/zone config, isolate teams."""
+
+    def setUp(self):
+        from organize.models import Session
+
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        Challenge.objects.create(
+            text='c', tower=self.tower, game=self.game, difficulty=1,
+        )
+        now = timezone.now()
+        self.session_a = Session.objects.create(
+            game=self.game, slug='morning', name='Morning',
+            start_time=now, end_time=now + timedelta(hours=2),
+            is_active=True,
+        )
+        self.session_b = Session.objects.create(
+            game=self.game, slug='afternoon', name='Afternoon',
+            start_time=now + timedelta(hours=3),
+            end_time=now + timedelta(hours=5),
+            is_active=True,
+        )
+        self.team_a = Team.objects.create(
+            name='team-a', session=self.session_a,
+            code='TA', color='#111', group=self.group,
+        )
+        self.team_b = Team.objects.create(
+            name='team-b', session=self.session_b,
+            code='TB', color='#222', group=self.group,
+        )
+        self.client_a, _ = _authed_client(self.team_a, username='pa')
+        self.client_b, _ = _authed_client(self.team_b, username='pb')
+
+    def test_shared_game_config_both_see_same_towers(self):
+        ids_a = {t['id'] for t in self.client_a.get('/api/towers/').json()}
+        ids_b = {t['id'] for t in self.client_b.get('/api/towers/').json()}
+        # Same tower visible in both sessions — the config is shared.
+        self.assertEqual(ids_a, {self.tower.id})
+        self.assertEqual(ids_b, {self.tower.id})
+
+    def test_teams_isolated_between_sessions_of_same_game(self):
+        codes_a = {t['code'] for t in self.client_a.get('/api/teams/').json()}
+        codes_b = {t['code'] for t in self.client_b.get('/api/teams/').json()}
+        self.assertEqual(codes_a, {self.team_a.code})
+        self.assertEqual(codes_b, {self.team_b.code})
+
+
+# ---------------------------------------------------------------------------
 # P3.1 — Game config fields + Challenge.game FK
 # ---------------------------------------------------------------------------
 
@@ -981,14 +1137,8 @@ class StaffAdminEndpointsTest(TestCase):
         self.zone = _make_zone(self.game, name='Z1')
         self.tower = _make_tower(self.game, name='T1', zone=self.zone)
         self.team = _make_team(self.game, self.group, code='T1CODE')
-        self.staff = User.objects.create_user(
-            username='admin', email='a@x.com',
-            password='password123', is_staff=True,
-        )
-        staff_token = Token.objects.create(user=self.staff)
-        self.staff_client = APIClient()
-        self.staff_client.credentials(
-            HTTP_AUTHORIZATION=f'Token {staff_token.key}',
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='admin',
         )
         self.player_client, self.player = _authed_client(self.team)
 
@@ -1135,16 +1285,10 @@ class StaffSubmissionEndpointsTest(TestCase):
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone)
         self.challenge = Challenge.objects.create(
-            text='Prove it', difficulty=1, tower=self.tower,
+            text='Prove it', difficulty=1, tower=self.tower, game=self.game,
         )
-        self.staff = User.objects.create_user(
-            username='review', email='r@x.com',
-            password='password123', is_staff=True,
-        )
-        staff_token = Token.objects.create(user=self.staff)
-        self.staff_client = APIClient()
-        self.staff_client.credentials(
-            HTTP_AUTHORIZATION=f'Token {staff_token.key}',
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='review',
         )
         self.player_client, self.player = _authed_client(self.team)
         self.list_url = reverse('api-staff-submissions')

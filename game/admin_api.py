@@ -12,6 +12,7 @@ from game.models import (
     Tower,
     Zone,
 )
+from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
 from organize.models import Team, TeamGroup
 
 
@@ -55,15 +56,16 @@ class AdminChallengeSerializer(serializers.ModelSerializer):
         fields = ('id', 'game', 'text', 'tower', 'difficulty')
 
 
-class AdminZoneViewSet(viewsets.ModelViewSet):
+class AdminZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for Zones. Shape editing stays in Django admin."""
 
     permission_classes = [IsAdminUser]
     queryset = Zone.objects.all().order_by('name')
     serializer_class = AdminZoneSerializer
+    game_scope_field = 'game'
 
 
-class AdminTowerViewSet(viewsets.ModelViewSet):
+class AdminTowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for Towers + activate/deactivate/unassign actions.
 
     Location (PointField) edits stay in Django admin. Everything else
@@ -73,6 +75,7 @@ class AdminTowerViewSet(viewsets.ModelViewSet):
     permission_classes = [IsAdminUser]
     queryset = Tower.objects.all().order_by('name')
     serializer_class = AdminTowerSerializer
+    game_scope_field = 'game'
 
     @action(detail=True, methods=['post'])
     def unassign(self, request, pk=None):
@@ -82,7 +85,9 @@ class AdminTowerViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def unassign_all(self, request):
-        towers = list(Tower.objects.filter(is_active=True))
+        # Restrict the sweep to the staff user's current scope so one
+        # game's admins can't accidentally close ownerships on another.
+        towers = list(self.get_queryset().filter(is_active=True))
         for tower in towers:
             tower.unassign()
         return Response(
@@ -91,28 +96,31 @@ class AdminTowerViewSet(viewsets.ModelViewSet):
         )
 
 
-class AdminTeamViewSet(viewsets.ModelViewSet):
+class AdminTeamViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for Teams."""
 
     permission_classes = [IsAdminUser]
     queryset = Team.objects.all().order_by('name')
     serializer_class = AdminTeamSerializer
+    session_scope_field = 'session'
 
 
-class AdminTeamGroupList(viewsets.ReadOnlyModelViewSet):
+class AdminTeamGroupList(GameScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
     """Staff-only read access to TeamGroups (needed by the team edit form)."""
 
     permission_classes = [IsAdminUser]
     queryset = TeamGroup.objects.all().order_by('name')
     serializer_class = AdminTeamGroupSerializer
+    game_scope_field = 'game'
 
 
-class AdminChallengeViewSet(viewsets.ModelViewSet):
+class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for Challenges (tower-specific or generic)."""
 
     permission_classes = [IsAdminUser]
     queryset = Challenge.objects.all().order_by('difficulty', 'id')
     serializer_class = AdminChallengeSerializer
+    game_scope_field = 'game'
 
 
 class ResetScoresView(APIView):

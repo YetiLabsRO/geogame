@@ -14,6 +14,7 @@ from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from game.scoping import SessionScopedViewSetMixin
 from organize.emails import send_invite_email
 from organize.models import Invite, TeamMembership
 
@@ -370,10 +371,14 @@ class InviteAcceptSerializer(serializers.Serializer):
     last_name = serializers.CharField(required=False, allow_blank=True)
 
 
-class InviteListCreate(generics.ListCreateAPIView):
+class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
     serializer_class = InviteSerializer
     permission_classes = [IsAdminUser]
     queryset = Invite.objects.select_related('team', 'created_by', 'accepted_by')
+    # Invites are scoped through the team's session. Staff viewing one
+    # session's roster will not see invites intended for another
+    # session (or another game entirely).
+    session_scope_field = 'team__session'
 
     def get_queryset(self):
         qs = super().get_queryset()

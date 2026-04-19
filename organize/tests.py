@@ -528,6 +528,9 @@ class InviteAPITest(TestCase):
 
         self.game = _make_game()
         self.team = _make_team(self.game)
+        # Phase-3 scoping: staff viewsets filter by current_session.
+        self.staff.profile.current_session = self.team.session
+        self.staff.profile.save(update_fields=['current_session'])
 
     def _create_invite(self, **overrides):
         defaults = {

@@ -41,7 +41,7 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
         return obj.initial_bonus != 0
 
 
-class TeamSerializer(serializers.HyperlinkedModelSerializer):
+class TeamSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(source='group.name', read_only=True, default=None)
     group_slug = serializers.CharField(source='group.slug', read_only=True, default=None)
 
