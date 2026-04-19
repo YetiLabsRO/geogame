@@ -68,6 +68,43 @@ export interface AdminChallenge {
   difficulty: number;
 }
 
+export interface AdminGame {
+  id: number;
+  slug: string;
+  name: string;
+  base_point: { type: 'Point'; coordinates: [number, number] } | null;
+  base_zoom_level: number;
+  is_active: boolean;
+  proximity_meters: number;
+  cooloff_minutes: number;
+  initial_bonus_default: number;
+  created_at: string | null;
+}
+
+export type AdminGamePayload = Partial<
+  Omit<AdminGame, 'id' | 'base_point' | 'created_at'>
+> & {
+  base_lat?: number | null;
+  base_lng?: number | null;
+};
+
+export interface AdminSession {
+  id: number;
+  game: number;
+  game_slug: string;
+  game_name: string;
+  slug: string;
+  name: string;
+  start_time: string;
+  end_time: string;
+  is_active: boolean;
+  created_at: string | null;
+}
+
+export type AdminSessionPayload = Partial<
+  Omit<AdminSession, 'id' | 'game_slug' | 'game_name' | 'created_at'>
+>;
+
 @Injectable({ providedIn: 'root' })
 export class StaffApiService {
   private readonly http = inject(HttpClient);
@@ -152,5 +189,37 @@ export class StaffApiService {
       '/api/staff/game-state/reset-scores/',
       {},
     );
+  }
+
+  // ---- Games ---------------------------------------------------------------
+
+  listGames(): Observable<AdminGame[]> {
+    return this.http.get<AdminGame[]>('/api/staff/games/');
+  }
+
+  createGame(payload: AdminGamePayload): Observable<AdminGame> {
+    return this.http.post<AdminGame>('/api/staff/games/', payload);
+  }
+
+  updateGame(id: number, payload: AdminGamePayload): Observable<AdminGame> {
+    return this.http.patch<AdminGame>(`/api/staff/games/${id}/`, payload);
+  }
+
+  // ---- Sessions ------------------------------------------------------------
+
+  listSessions(gameId?: number): Observable<AdminSession[]> {
+    const query = gameId ? `?game=${gameId}` : '';
+    return this.http.get<AdminSession[]>(`/api/staff/sessions/${query}`);
+  }
+
+  createSession(payload: AdminSessionPayload): Observable<AdminSession> {
+    return this.http.post<AdminSession>('/api/staff/sessions/', payload);
+  }
+
+  updateSession(
+    id: number,
+    payload: AdminSessionPayload,
+  ): Observable<AdminSession> {
+    return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
   }
 }

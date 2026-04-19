@@ -3,10 +3,12 @@ import { Router, RouterLink, RouterLinkActive, RouterOutlet } from '@angular/rou
 
 import { AuthService } from 'shared';
 
+import { SessionSwitcherComponent } from './session-switcher.component';
+
 @Component({
   selector: 'app-root',
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterOutlet, RouterLink, RouterLinkActive],
+  imports: [RouterOutlet, RouterLink, RouterLinkActive, SessionSwitcherComponent],
   templateUrl: './app.html',
   styleUrl: './app.scss',
 })
