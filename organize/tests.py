@@ -15,6 +15,7 @@ from rest_framework.test import APIClient
 from organize.models import (
     Game,
     Invite,
+    Session,
     Team,
     TeamMembership,
     UserProfile,
@@ -466,13 +467,22 @@ class CurrentSessionTest(TestCase):
             start_time=now, end_time=now + timedelta(hours=1),
             is_active=True,
         )
+        # Give the tester an active membership so the auto-resolver has
+        # a candidate. Dedicated tests below cover the 0- and multi-
+        # membership paths.
+        self.team = _make_team(self.game)
+        self.team.session = self.session
+        self.team.save()
+        TeamMembership.objects.create(
+            team=self.team, user=self.user.profile, is_active=True,
+        )
 
     def test_requires_auth(self):
         anon = APIClient()
         resp = anon.get(self.url)
         self.assertIn(resp.status_code, (401, 403))
 
-    def test_get_falls_back_to_newest_active_session_when_unset(self):
+    def test_get_auto_resolves_single_membership(self):
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
         body = resp.json()
@@ -483,6 +493,11 @@ class CurrentSessionTest(TestCase):
         self.assertEqual(body['game']['slug'], 'live')
         self.assertEqual(body['game']['proximity_meters'], 50)
         self.assertEqual(body['game']['cooloff_minutes'], 5)
+        # Auto-persist: calling again reads from profile.current_session.
+        self.user.profile.refresh_from_db()
+        self.assertEqual(
+            self.user.profile.current_session_id, self.session.id,
+        )
 
     def test_get_404_when_no_active_session(self):
         self.session.is_active = False
@@ -515,6 +530,110 @@ class CurrentSessionTest(TestCase):
             self.url, {}, content_type='application/json',
         )
         self.assertEqual(resp.status_code, 400)
+
+
+class CurrentSessionAutoResolveTest(TestCase):
+    """P3.9 — default-session selection covers 0 / 1 / many memberships."""
+
+    url = reverse('api-current-session')
+
+    def setUp(self):
+        self.user = User.objects.create_user(
+            username='picker', email='p@x.com', password='password123',
+        )
+        token = Token.objects.create(user=self.user)
+        self.client = APIClient()
+        self.client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+
+    def _session(self, game, slug='default', active=True):
+        now = timezone.now()
+        return Session.objects.create(
+            game=game, slug=slug, name=slug.title(),
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=active,
+        )
+
+    def _join(self, session, code='TEAM'):
+        team = Team.objects.create(
+            name=code.lower(), session=session, code=code, color='#111',
+        )
+        TeamMembership.objects.create(
+            team=team, user=self.user.profile, is_active=True,
+        )
+        return team
+
+    def test_zero_memberships_returns_404(self):
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 404)
+
+    def test_multiple_active_memberships_returns_409_with_candidates(self):
+        game_a = _make_game(name='A', slug='a')
+        game_b = _make_game(name='B', slug='b')
+        s_a = self._session(game_a)
+        s_b = self._session(game_b)
+        self._join(s_a, code='A1')
+        self._join(s_b, code='B1')
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 409)
+        body = resp.json()
+        self.assertEqual(len(body['candidates']), 2)
+        ids = {c['id'] for c in body['candidates']}
+        self.assertEqual(ids, {s_a.id, s_b.id})
+
+    def test_stale_current_session_is_auto_replaced(self):
+        """A current_session the user is no longer a member of is dropped."""
+        gone_game = _make_game(name='Gone', slug='gone')
+        gone = self._session(gone_game)
+        # Set current_session directly, but user has no membership.
+        self.user.profile.current_session = gone
+        self.user.profile.save(update_fields=['current_session'])
+        # Meanwhile, user is a member of exactly one real session.
+        live_game = _make_game(name='Live', slug='live-auto')
+        live = self._session(live_game)
+        self._join(live, code='L1')
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], live.id)
+
+    def test_inactive_session_triggers_auto_resolve(self):
+        """If current_session went inactive, fall back to an active one."""
+        # Inactive session on one game…
+        old_game = _make_game(name='Old', slug='old-g')
+        old_session = self._session(old_game, slug='old', active=False)
+        self._join(old_session, code='OLD')
+        self.user.profile.current_session = old_session
+        self.user.profile.save(update_fields=['current_session'])
+        # …and an active membership on a different game's session.
+        live_game = _make_game(name='Live', slug='live-g')
+        new_session = self._session(live_game, slug='new')
+        self._join(new_session, code='NEW')
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], new_session.id)
+
+    def test_player_cannot_post_session_they_do_not_belong_to(self):
+        other_game = _make_game(name='Other', slug='other')
+        other = self._session(other_game)
+        resp = self.client.post(
+            self.url,
+            {'session_id': other.id},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_staff_without_memberships_gets_fallback(self):
+        staff = User.objects.create_user(
+            username='staff-picker', email='sp@x.com',
+            password='password123', is_staff=True,
+        )
+        token = Token.objects.create(user=staff)
+        c = APIClient()
+        c.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        game = _make_game(name='S', slug='s-auto')
+        s = self._session(game)
+        resp = c.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], s.id)
 
 
 class InviteAPITest(TestCase):

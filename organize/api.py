@@ -274,23 +274,51 @@ class CurrentSessionSerializer(serializers.Serializer):
 class CurrentSessionView(APIView):
     """Read / write the authenticated user's active Session.
 
-    GET returns the Session the user is currently scoped to, with the
-    Game config nested inline. If no session is set explicitly, we
-    fall back to the single newest active Session on the system — this
-    keeps the Phase-2 callers (who never POST) working. T3.9 will
-    replace this heuristic with the player default-selection logic.
+    GET auto-resolves from the caller's active TeamMemberships when no
+    session is set (or the currently-set one is no longer valid):
 
-    POST accepts `{session_id: <int>}` and updates
-    profile.current_session. 404 when the session does not exist.
+    - Exactly one active membership on an active session → auto-persist
+      and return it.
+    - Multiple → return 409 with `candidates` so the UI can show a
+      picker.
+    - Zero → 404 "You are not in any active session" (unless the caller
+      is staff, in which case we fall back to the newest active session
+      system-wide so the scoped viewsets still have something to scope
+      by).
+
+    POST accepts `{session_id: <int>}`. Non-staff callers must have an
+    active membership on a team in that session; staff can pick freely.
     """
 
     permission_classes = [IsAuthenticated]
 
-    def _current_for(self, user):
+    def _candidate_sessions(self, user):
+        """Distinct sessions this user is an active member of."""
         from organize.models import Session
-        profile = user.profile
-        if profile.current_session is not None:
-            return profile.current_session
+        session_ids = (
+            user.profile.memberships
+            .filter(is_active=True, team__session__is_active=True)
+            .values_list('team__session_id', flat=True)
+            .distinct()
+        )
+        return list(
+            Session.objects
+            .filter(id__in=session_ids, is_active=True)
+            .select_related('game')
+            .order_by('game__name', 'name')
+        )
+
+    def _current_still_valid(self, user, session):
+        if session is None or not session.is_active:
+            return False
+        if user.is_staff:
+            return True
+        return user.profile.memberships.filter(
+            is_active=True, team__session=session,
+        ).exists()
+
+    def _staff_fallback(self):
+        from organize.models import Session
         return (
             Session.objects
             .filter(is_active=True)
@@ -299,14 +327,45 @@ class CurrentSessionView(APIView):
             .first()
         )
 
+    def _persist(self, user, session):
+        user.profile.current_session = session
+        user.profile.save(update_fields=['current_session'])
+
     def get(self, request):
-        session = self._current_for(request.user)
-        if session is None:
+        profile = request.user.profile
+
+        if self._current_still_valid(request.user, profile.current_session):
             return Response(
-                {'detail': 'No active session.'},
-                status=status.HTTP_404_NOT_FOUND,
+                CurrentSessionSerializer(profile.current_session).data,
             )
-        return Response(CurrentSessionSerializer(session).data)
+
+        candidates = self._candidate_sessions(request.user)
+        if len(candidates) == 1:
+            self._persist(request.user, candidates[0])
+            return Response(CurrentSessionSerializer(candidates[0]).data)
+
+        if len(candidates) > 1:
+            return Response(
+                {
+                    'detail': 'Multiple active sessions available.',
+                    'candidates': CurrentSessionSerializer(
+                        candidates, many=True,
+                    ).data,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        # No memberships. Staff keep a fallback so the scoped viewsets
+        # still work; everyone else gets 404.
+        if request.user.is_staff:
+            fallback = self._staff_fallback()
+            if fallback is not None:
+                self._persist(request.user, fallback)
+                return Response(CurrentSessionSerializer(fallback).data)
+        return Response(
+            {'detail': 'You are not in any active session.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
 
     def post(self, request):
         from organize.models import Session
@@ -317,16 +376,30 @@ class CurrentSessionView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
         session = (
-            Session.objects.select_related('game').filter(pk=session_id).first()
+            Session.objects
+            .select_related('game')
+            .filter(pk=session_id)
+            .first()
         )
         if session is None:
             return Response(
                 {'detail': 'Session not found.'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        profile = request.user.profile
-        profile.current_session = session
-        profile.save(update_fields=['current_session'])
+
+        # Players can only set the current session to one they have an
+        # active membership in. Staff can switch freely.
+        if not request.user.is_staff:
+            is_member = request.user.profile.memberships.filter(
+                is_active=True, team__session=session,
+            ).exists()
+            if not is_member:
+                return Response(
+                    {'detail': 'You are not a member of that session.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+        self._persist(request.user, session)
         return Response(CurrentSessionSerializer(session).data)
 
 

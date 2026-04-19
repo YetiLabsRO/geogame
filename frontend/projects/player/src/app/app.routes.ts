@@ -25,6 +25,14 @@ export const routes: Routes = [
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },
   {
+    path: 'pick-session',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./session-picker/session-picker.component').then(
+        (m) => m.SessionPickerComponent,
+      ),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },

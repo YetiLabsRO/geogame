@@ -9,7 +9,8 @@ import {
   signal,
   viewChild,
 } from '@angular/core';
-import { ActivatedRoute } from '@angular/router';
+import { ActivatedRoute, Router } from '@angular/router';
+import { HttpErrorResponse } from '@angular/common/http';
 import { forkJoin } from 'rxjs';
 import * as L from 'leaflet';
 
@@ -77,6 +78,7 @@ export class MapComponent {
   private readonly api = inject(GameApiService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
 
   protected readonly mapContainer = viewChild.required<ElementRef<HTMLDivElement>>('mapContainer');
   protected readonly errorMessage = signal<string | null>(null);
@@ -114,7 +116,16 @@ export class MapComponent {
         this.renderZones(zones, slug !== null);
         this.renderTowers(towers);
       },
-      error: () => {
+      error: (err) => {
+        // 404 (no session) and 409 (multiple candidates) mean the
+        // player needs to land on /pick-session before we can render.
+        if (
+          err instanceof HttpErrorResponse &&
+          (err.status === 404 || err.status === 409)
+        ) {
+          this.router.navigateByUrl('/pick-session');
+          return;
+        }
         this.errorMessage.set('Could not load map data. Check your connection and refresh.');
       },
     });
