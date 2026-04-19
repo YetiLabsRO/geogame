@@ -85,6 +85,34 @@ npx ng generate component some-name --project=player
 
 Both are launched via `npx -y` on demand; no global install needed.
 
+### E2E (Playwright)
+
+Specs live in [frontend/e2e/](../frontend/e2e/). They cover the player journey
+(invite → register → submit challenge) and the staff journey (create invite →
+review → confirm → tower color update).
+
+First-time setup (installs the Chromium browser + OS deps):
+```bash
+cd frontend
+npm run e2e:install
+```
+
+Running the specs (the `globalSetup` calls `manage.py seed_e2e_fixture` which
+resets a deterministic set of e2e-prefixed rows, so it's safe to rerun):
+```bash
+# Start the backend and both dev servers in separate terminals:
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8000
+cd frontend && npm run start:player
+cd frontend && npm run start:staff
+
+# Then from frontend/:
+npm run e2e         # headless
+npm run e2e:ui      # interactive runner
+```
+
+CI can set `PLAYWRIGHT_MANAGED=1` to let Playwright start all three servers
+itself (see [playwright.config.ts](../frontend/playwright.config.ts)).
+
 ### Angular style
 
 - Use **standalone components** (default in v21). Avoid NgModules.

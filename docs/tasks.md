@@ -117,9 +117,9 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2F.1: Delete `game/templates/` and associated template views; keep admin templates. Wire root URL to Angular build. (Plan: P2F.1, Req: 15.1)
 
 ## Phase 2G: E2E Tests
-- [ ] T2G.1: Install and configure Playwright in `frontend/`. (Plan: P2G.1)
-- [ ] T2G.2: Player journey E2E: invite → register → login → map → submit challenge with photo. (Plan: P2G.2, Req: 13.1, 14.2, 15.1)
-- [ ] T2G.3: Staff journey E2E: create invite → review submission → confirm → tower color updates. (Plan: P2G.3, Req: 16.1, 16.2)
+- [x] T2G.1: Install and configure Playwright in `frontend/`. (Plan: P2G.1)
+- [x] T2G.2: Player journey E2E: invite → register → login → map → submit challenge with photo. (Plan: P2G.2, Req: 13.1, 14.2, 15.1)
+- [x] T2G.3: Staff journey E2E: create invite → review submission → confirm → tower color updates. (Plan: P2G.3, Req: 16.1, 16.2)
 
 ## Phase 3: Multi-Game Support
 - [ ] T3.1: Add `Game` model with config fields; add `game` FK to Zone/Tower/Team/Challenge; data migration creates Default Game and backfills. (Plan: P3.1, Req: 17.1)
