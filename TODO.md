@@ -1,3 +1,0 @@
-- when the day cuts off, make sure to stop all team tower membership
-- when the day starts again, make sure to start all team tower membership ?
-- what happens when a team fails a challenge?

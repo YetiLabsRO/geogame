@@ -141,10 +141,23 @@ the earlier `clone_game` idea.
 - [x] T3.10: Session history — staff "Past sessions" list with read-only final scoreboard + ownership timeline; player list of own past sessions with read-only views. (Plan: P3.10, Req: 19.1, 19.2)
 - [x] T3.11: Drop the deprecated `organize.Team.team_code` column. (Plan: P3.11, Req: 13.2)
 
-## Phase 10: Open Items (from TODO.md — specs needed first)
-- [ ] T10.1: Specify and implement day-cutoff pausing of TeamTowerOwnership. (Plan: OPEN1) — **blocked on requirements definition**
-- [ ] T10.2: Specify and implement day-start resumption of TeamTowerOwnership. (Plan: OPEN1) — **blocked on requirements definition**
-- [ ] T10.3: Specify and implement challenge-failure consequences beyond 5-min cooloff. (Plan: OPEN2) — **blocked on requirements definition**
+## Phase 10: Day Pausing + Failure Consequences
+
+### Day cut-off pausing
+- [ ] T10.1: Add `PauseWindow` model in `game` app (`session` FK, `started_at`, `ended_at` nullable, snapshots of closed tower + zone ownerships). Add pause-behavior knobs (`pause_freezes_floating_score`, `pause_restores_ownerships_on_resume`, `pause_rejects_submissions`) to `Game` with per-`Session` overrides. Migrations + admin. (Plan: P10.1, Req: 20.1)
+- [ ] T10.2: Implement `POST /api/staff/sessions/{id}/pause/` + `/resume/` endpoints. On pause: close active `TeamTowerOwnership` / `TeamZoneOwnership` rows and record them on the window. On resume (when `pause_restores_ownerships_on_resume=True`): reopen matching rows with `timestamp_start=resume_time`. (Plan: P10.1, Req: 20.1, 20.2)
+- [ ] T10.3: Make scoring pause-aware — `Team.floating_score()` SHALL evaluate as of the open window's `started_at` when `pause_freezes_floating_score=True`. Update the submission serializer so `POST /api/team_tower_challenges/` returns HTTP 409 while paused when `pause_rejects_submissions=True`, else stores PENDING without triggering capture. (Plan: P10.2, Req: 20.2)
+- [ ] T10.4: Implement `POST /api/staff/games/{id}/pause_all/` — pause every active Session on the game in one call. (Plan: P10.2, Req: 20.1)
+- [ ] T10.5: Staff UI — pause/resume buttons on the Session detail page + a "Pause all sessions" button on the Game page; surface current pause state + pause history. (Plan: P10.1, P10.2, Req: 20.1)
+- [ ] T10.6: Tests — pause/resume round-trip restores ownerships; frozen floating score returns identical values during the window; submission endpoint returns 409 when configured to reject; per-session override beats game default. (Plan: P10.1, P10.2, Req: 20.1, 20.2)
+
+### Challenge-failure consequences
+- [ ] T10.7: Add failure-penalty fields to `Game` with per-`Session` overrides: `fail_point_penalty`, `fail_cooloff_scaling`, `fail_tower_lockout_minutes`, `fail_difficulty_rollback`, `fail_counter_reset` (enum: `TOWER_SUCCESS_ONLY` / `ANY_SUCCESS_ELSEWHERE` / `ANY_ATTEMPT_ELSEWHERE`, default `TOWER_SUCCESS_ONLY`). Migrations + admin. (Plan: P10.3, Req: 21.1)
+- [ ] T10.8: Track consecutive failures per `(team, tower)` (new model or derived from `TeamTowerChallenge`) and apply on REJECT: subtract `fail_point_penalty` atomically (clamped to ≥0); set a `locked_until = now + fail_tower_lockout_minutes` blocker; scale the team/tower cooloff by `fail_cooloff_scaling ^ consecutive_fails`. Wire into `Tower.team_in_cooloff` + the submission serializer's lockout check. (Plan: P10.3, Req: 21.1)
+- [ ] T10.9: Extend next-challenge selection so that when `fail_difficulty_rollback=True` and the team has outstanding consecutive fails on that tower, the next challenge is drawn from the next-lower difficulty bucket. (Plan: P10.3, Req: 21.1)
+- [ ] T10.10: Implement `fail_counter_reset` semantics — reset counters per the configured enum (tower-success only / any success / any attempt elsewhere). (Plan: P10.3, Req: 21.1)
+- [ ] T10.11: Staff UI — per-Game form for the five failure knobs + optional per-Session override; scoreboard/timeline view shows current lockouts and consecutive-fail counts for observability. (Plan: P10.3, Req: 21.1)
+- [ ] T10.12: Tests — REJECT subtracts points clamped to ≥0, cooloff scales as `base × scaling^n`, lockout blocks submissions for exactly `fail_tower_lockout_minutes`, difficulty rollback picks from the lower bucket, each reset-enum value behaves as specified, no cross-team side effects. (Plan: P10.3, Req: 21.1)
 
 ## Adding New Tasks
 

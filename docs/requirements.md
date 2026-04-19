@@ -364,9 +364,41 @@ time: two Sessions sharing one Game.
      - A player's session list SHALL include all Sessions where they have (or had) a TeamMembership — active or inactive.
      - Read-only past-session views SHALL show the final scoreboard and their team's ownership timeline.
 
-## Open Items (future consideration)
+### 20. Day Cut-Off Pausing (Phase 10)
 
-Tracked from repo `TODO.md`, still awaiting detailed specifications:
-- **TODO-A**: When the "day" ends (event daily cut-off) pause / close all active `TeamTowerOwnership` records.
-- **TODO-B**: When the day resumes, reopen ownerships.
-- **TODO-C**: Define explicit consequences when a team fails a challenge beyond the 5-minute cooloff (e.g., progression rollback, alternative penalties). Current behavior is only the cooloff.
+Sessions can span multiple days. Between playing days, staff need to pause a Session so that no captures, submissions, or zone-score accrual happen while players are off the field. A Session MAY have multiple non-overlapping pauses over its lifetime.
+
+20.1 **User Story**: As a staff member, I want to pause a running Session at a day cut-off and resume it later so that no scoring or captures accumulate while the event is off-hours.
+   - **Acceptance Criteria**:
+     - A Session SHALL support zero or more `PauseWindow` records (`session`, `started_at`, `ended_at` nullable, plus snapshots needed for resume). A Session SHALL be considered "paused" iff it has an open PauseWindow (`ended_at IS NULL`). The `PauseWindow` model SHALL live in the `game` app alongside the ownership records it interacts with.
+     - Pause behavior knobs SHALL live on `Game` as defaults and SHALL be overridable per `Session`:
+       - `pause_freezes_floating_score` (bool, default `True`)
+       - `pause_restores_ownerships_on_resume` (bool, default `True`)
+       - `pause_rejects_submissions` (bool, default `True`)
+     - `POST /api/staff/sessions/{id}/pause/` SHALL open a PauseWindow. `POST /api/staff/sessions/{id}/resume/` SHALL close the newest open window.
+     - `POST /api/staff/games/{id}/pause_all/` SHALL open a PauseWindow on every active Session of that Game in a single call. (When SessionGroups are introduced, the same action SHALL extend to a SessionGroup.)
+     - Pausing and resuming SHALL be staff-triggered only — no automatic / scheduled pauses in this phase.
+
+20.2 **User Story**: As a player, I want consistent scoring and submission behavior across a pause so that my team isn't unfairly penalized or rewarded by the cut-off.
+   - **Acceptance Criteria**:
+     - While a PauseWindow is open, `Team.floating_score()` SHALL evaluate as of `window.started_at` (not `now`) whenever the effective `pause_freezes_floating_score` is `True`.
+     - On pause open, if the effective `pause_restores_ownerships_on_resume` is `True`, every active `TeamTowerOwnership` / `TeamZoneOwnership` SHALL be closed (`timestamp_end=window.started_at`) and SHALL be recorded on the window so they can be reopened on resume. If `False`, they SHALL be closed the same way but SHALL NOT be restored — teams must re-capture after resume.
+     - On resume with `pause_restores_ownerships_on_resume=True`, new ownership rows SHALL be opened for every (team, tower) / (team, zone) pair that was open at pause time, with `timestamp_start=resume_time`.
+     - While paused, challenge submissions SHALL be rejected with HTTP 409 when the effective `pause_rejects_submissions` is `True`. When `False`, submissions SHALL be accepted and stored as `PENDING`, but SHALL NOT trigger capture until resume.
+
+### 21. Challenge Failure Consequences (Phase 10)
+
+Today, a REJECTED submission only triggers a 5-minute cooloff. This section lets staff stack additional, opt-in consequences so that failure has weight.
+
+21.1 **User Story**: As a staff member, I want to configure consequences for a team failing a challenge so that failure matters beyond the 5-minute cooloff.
+   - **Acceptance Criteria**:
+     - `Game` SHALL expose the following combinable failure-penalty knobs as defaults, each independently toggleable and each overridable per `Session`. All default to "off" so existing behavior is unchanged:
+       - `fail_point_penalty` (non-negative int, default `0`): subtracted from `Team.score` each time a submission is REJECTED. Score SHALL NOT go below zero.
+       - `fail_cooloff_scaling` (float ≥ 1.0, default `1.0`): the effective cooloff for a `(team, tower)` pair SHALL be `base_cooloff × scaling ^ consecutive_fails_on_this_tower`.
+       - `fail_tower_lockout_minutes` (non-negative int, default `0`): after a REJECTED submission, the team SHALL be blocked from resubmitting on that tower for this many minutes, independently of the cooloff.
+       - `fail_difficulty_rollback` (bool, default `False`): when `True`, after a REJECTED submission the team's next challenge selection for that tower SHALL be drawn from the next-lower difficulty bucket.
+     - Consecutive-fail counters SHALL be tracked per `(team, tower)`. Reset semantics SHALL be configurable on `Game` (overridable per `Session`) via `fail_counter_reset`, an enum with values:
+       - `TOWER_SUCCESS_ONLY` (default): the counter SHALL reset only on a CONFIRMED submission on the same tower, or when staff explicitly clear it.
+       - `ANY_SUCCESS_ELSEWHERE`: a CONFIRMED submission on any other tower SHALL also reset the counter.
+       - `ANY_ATTEMPT_ELSEWHERE`: any submission (regardless of outcome) on any other tower SHALL reset the counter.
+     - Failure penalties SHALL have no cross-team side effects. A team's failures SHALL NOT affect other teams' state, challenge selection, or cooloffs.

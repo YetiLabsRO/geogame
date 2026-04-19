@@ -172,8 +172,12 @@ Session on an existing Game *is* the clone flow.
 | **P3.10 Session History Views** | Staff: "Past sessions" list filterable by Game with a read-only final scoreboard + ownership timeline. Player: list of own past sessions with per-team read-only scoreboard. | 19.1, 19.2 | Medium |
 | **P3.11 Drop legacy `team_code`** | Schema migration removing the Phase-2-deprecated `organize.Team.team_code` column. | 13.2 | Low |
 
-## Open Items (from TODO.md)
+## Phase 10 — Day Pausing + Failure Consequences
+
+Staff-triggered Session pauses (events span multiple days) and configurable challenge-failure penalties. All behavior is opt-in — defaults preserve current Phase 3 behavior.
+
 | Item | Description | Linked Requirements | Priority |
 | :--- | :--- | :--- | :--- |
-| **OPEN1. Day Cut-Off Pause** | When the event's "day" ends, close all active `TeamTowerOwnership` records; open them again when the day resumes. Needs a clock / schedule source of truth (admin-triggered vs. scheduled) to be specified. | (new req needed) | Medium |
-| **OPEN2. Challenge Failure Consequences** | Decide consequences beyond the 5-minute cooloff when a team fails a challenge (progression rollback? point penalty? cooloff scaling?). Spec needed before implementation. | (new req needed) | Low |
+| **P10.1 PauseWindow Model + Pause/Resume API** | New `game.PauseWindow(session, started_at, ended_at, closed_tower_ownerships, closed_zone_ownerships)` + pause knobs on `Game` (with per-`Session` overrides). `POST /api/staff/sessions/{id}/pause/` + `/resume/` endpoints. On pause: close active `TeamTower`/`TeamZone`Ownership rows and record them on the window. On resume: reopen matching rows with `timestamp_start=now` when `pause_restores_ownerships_on_resume=True`. | 20.1, 20.2 | Medium |
+| **P10.2 Pause-Aware Scoring + Submissions** | `Team.floating_score()` SHALL evaluate as of the open window's `started_at` when `pause_freezes_floating_score=True`. Submission serializer SHALL reject with HTTP 409 while paused when `pause_rejects_submissions=True`, else store `PENDING` without capture. `POST /api/staff/games/{id}/pause_all/` SHALL pause every active Session on the game. | 20.1, 20.2 | Medium |
+| **P10.3 Challenge Failure Penalties** | Add failure-penalty fields to `Game` (with per-`Session` overrides): `fail_point_penalty`, `fail_cooloff_scaling`, `fail_tower_lockout_minutes`, `fail_difficulty_rollback`, `fail_counter_reset` (enum). New `TeamTowerFailCounter(team, tower, consecutive_fails, last_failed_at, locked_until)` (or derived from existing submissions) driving cooloff scaling + lockout + optional difficulty rollback. Score penalty applied atomically on REJECT. | 21.1 | Low |
