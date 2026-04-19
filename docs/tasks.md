@@ -121,15 +121,25 @@ Tasks are linked to [plan.md](plan.md) items and [requirements.md](requirements.
 - [x] T2G.2: Player journey E2E: invite → register → login → map → submit challenge with photo. (Plan: P2G.2, Req: 13.1, 14.2, 15.1)
 - [x] T2G.3: Staff journey E2E: create invite → review submission → confirm → tower color updates. (Plan: P2G.3, Req: 16.1, 16.2)
 
-## Phase 3: Multi-Game Support
-- [ ] T3.1: Add `Game` model with config fields; add `game` FK to Zone/Tower/Team/Challenge; data migration creates Default Game and backfills. (Plan: P3.1, Req: 17.1)
-- [ ] T3.2: Implement `GameScopedViewSet` mixin; update all viewsets to scope by current game. (Plan: P3.2, Req: 17.1, 18.3)
-- [ ] T3.3: Replace hardcoded 50m and 5min constants with Game config reads. (Plan: P3.3, Req: 17.2)
-- [ ] T3.4: Add Games CRUD API (`GET/POST/PATCH/DELETE /api/games/`). (Plan: P3.4, Req: 18.2)
-- [ ] T3.5: Add current-game selector UI in staff app; default players to their team's game. (Plan: P3.5, Req: 18.1)
-- [ ] T3.6: Implement `clone_game` management command (deep-copy Zones/Towers/Challenges; `--include-teams` opt-in). (Plan: P3.6, Req: 19.1)
-- [ ] T3.7: Add "Clone game" button to staff UI wrapping the command. (Plan: P3.7, Req: 19.1)
-- [ ] T3.8: Drop `Team.team_code` column (Phase 2 hard cutover complete). (Plan: P3.8, Req: 13.2)
+## Phase 3: Session Model + Multi-Game Support
+
+Phase 3 introduces `Session` as the runtime entity sitting between `Game`
+(event config — map, rules, challenges) and `Team` (roster + scoring state).
+Parallel Sessions on the same Game share tower/zone/challenge data but keep
+separate scoreboards. Creating a new Session on an existing Game replaces
+the earlier `clone_game` idea.
+
+- [ ] T3.1: Add Game config fields (`slug` unique, `proximity_meters`, `cooloff_minutes`, `initial_bonus_default`, `created_by`, `created_at`); add `game` FK to `game.Challenge` with backfill from `tower.game`. (Plan: P3.1, Req: 17.1)
+- [ ] T3.2: Add `organize.Session` model (`game`, `slug`, `name`, `start_time`, `end_time`, `is_active`, `created_by`, `created_at`); data migration creates a default Session per existing Game inheriting its dates/flags, re-parents every `Team` off `Game` onto `Session`, drops `Team.game` + `Game.start_time` + `Game.end_time`. (Plan: P3.2, Req: 18.1)
+- [ ] T3.3: Rename `UserProfile.current_game` → `current_session`; replace `/api/current-game/` with `/api/current-session/` (returns session + nested game). (Plan: P3.3, Req: 18.2)
+- [ ] T3.4: Denormalize `TeamMembership.game` (kept in sync with `team.session.game`); add conditional unique constraint `(user, game) where is_active=True`; surface friendly errors on conflict in invite-accept + admin flows. (Plan: P3.4, Req: 18.3)
+- [ ] T3.5: Implement `SessionScopedViewSet` + `GameScopedViewSet` mixins and apply to every existing viewset (player API, staff admin API, submissions, invites). (Plan: P3.5, Req: 17.1, 18.4)
+- [ ] T3.6: Replace hardcoded 50m proximity and 5min cooloff with reads from `session.game.proximity_meters` / `cooloff_minutes` (tower state endpoint, submission serializer, `Tower.team_in_cooloff`). (Plan: P3.6, Req: 17.2)
+- [ ] T3.7: Games + Sessions CRUD API at `/api/staff/games/` and `/api/staff/sessions/`; deactivating a Session SHALL close its open ownerships (mirrors `unassign_all`). (Plan: P3.7, Req: 18.5)
+- [ ] T3.8: Staff UI — Games list/edit, Sessions list/edit grouped by Game, navbar current-session switcher grouped by Game. (Plan: P3.8, Req: 18.2, 18.5)
+- [ ] T3.9: Player default-session selection: if exactly one active membership on an active session, auto-select; otherwise surface a picker. (Plan: P3.9, Req: 18.2)
+- [ ] T3.10: Session history — staff "Past sessions" list with read-only final scoreboard + ownership timeline; player list of own past sessions with read-only views. (Plan: P3.10, Req: 19.1, 19.2)
+- [ ] T3.11: Drop the deprecated `organize.Team.team_code` column. (Plan: P3.11, Req: 13.2)
 
 ## Phase 10: Open Items (from TODO.md — specs needed first)
 - [ ] T10.1: Specify and implement day-cutoff pausing of TeamTowerOwnership. (Plan: OPEN1) — **blocked on requirements definition**

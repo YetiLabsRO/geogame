@@ -150,17 +150,27 @@ Use this doc as the index from requirements → modules/code.
 | **P2G.2 Player Journey E2E** | Invite → register → login → view map → submit challenge with photo. | 13.1, 14.2, 15.1 | High |
 | **P2G.3 Staff Journey E2E** | Create invite → review submission → confirm → tower color updates on map. | 16.1, 16.2 | High |
 
-## Phase 3 — Multi-Game Support
+## Phase 3 — Session Model + Multi-Game Support
+
+Phase 3 introduces `Session` as the runtime entity that sits between `Game`
+(event config) and `Team` (roster / scoring state). Two parallel Sessions on
+the same Game share the tower/zone/challenge configuration but keep separate
+scoreboards. `clone_game` from earlier drafts disappears — creating a new
+Session on an existing Game *is* the clone flow.
+
 | Item | Description | Linked Requirements | Priority |
 | :--- | :--- | :--- | :--- |
-| **P3.1 Game Model & Migration** | `organize.Game` model ALREADY exists with `name, players, base_point, base_zoom_level, start_time, end_time, is_active`. Zone/Tower/Team already have `game` FK. **Phase 3 work**: add `game` FK to `game.Challenge`; add denormalized `game_id` to `game.TeamTowerChallenge`; add missing config fields (`slug`, `is_active_during_hours`, `proximity_meters`, `cooloff_minutes`, `initial_bonus_default`, `created_by`); data migration ensures a backfill game exists. | 17.1 | High |
-| **P3.2 Query Scoping** | `GameScopedViewSet` mixin; update all viewsets to scope by `request.user.profile.current_game`. | 17.1, 18.3 | High |
-| **P3.3 Game Config Usage** | Replace hardcoded 50m and 5min with game config fields. | 17.2 | High |
-| **P3.4 Games CRUD API** | `GET/POST/PATCH/DELETE /api/games/`. | 18.2 | High |
-| **P3.5 Current-Game Selector (UI)** | Staff switcher in Angular staff app; player default to team's game. | 18.1 | High |
-| **P3.6 `clone_game` Command** | Management command to deep-copy Zones/Towers/Challenges to a new Game. | 19.1 | Medium |
-| **P3.7 Clone Game UI** | Staff UI button wrapping the command. | 19.1 | Medium |
-| **P3.8 Drop team_code Field** | Schema migration removing the deprecated `organize.Team.code` column (was `Team.team_code` pre-refactor; remote renamed to `code`). | 13.2 | Low |
+| **P3.1 Game Config Fields** | Add `slug` (unique), `proximity_meters`, `cooloff_minutes`, `initial_bonus_default`, `created_by`, `created_at` to `organize.Game`. Add `game` FK to `game.Challenge` with backfill from `tower.game`. | 17.1 | High |
+| **P3.2 Session Model + Migration** | New `organize.Session(game, slug, name, start_time, end_time, is_active, created_by, created_at)`. Data migration: for each existing Game, create a default Session inheriting its dates/is_active; re-parent every Team from `game` FK to `session` FK; drop `Team.game`, `Game.start_time`, `Game.end_time`. `(game, slug)` unique. | 18.1 | High |
+| **P3.3 Current-Session Profile + Endpoint** | Rename `UserProfile.current_game` → `current_session`. Replace `/api/current-game/` with `/api/current-session/` (returns session + nested game). | 18.2 | High |
+| **P3.4 TeamMembership Uniqueness** | Denormalize `game` onto `TeamMembership` (sourced from `team.session.game`, kept in sync in `save()`). Add conditional unique constraint `(user, game)` where `is_active=True`. Invite-accept and admin flows SHALL surface a friendly error on conflict. | 18.3 | High |
+| **P3.5 Scoping Mixins** | Introduce `SessionScopedViewSet` (Team, ownerships, submissions) and `GameScopedViewSet` (Zone, Tower, Challenge, TeamGroup). Apply to every existing viewset. | 17.1, 18.4 | High |
+| **P3.6 Per-Game Config Reads** | Replace hardcoded 50m proximity and 5min cooloff with `session.game.proximity_meters` / `cooloff_minutes`. Update tower state endpoint, submission serializer, and the `team_in_cooloff` model method. | 17.2 | High |
+| **P3.7 Games + Sessions CRUD API** | `GET/POST/PATCH/DELETE /api/staff/games/` and `/api/staff/sessions/`. Session deactivation SHALL close all open ownerships on that session (mirrors `unassign_all`). | 18.5 | High |
+| **P3.8 Staff UI — Games, Sessions, Switcher** | Staff pages for Games list/edit and Sessions list/edit (grouped by Game). Current-session switcher in the navbar, grouped by Game. | 18.2, 18.5 | High |
+| **P3.9 Player Default-Session Logic** | On login/profile fetch, if the player has exactly one active TeamMembership on an active Session, auto-select it; otherwise surface a "pick your session" picker. | 18.2 | Medium |
+| **P3.10 Session History Views** | Staff: "Past sessions" list filterable by Game with a read-only final scoreboard + ownership timeline. Player: list of own past sessions with per-team read-only scoreboard. | 19.1, 19.2 | Medium |
+| **P3.11 Drop legacy `team_code`** | Schema migration removing the Phase-2-deprecated `organize.Team.team_code` column. | 13.2 | Low |
 
 ## Open Items (from TODO.md)
 | Item | Description | Linked Requirements | Priority |

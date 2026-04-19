@@ -286,50 +286,83 @@ Target users:
      - The scoreboard SHALL show each team's locked + floating score with per-TeamGroup tabs.
      - The scoreboard SHALL refresh automatically (polling every 30s is acceptable; websockets not required in Phase 2).
 
-### 17. Game Entity (partially implemented, Phase 3 will complete)
+### 17. Game Entity — event configuration (Phase 3)
 
-17.1 **User Story**: As an administrator, I want a `Game` entity that owns zones, towers, teams, and team groups so that multiple independent games can run on one server.
-   - **Status**: Partially implemented in the pre-Phase-0 refactor. `organize.Game`, `organize.TeamGroup`, `organize.Team` exist; `game.Zone`, `game.Tower`, `game.Team` carry a mandatory `game = ForeignKey(Game)` FK. `Challenge` does NOT yet have a `game` FK — Phase 3 will add this.
+A **Game** is the reusable event configuration: the map, the rules, the
+challenge bank, the team-group taxonomy. A Game does NOT hold the running
+scoreboard; that is `Session` (§18). Multiple Sessions can run on the same
+Game concurrently (e.g. two rosters running the same course), and each
+Session has its own teams, ownerships, and clock.
+
+17.1 **User Story**: As an administrator, I want a `Game` entity that owns the zones, towers, team groups, and challenges for an event so that the same course can be re-run across multiple events without re-creating map data.
+   - **Status**: Partially implemented in the pre-Phase-0 refactor. `organize.Game`, `organize.TeamGroup` exist; `game.Zone`, `game.Tower` already carry a mandatory `game = ForeignKey(Game)` FK. `Challenge` does NOT yet have a `game` FK and `Team` currently hangs off Game directly — Phase 3 will fix both.
    - **Acceptance Criteria (target end of Phase 3)**:
-     - `Game` SHALL have: `name`, `players` M2M, `base_point` + `base_zoom_level` (map defaults), `start_time`, `end_time`, `is_active`. Additional configurable rule fields (`proximity_meters` default 50, `cooloff_minutes` default 5, `initial_bonus_default` default 0) SHALL be added in Phase 3.
-     - `Zone`, `Tower`, `Team` ALREADY have a mandatory `game` FK.
-     - `Challenge` SHALL gain a `game` FK (Phase 3).
-     - `TeamTowerChallenge` SHALL gain a denormalized `game_id` for query performance (Phase 3).
-     - All queries SHALL be scoped by game; a reusable `GameScopedViewSet` / queryset mixin SHALL enforce this at the API layer (Phase 3).
+     - `Game` SHALL have: `slug` (URL-safe, unique), `name`, `base_point` + `base_zoom_level` (map defaults), `is_active`, `created_by`, `created_at`. Configurable rule fields (`proximity_meters` default 50, `cooloff_minutes` default 5, `initial_bonus_default` default 0) SHALL be added in Phase 3.
+     - `start_time` and `end_time` move from Game to Session (§18); Game carries no per-run clock.
+     - `Zone`, `Tower` retain their existing mandatory `game` FK.
+     - `Challenge` SHALL gain a `game` FK (Phase 3). Challenges are shared across every Session of the Game.
+     - `TeamGroup` remains `game`-scoped — the category taxonomy belongs to the event config, not to a specific run.
+     - `Team` SHALL move off Game and onto Session (§18).
 
 17.2 **User Story**: As a staff member, I want to configure per-game rules so that different events can have different behavior.
-   - **Status**: Not yet implemented. Proximity (50m) and cooloff (5min) are still hardcoded in `game.views` and `game.forms` / `game.models.Tower.team_in_cooloff`.
+   - **Status**: Not yet implemented. Proximity (50m) and cooloff (5min) are hardcoded in `game.views` and `game.api`.
    - **Acceptance Criteria**:
-     - Proximity threshold (`proximity_meters`) SHALL be read from the game config, not hardcoded.
-     - Cooloff duration (`cooloff_minutes`) SHALL be read from the game config.
-     - Existing hardcoded 50m and 5min values SHALL remain the defaults for the Default Game so existing tests continue to pass.
+     - Proximity threshold (`proximity_meters`) SHALL be read from the current Session's game config, not hardcoded.
+     - Cooloff duration (`cooloff_minutes`) SHALL be read from the current Session's game config.
+     - Existing hardcoded 50m and 5min values SHALL remain the defaults for migrated games so existing tests continue to pass.
 
-### 18. Multi-Game Operation (Phase 3)
+### 18. Session Entity — a single live run (Phase 3)
 
-18.1 **User Story**: As a user, I want to select which game I'm currently playing or administering so that I see only that game's state.
+A **Session** is one live run of a Game with a specific roster. Teams belong
+to a Session, not to a Game. Ownership records (`TeamTowerOwnership`,
+`TeamZoneOwnership`, `TeamTowerChallenge`) hang off Team and therefore
+inherit the Session via `Team.session`. This is how the system supports
+running the same physical course for two different rosters at the same
+time: two Sessions sharing one Game.
+
+18.1 **User Story**: As a staff member, I want to create multiple Sessions on the same Game so that I can run the same event for different rosters (including at the same time).
    - **Acceptance Criteria**:
-     - `UserProfile` SHALL have a `current_game = ForeignKey(Game, null=True)` field.
-     - `GET/POST /api/current-game/` SHALL read and write the current game selection.
-     - For players, selection SHALL default to the game of their active team membership; cross-game team membership is not supported in Phase 3.
-     - For staff, the UI SHALL show a game switcher; all staff views SHALL filter by the selected game.
+     - `Session` SHALL have: `game` FK, `slug` (unique within game), `name`, `start_time`, `end_time`, `is_active`, `created_by`, `created_at`.
+     - `(game, slug)` SHALL be unique.
+     - Each Session SHALL run its own clock (`start_time` / `end_time`). A future mode SHALL introduce `SessionGroup` for shared clocks — explicitly out of Phase 3 scope.
+     - Deactivating a Session (`is_active=False`) SHALL hide it from active player/scoreboard views but SHALL preserve all ownership records and remain visible in history.
 
-18.2 **User Story**: As a staff member, I want to create, edit, activate, and deactivate games so that I can run events independently.
+18.2 **User Story**: As a user, I want to select which Session I'm currently playing or administering so that I see only that run's state.
    - **Acceptance Criteria**:
-     - `POST /api/games/` (staff-only) SHALL create a game.
-     - `PATCH /api/games/{id}/` SHALL edit name, slug, rules, dates, and active flag.
-     - Deactivating a game (`is_active=False`) SHALL hide it from player views but SHALL NOT close ownerships (historical record preserved).
+     - `UserProfile` SHALL have a `current_session = ForeignKey(Session, null=True)` field (replaces `current_game` from the Phase-2 stub).
+     - `GET/POST /api/current-session/` SHALL read and write the current selection and return the nested Game config alongside the Session.
+     - For players, the default SHALL be: if the player has exactly one active `TeamMembership` whose `team.session.is_active` is true, select that; otherwise prompt.
+     - For staff, the UI SHALL show a session switcher that groups sessions by Game; all staff views SHALL filter by the selected Session.
 
-18.3 **User Story**: As a player, I want to only see the towers, zones, and teams of my game.
-   - **Acceptance Criteria**: The main map, score maps, and all API reads SHALL filter by the viewer's current game.
-
-### 19. Game Cloning (Phase 3)
-
-19.1 **User Story**: As a staff member organizing a new event, I want to clone an existing game's zones, towers, and challenges so that I don't have to recreate map data.
+18.3 **User Story**: As a player, I want to only ever belong to one Session per Game, but I may participate in multiple Sessions so long as each is in a different Game.
    - **Acceptance Criteria**:
-     - A `clone_game` management command SHALL take a source game slug and a target game name/slug and deep-copy all Zones, Towers, and Challenges into a new Game.
-     - Teams SHALL NOT be copied by default (fresh roster per event); a `--include-teams` flag SHALL opt-in to copy team rows (without memberships).
-     - A staff UI "Clone game" action SHALL wrap the management command.
-     - `TeamTowerChallenge`, `TeamTowerOwnership`, and `TeamZoneOwnership` records SHALL NOT be cloned — the new game starts with a clean slate.
+     - `TeamMembership` SHALL carry a denormalized `game` FK (sourced from `team.session.game`) so the uniqueness constraint can be enforced at the DB layer.
+     - A unique constraint SHALL prevent two active memberships (`is_active=True`) for the same `(user, game)` pair.
+     - Accept-invite and admin flows SHALL surface a clear error when this constraint would be violated.
+
+18.4 **User Story**: As a player, I want to only see the towers, zones, and teams of my current Session.
+   - **Acceptance Criteria**:
+     - `SessionScopedViewSet` (Team, ownerships, submissions) SHALL filter by `request.user.profile.current_session`.
+     - `GameScopedViewSet` (Zone, Tower, Challenge, TeamGroup) SHALL filter by `request.user.profile.current_session.game`.
+
+18.5 **User Story**: As a staff member, I want to create, edit, activate, and deactivate Games and Sessions independently.
+   - **Acceptance Criteria**:
+     - `POST /api/games/` (staff-only) SHALL create a game; `PATCH /api/games/{id}/` SHALL edit name/slug/rules/active flag.
+     - `POST /api/sessions/` (staff-only) SHALL create a session under a chosen Game; `PATCH /api/sessions/{id}/` SHALL edit name/slug/dates/active flag.
+     - Deactivating a Game SHALL hide it from the "create new session" picker but SHALL NOT affect running sessions on that game.
+     - Deactivating a Session SHALL close all open `TeamTowerOwnership` / `TeamZoneOwnership` records on that session (same semantics as tower `unassign_all`) but SHALL preserve history.
+
+### 19. Session History & Visibility (Phase 3)
+
+19.1 **User Story**: As an administrator, I want to browse past Sessions and their final state.
+   - **Acceptance Criteria**:
+     - Sessions SHALL never be hard-deleted; they are retained as historical records.
+     - The staff UI SHALL surface a "Past sessions" list filterable by Game, with a read-only view of each past session's final scoreboard and ownership timeline.
+
+19.2 **User Story**: As a player, I want to view past Sessions I participated in so I can see where my team ended up.
+   - **Acceptance Criteria**:
+     - A player's session list SHALL include all Sessions where they have (or had) a TeamMembership — active or inactive.
+     - Read-only past-session views SHALL show the final scoreboard and their team's ownership timeline.
 
 ## Open Items (future consideration)
 
