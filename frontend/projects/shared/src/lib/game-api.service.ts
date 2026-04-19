@@ -93,6 +93,20 @@ export class GameApiService {
     });
   }
 
+  mySessions(): Observable<CurrentSession[]> {
+    return this.http.get<CurrentSession[]>('/api/my-sessions/');
+  }
+
+  sessionScoreboard(id: number): Observable<SessionScoreboard> {
+    return this.http.get<SessionScoreboard>(
+      `/api/sessions/${id}/scoreboard/`,
+    );
+  }
+
+  sessionTimeline(id: number): Observable<SessionTimeline> {
+    return this.http.get<SessionTimeline>(`/api/sessions/${id}/timeline/`);
+  }
+
   zones(params?: { group?: number; groupSlug?: string }): Observable<ZoneFeature[]> {
     const parts: string[] = [];
     if (params?.group) parts.push(`group=${params.group}`);
@@ -119,6 +133,39 @@ export class GameApiService {
   teams(): Observable<TeamSummary[]> {
     return this.http.get<TeamSummary[]>('/api/teams/');
   }
+}
+
+export interface SessionScoreboardEntry {
+  team_id: number;
+  team_name: string;
+  team_code: string;
+  team_color: string;
+  group_name: string | null;
+  group_slug: string | null;
+  locked_score: number;
+  floating_score: number;
+  current_score: number;
+}
+
+export interface SessionScoreboard {
+  session: CurrentSession;
+  entries: SessionScoreboardEntry[];
+}
+
+export interface SessionTimelineEvent {
+  id: number;
+  team_id: number;
+  team_name: string;
+  team_color: string;
+  tower_id: number;
+  tower_name: string;
+  timestamp_start: string;
+  timestamp_end: string | null;
+}
+
+export interface SessionTimeline {
+  session: CurrentSession;
+  events: SessionTimelineEvent[];
 }
 
 export interface TeamSummary {

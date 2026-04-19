@@ -51,6 +51,14 @@ export const routes: Routes = [
       import('./admin/sessions.component').then((m) => m.SessionsComponent),
   },
   {
+    path: 'sessions/:id',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/session-detail.component').then(
+        (m) => m.StaffSessionDetailComponent,
+      ),
+  },
+  {
     path: 'scoreboard',
     canActivate: [staffGuard],
     loadComponent: () =>

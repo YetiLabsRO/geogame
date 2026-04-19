@@ -11,6 +11,17 @@ urlpatterns = [
     path('me/', api.MeView.as_view(), name='api-me'),
     path('my-team/', api.MyTeamView.as_view(), name='api-my-team'),
     path('current-session/', api.CurrentSessionView.as_view(), name='api-current-session'),
+    path('my-sessions/', api.MySessionsView.as_view(), name='api-my-sessions'),
+    path(
+        'sessions/<int:pk>/scoreboard/',
+        api.SessionScoreboardView.as_view(),
+        name='api-session-scoreboard',
+    ),
+    path(
+        'sessions/<int:pk>/timeline/',
+        api.SessionTimelineView.as_view(),
+        name='api-session-timeline',
+    ),
     path('invites/', api.InviteListCreate.as_view(), name='api-invites'),
     path('invites/accept/<uuid:token>/', api.invite_accept, name='api-invite-accept'),
     path('invites/<uuid:token>/', api.invite_preview, name='api-invite-preview'),

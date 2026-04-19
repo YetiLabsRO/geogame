@@ -33,6 +33,20 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'history',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./history/my-sessions.component').then((m) => m.MySessionsComponent),
+  },
+  {
+    path: 'history/:id',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./history/session-detail.component').then(
+        (m) => m.SessionDetailComponent,
+      ),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },

@@ -12,6 +12,7 @@ import {
   ReactiveFormsModule,
   Validators,
 } from '@angular/forms';
+import { RouterLink } from '@angular/router';
 
 import {
   AdminGame,
@@ -39,10 +40,24 @@ interface GameGroup {
   selector: 'app-admin-sessions',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, FormsModule, DatePipe],
+  imports: [ReactiveFormsModule, FormsModule, DatePipe, RouterLink],
   template: `
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h1 class="h3 mb-0">Sessions</h1>
+      <ul class="nav nav-pills">
+        @for (f of filters; track f.key) {
+          <li class="nav-item">
+            <button
+              type="button"
+              class="nav-link"
+              [class.active]="activeFilter() === f.key"
+              (click)="setFilter(f.key)"
+            >
+              {{ f.label }}
+            </button>
+          </li>
+        }
+      </ul>
     </div>
     <p class="text-body-secondary small">
       A Session is one live run of a Game — its own roster and scoreboard.
@@ -174,17 +189,25 @@ interface GameGroup {
                         </div>
                       </td>
                       <td class="text-end">
-                        <button
-                          type="button"
-                          class="btn btn-sm btn-primary"
-                          [disabled]="!row.dirty || row.saving"
-                          (click)="save(row)"
-                        >
-                          @if (row.saving) {
-                            <span class="spinner-border spinner-border-sm me-1"></span>
-                          }
-                          Save
-                        </button>
+                        <div class="d-flex gap-2 justify-content-end">
+                          <a
+                            class="btn btn-sm btn-outline-secondary"
+                            [routerLink]="['/sessions', row.session.id]"
+                          >
+                            View
+                          </a>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-primary"
+                            [disabled]="!row.dirty || row.saving"
+                            (click)="save(row)"
+                          >
+                            @if (row.saving) {
+                              <span class="spinner-border spinner-border-sm me-1"></span>
+                            }
+                            Save
+                          </button>
+                        </div>
                         @if (row.error; as msg) {
                           <div class="small text-danger mt-1">{{ msg }}</div>
                         }
@@ -212,9 +235,19 @@ export class SessionsComponent {
   protected readonly creating = signal(false);
   protected readonly createError = signal<string | null>(null);
 
+  protected readonly filters: { key: 'all' | 'active' | 'past'; label: string }[] = [
+    { key: 'all', label: 'All' },
+    { key: 'active', label: 'Active' },
+    { key: 'past', label: 'Past' },
+  ];
+  protected readonly activeFilter = signal<'all' | 'active' | 'past'>('all');
+
   protected readonly groups = computed<GameGroup[]>(() => {
+    const filter = this.activeFilter();
     const byGame = new Map<number, Row[]>();
     for (const row of this.rows()) {
+      if (filter === 'active' && !row.session.is_active) continue;
+      if (filter === 'past' && row.session.is_active) continue;
       const key = row.session.game;
       const bucket = byGame.get(key);
       if (bucket) {
@@ -241,6 +274,10 @@ export class SessionsComponent {
 
   constructor() {
     this.refresh();
+  }
+
+  protected setFilter(filter: 'all' | 'active' | 'past'): void {
+    this.activeFilter.set(filter);
   }
 
   private refresh(): void {

@@ -256,6 +256,12 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
         game_id = self.request.query_params.get('game')
         if game_id:
             qs = qs.filter(game_id=game_id)
+        is_active = self.request.query_params.get('is_active')
+        if is_active is not None:
+            if is_active.lower() in ('true', '1'):
+                qs = qs.filter(is_active=True)
+            elif is_active.lower() in ('false', '0'):
+                qs = qs.filter(is_active=False)
         return qs
 
     def perform_create(self, serializer):

@@ -138,7 +138,7 @@ the earlier `clone_game` idea.
 - [x] T3.7: Games + Sessions CRUD API at `/api/staff/games/` and `/api/staff/sessions/`; deactivating a Session SHALL close its open ownerships (mirrors `unassign_all`). (Plan: P3.7, Req: 18.5)
 - [x] T3.8: Staff UI — Games list/edit, Sessions list/edit grouped by Game, navbar current-session switcher grouped by Game. (Plan: P3.8, Req: 18.2, 18.5)
 - [x] T3.9: Player default-session selection: if exactly one active membership on an active session, auto-select; otherwise surface a picker. (Plan: P3.9, Req: 18.2)
-- [ ] T3.10: Session history — staff "Past sessions" list with read-only final scoreboard + ownership timeline; player list of own past sessions with read-only views. (Plan: P3.10, Req: 19.1, 19.2)
+- [x] T3.10: Session history — staff "Past sessions" list with read-only final scoreboard + ownership timeline; player list of own past sessions with read-only views. (Plan: P3.10, Req: 19.1, 19.2)
 - [ ] T3.11: Drop the deprecated `organize.Team.team_code` column. (Plan: P3.11, Req: 13.2)
 
 ## Phase 10: Open Items (from TODO.md — specs needed first)

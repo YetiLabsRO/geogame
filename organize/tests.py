@@ -636,6 +636,141 @@ class CurrentSessionAutoResolveTest(TestCase):
         self.assertEqual(resp.json()['id'], s.id)
 
 
+class SessionHistoryTest(TestCase):
+    """P3.10 — my-sessions, scoreboard, timeline + access control."""
+
+    def setUp(self):
+        self.game = _make_game(name='Hist', slug='hist')
+        now = timezone.now()
+        self.session = Session.objects.create(
+            game=self.game, slug='default', name='Default',
+            start_time=now, end_time=now + timedelta(hours=1),
+            is_active=True,
+        )
+        self.past_session = Session.objects.create(
+            game=self.game, slug='past', name='Past',
+            start_time=now - timedelta(days=7),
+            end_time=now - timedelta(days=6),
+            is_active=False,
+        )
+        self.team = Team.objects.create(
+            name='alpha', session=self.session, code='ALPHA', color='#111',
+        )
+        self.team.score = 42
+        self.team.save()
+
+        self.member = User.objects.create_user(
+            username='alpha-player', email='a@x.com', password='password123',
+        )
+        TeamMembership.objects.create(
+            team=self.team, user=self.member.profile, is_active=True,
+        )
+        self.member_client = APIClient()
+        self.member_client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=self.member).key}',
+        )
+
+        self.outsider = User.objects.create_user(
+            username='outsider', email='o@x.com', password='password123',
+        )
+        self.outsider_client = APIClient()
+        self.outsider_client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=self.outsider).key}',
+        )
+
+        self.staff = User.objects.create_user(
+            username='hist-staff', email='hs@x.com',
+            password='password123', is_staff=True,
+        )
+        self.staff_client = APIClient()
+        self.staff_client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=self.staff).key}',
+        )
+
+    def test_my_sessions_returns_player_memberships(self):
+        resp = self.member_client.get(reverse('api-my-sessions'))
+        self.assertEqual(resp.status_code, 200)
+        ids = [s['id'] for s in resp.json()]
+        self.assertEqual(ids, [self.session.id])
+
+    def test_my_sessions_hides_other_users_sessions(self):
+        resp = self.outsider_client.get(reverse('api-my-sessions'))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+    def test_scoreboard_accessible_to_member(self):
+        url = reverse(
+            'api-session-scoreboard', args=[self.session.id],
+        )
+        resp = self.member_client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['session']['id'], self.session.id)
+        entry = body['entries'][0]
+        self.assertEqual(entry['team_id'], self.team.id)
+        self.assertEqual(entry['locked_score'], 42)
+
+    def test_scoreboard_forbidden_to_non_member(self):
+        url = reverse(
+            'api-session-scoreboard', args=[self.session.id],
+        )
+        resp = self.outsider_client.get(url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_scoreboard_open_to_staff(self):
+        url = reverse(
+            'api-session-scoreboard', args=[self.session.id],
+        )
+        resp = self.staff_client.get(url)
+        self.assertEqual(resp.status_code, 200)
+
+    def test_timeline_returns_ownership_events(self):
+        from django.contrib.gis.geos import Point, Polygon
+
+        from game.models import TeamTowerOwnership, Tower, Zone
+        zone = Zone.objects.create(
+            name='Z', scoring_type=Zone.SCORE_LIN,
+            shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
+            game=self.game,
+        )
+        tower = Tower.objects.create(
+            name='T', zone=zone, location=Point(23.5, 46.5),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+            game=self.game,
+        )
+        TeamTowerOwnership.objects.create(team=self.team, tower=tower)
+        url = reverse(
+            'api-session-timeline', args=[self.session.id],
+        )
+        resp = self.member_client.get(url)
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(len(body['events']), 1)
+        event = body['events'][0]
+        self.assertEqual(event['tower_name'], tower.name)
+        self.assertEqual(event['team_id'], self.team.id)
+
+    def test_timeline_forbidden_to_non_member(self):
+        url = reverse(
+            'api-session-timeline', args=[self.session.id],
+        )
+        resp = self.outsider_client.get(url)
+        self.assertEqual(resp.status_code, 403)
+
+    def test_staff_sessions_filter_by_is_active(self):
+        self.staff.profile.current_session = self.session
+        self.staff.profile.save(update_fields=['current_session'])
+        resp = self.staff_client.get('/api/staff/sessions/?is_active=false')
+        self.assertEqual(resp.status_code, 200)
+        ids = [s['id'] for s in resp.json()]
+        self.assertEqual(ids, [self.past_session.id])
+
+    def test_scoreboard_404_for_unknown_session(self):
+        url = reverse('api-session-scoreboard', args=[999999])
+        resp = self.staff_client.get(url)
+        self.assertEqual(resp.status_code, 404)
+
+
 class InviteAPITest(TestCase):
     def setUp(self):
         self.staff = User.objects.create_user(

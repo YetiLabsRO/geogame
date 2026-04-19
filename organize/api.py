@@ -271,6 +271,142 @@ class CurrentSessionSerializer(serializers.Serializer):
     game = GameConfigSerializer()
 
 
+class MySessionsView(APIView):
+    """Active + past Sessions the authenticated user has a membership on.
+
+    Memberships with `is_active=False` (i.e. the player left the team)
+    still show up; the per-session scoreboard endpoint locks those out
+    on access control if the player has no memberships at all on the
+    session.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        from organize.models import Session
+        session_ids = (
+            request.user.profile.memberships
+            .values_list('team__session_id', flat=True)
+            .distinct()
+        )
+        sessions = (
+            Session.objects
+            .filter(id__in=session_ids)
+            .select_related('game')
+            .order_by('-start_time')
+        )
+        return Response(
+            CurrentSessionSerializer(sessions, many=True).data,
+        )
+
+
+def _user_can_see_session(user, session):
+    if user.is_staff:
+        return True
+    return user.profile.memberships.filter(
+        team__session=session,
+    ).exists()
+
+
+class SessionScoreboardView(APIView):
+    """Final scoreboard for a Session.
+
+    Staff can view any session. Non-staff need (or needed) a team
+    membership in that session.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from organize.models import Session, Team
+        session = Session.objects.filter(pk=pk).select_related('game').first()
+        if session is None:
+            return Response(
+                {'detail': 'Session not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not _user_can_see_session(request.user, session):
+            return Response(
+                {'detail': 'Not your session.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        teams = (
+            Team.objects
+            .filter(session=session)
+            .select_related('group')
+            .order_by('name')
+        )
+        entries = [
+            {
+                'team_id': t.id,
+                'team_name': t.name,
+                'team_code': t.code,
+                'team_color': t.color,
+                'group_name': t.group.name if t.group else None,
+                'group_slug': t.group.slug if t.group else None,
+                'locked_score': t.score,
+                'floating_score': t.floating_score(),
+                'current_score': t.current_score(),
+            }
+            for t in teams
+        ]
+        entries.sort(key=lambda e: (-e['current_score'], e['team_name']))
+        return Response({
+            'session': CurrentSessionSerializer(session).data,
+            'entries': entries,
+        })
+
+
+class SessionTimelineView(APIView):
+    """Ownership timeline (tower captures) for a Session.
+
+    Returns every TeamTowerOwnership — open and closed — for teams in
+    the session, ordered by capture time.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request, pk):
+        from game.models import TeamTowerOwnership
+        from organize.models import Session
+        session = Session.objects.filter(pk=pk).select_related('game').first()
+        if session is None:
+            return Response(
+                {'detail': 'Session not found.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not _user_can_see_session(request.user, session):
+            return Response(
+                {'detail': 'Not your session.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        events = (
+            TeamTowerOwnership.objects
+            .filter(team__session=session)
+            .select_related('team', 'tower')
+            .order_by('timestamp_start')
+        )
+        payload = [
+            {
+                'id': e.id,
+                'team_id': e.team_id,
+                'team_name': e.team.name,
+                'team_color': e.team.color,
+                'tower_id': e.tower_id,
+                'tower_name': e.tower.name,
+                'timestamp_start': e.timestamp_start.isoformat(),
+                'timestamp_end': (
+                    e.timestamp_end.isoformat() if e.timestamp_end else None
+                ),
+            }
+            for e in events
+        ]
+        return Response({
+            'session': CurrentSessionSerializer(session).data,
+            'events': payload,
+        })
+
+
 class CurrentSessionView(APIView):
     """Read / write the authenticated user's active Session.
 
