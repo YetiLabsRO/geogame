@@ -81,6 +81,31 @@
       "python": "/home/yeti/.virtualenvs/cercetador/bin/python",
       "console": "integratedTerminal",
       "justMyCode": false
+    },
+    {
+      "name": "ng serve: player",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npx ng serve player --port 4200",
+      "cwd": "${workspaceFolder}/frontend"
+    },
+    {
+      "name": "ng serve: staff",
+      "type": "node-terminal",
+      "request": "launch",
+      "command": "npx ng serve staff --port 4201",
+      "cwd": "${workspaceFolder}/frontend"
+    }
+  ],
+  "compounds": [
+    {
+      "name": "Full stack (Django + player + staff)",
+      "configurations": [
+        "Django (runserver)",
+        "ng serve: player",
+        "ng serve: staff"
+      ],
+      "stopAll": true
     }
   ]
 }
