@@ -95,7 +95,6 @@ class TeamMemberSerializer(serializers.Serializer):
 class MyTeamSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     name = serializers.CharField()
-    code = serializers.CharField()
     color = serializers.CharField()
     score = serializers.IntegerField()
     current_score = serializers.SerializerMethodField()
@@ -340,7 +339,6 @@ class SessionScoreboardView(APIView):
             {
                 'team_id': t.id,
                 'team_name': t.name,
-                'team_code': t.code,
                 'team_color': t.color,
                 'group_name': t.group.name if t.group else None,
                 'group_slug': t.group.slug if t.group else None,

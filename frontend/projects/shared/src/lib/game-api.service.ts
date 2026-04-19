@@ -63,7 +63,6 @@ export interface ZoneFeature {
 
 export interface TowerOwnership {
   name: string;
-  code: string;
   color: string;
   current_score: number;
 }
@@ -138,7 +137,6 @@ export class GameApiService {
 export interface SessionScoreboardEntry {
   team_id: number;
   team_name: string;
-  team_code: string;
   team_color: string;
   group_name: string | null;
   group_slug: string | null;
@@ -171,7 +169,6 @@ export interface SessionTimeline {
 export interface TeamSummary {
   id: number;
   name: string;
-  code: string;
   group: number | null;
   group_name: string | null;
   group_slug: string | null;

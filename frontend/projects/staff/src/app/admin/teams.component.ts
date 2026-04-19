@@ -38,7 +38,6 @@ interface Row {
           <thead>
             <tr>
               <th>Name</th>
-              <th>Code</th>
               <th>Group</th>
               <th>Color</th>
               <th>Description</th>
@@ -54,14 +53,6 @@ interface Row {
                     type="text"
                     [ngModel]="row.draft.name"
                     (ngModelChange)="update(row, 'name', $event)"
-                  />
-                </td>
-                <td style="max-width: 8rem">
-                  <input
-                    class="form-control form-control-sm"
-                    type="text"
-                    [ngModel]="row.draft.code"
-                    (ngModelChange)="update(row, 'code', $event)"
                   />
                 </td>
                 <td style="min-width: 10rem">

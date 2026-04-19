@@ -33,8 +33,8 @@ type TabKey = InviteStatus | 'all';
                 <label class="form-label" for="team">Team</label>
                 <select id="team" class="form-select" formControlName="team">
                   <option [ngValue]="null" disabled>Pick a team…</option>
-                  @for (t of teams(); track t.code) {
-                    <option [ngValue]="t.id">{{ t.name }} ({{ t.code }})</option>
+                  @for (t of teams(); track t.id) {
+                    <option [ngValue]="t.id">{{ t.name }}</option>
                   }
                 </select>
               </div>

@@ -51,11 +51,10 @@ def _default_session(game):
     return session
 
 
-def _make_team(game, name='Lynx', code='LYNX'):
+def _make_team(game, name='Lynx'):
     return Team.objects.create(
         name=name,
         session=_default_session(game),
-        code=code,
         color='#ff0000',
     )
 
@@ -300,10 +299,10 @@ class TeamMembershipUniquenessTest(TestCase):
             is_active=True,
         )
         self.team_a = Team.objects.create(
-            name='a', session=self.session_a, code='AAA', color='#111',
+            name='a', session=self.session_a, color='#111',
         )
         self.team_b = Team.objects.create(
-            name='b', session=self.session_b, code='BBB', color='#222',
+            name='b', session=self.session_b, color='#222',
         )
         self.user = User.objects.create_user(
             username='scout', email='s@x.com', password='password123',
@@ -349,7 +348,7 @@ class TeamMembershipUniquenessTest(TestCase):
             is_active=True,
         )
         other_team = Team.objects.create(
-            name='o', session=other_session, code='OO', color='#333',
+            name='o', session=other_session, color='#333',
         )
         TeamMembership.objects.create(
             team=self.team_a, user=self.user.profile, is_active=True,
@@ -434,10 +433,10 @@ class TeamSessionReparentingTest(TestCase):
             start_time=now, end_time=now + timedelta(hours=1),
         )
         Team.objects.create(
-            name='a-team', session=session_a, code='ATEAM', color='#111',
+            name='a-team', session=session_a, color='#111',
         )
         Team.objects.create(
-            name='b-team', session=session_b, code='BTEAM', color='#222',
+            name='b-team', session=session_b, color='#222',
         )
         self.assertEqual(session_a.teams.count(), 1)
         self.assertEqual(session_b.teams.count(), 1)
@@ -553,9 +552,9 @@ class CurrentSessionAutoResolveTest(TestCase):
             is_active=active,
         )
 
-    def _join(self, session, code='TEAM'):
+    def _join(self, session, name='team'):
         team = Team.objects.create(
-            name=code.lower(), session=session, code=code, color='#111',
+            name=name, session=session, color='#111',
         )
         TeamMembership.objects.create(
             team=team, user=self.user.profile, is_active=True,
@@ -571,8 +570,8 @@ class CurrentSessionAutoResolveTest(TestCase):
         game_b = _make_game(name='B', slug='b')
         s_a = self._session(game_a)
         s_b = self._session(game_b)
-        self._join(s_a, code='A1')
-        self._join(s_b, code='B1')
+        self._join(s_a, name='a1')
+        self._join(s_b, name='b1')
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 409)
         body = resp.json()
@@ -590,7 +589,7 @@ class CurrentSessionAutoResolveTest(TestCase):
         # Meanwhile, user is a member of exactly one real session.
         live_game = _make_game(name='Live', slug='live-auto')
         live = self._session(live_game)
-        self._join(live, code='L1')
+        self._join(live, name='l1')
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['id'], live.id)
@@ -600,13 +599,13 @@ class CurrentSessionAutoResolveTest(TestCase):
         # Inactive session on one game…
         old_game = _make_game(name='Old', slug='old-g')
         old_session = self._session(old_game, slug='old', active=False)
-        self._join(old_session, code='OLD')
+        self._join(old_session, name='old')
         self.user.profile.current_session = old_session
         self.user.profile.save(update_fields=['current_session'])
         # …and an active membership on a different game's session.
         live_game = _make_game(name='Live', slug='live-g')
         new_session = self._session(live_game, slug='new')
-        self._join(new_session, code='NEW')
+        self._join(new_session, name='new')
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(resp.json()['id'], new_session.id)
@@ -654,7 +653,7 @@ class SessionHistoryTest(TestCase):
             is_active=False,
         )
         self.team = Team.objects.create(
-            name='alpha', session=self.session, code='ALPHA', color='#111',
+            name='alpha', session=self.session, color='#111',
         )
         self.team.score = 42
         self.team.save()
@@ -893,7 +892,7 @@ class InviteAPITest(TestCase):
             is_active=True,
         )
         second_team = Team.objects.create(
-            name='rival', session=second_session, code='RIVAL', color='#888',
+            name='rival', session=second_session, color='#888',
         )
         existing = User.objects.create_user(
             username='double', email='d@x.com', password='password123',

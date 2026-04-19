@@ -42,7 +42,7 @@ class AdminTeamSerializer(serializers.ModelSerializer):
         model = Team
         fields = (
             'id', 'name', 'session', 'game',
-            'code', 'group', 'color', 'description',
+            'group', 'color', 'description',
         )
 
 

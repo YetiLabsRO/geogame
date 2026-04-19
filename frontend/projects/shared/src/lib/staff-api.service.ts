@@ -47,7 +47,6 @@ export interface AdminTeam {
   id: number;
   name: string;
   game: number;
-  code: string;
   group: number | null;
   color: string;
   description: string | null;

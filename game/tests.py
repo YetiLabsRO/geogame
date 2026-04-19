@@ -134,10 +134,9 @@ def _default_session(game):
     return session
 
 
-def _make_team(game, group, name="explo1", code="EXPLO1", color="#003366"):
+def _make_team(game, group, name="explo1", color="#003366"):
     return Team.objects.create(
         name=name,
-        code=code,
         color=color,
         session=_default_session(game),
         group=group,
@@ -238,8 +237,8 @@ class TowerCaptureTest(TestCase):
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=25)
-        self.t1 = _make_team(self.game, self.group, code="A")
-        self.t2 = _make_team(self.game, self.group, name="t2", code="B")
+        self.t1 = _make_team(self.game, self.group)
+        self.t2 = _make_team(self.game, self.group, name="t2")
 
     def test_capture_awards_initial_bonus(self):
         self.tower.assign_to_team(self.t1)
@@ -298,8 +297,8 @@ class ZoneRecalculationTest(TestCase):
         self.game = _make_game()
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
-        self.t1 = _make_team(self.game, self.group, name="t1", code="A")
-        self.t2 = _make_team(self.game, self.group, name="t2", code="B")
+        self.t1 = _make_team(self.game, self.group, name="t1")
+        self.t2 = _make_team(self.game, self.group, name="t2")
 
     def test_single_tower_zone_goes_to_capturer(self):
         tower = _make_tower(self.game, zone=self.zone)
@@ -334,8 +333,8 @@ class ZoneRecalculationTest(TestCase):
 
     def test_different_group_isolation(self):
         other_group = _make_group(self.game, name="Other", slug="other")
-        t1_explo = _make_team(self.game, self.group, name="e1", code="X1")
-        _make_team(self.game, other_group, name="o1", code="X2")
+        t1_explo = _make_team(self.game, self.group, name="e1")
+        _make_team(self.game, other_group, name="o1")
 
         tower = _make_tower(self.game, zone=self.zone)
         tower.assign_to_team(t1_explo)
@@ -373,7 +372,7 @@ class ProximityTest(TestCase):
         self.tower = _make_tower(
             self.game, zone=self.zone, lng=23.5, lat=46.5,
         )
-        self.team = _make_team(self.game, self.group, code="T1")
+        self.team = _make_team(self.game, self.group)
         self.challenge = Challenge.objects.create(
             text="c", tower=self.tower, difficulty=1,
         )
@@ -458,8 +457,8 @@ class CooloffTest(TestCase):
         self.other_tower = _make_tower(
             self.game, zone=self.zone, name="other",
         )
-        self.t1 = _make_team(self.game, self.group, code="A")
-        self.t2 = _make_team(self.game, self.group, name="t2", code="B")
+        self.t1 = _make_team(self.game, self.group)
+        self.t2 = _make_team(self.game, self.group, name="t2")
         self.challenge = Challenge.objects.create(
             text="c", tower=self.tower, difficulty=1,
         )
@@ -512,8 +511,8 @@ class ChallengeProgressionTest(TestCase):
         self.tower2 = _make_tower(
             self.game, zone=self.zone, name="t2", lng=23.6,
         )
-        self.t1 = _make_team(self.game, self.group, name="t1", code="A")
-        self.t2 = _make_team(self.game, self.group, name="t2", code="B")
+        self.t1 = _make_team(self.game, self.group, name="t1")
+        self.t2 = _make_team(self.game, self.group, name="t2")
 
         self.c1 = Challenge.objects.create(
             text="c1", tower=self.tower1, difficulty=1,
@@ -571,7 +570,7 @@ class NextChallengeEdgeCasesTest(TestCase):
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone)
-        self.team = _make_team(self.game, self.group, code="A")
+        self.team = _make_team(self.game, self.group)
 
     def test_tower_specific_first(self):
         _ = Challenge.objects.create(text="g1", difficulty=1)
@@ -600,7 +599,7 @@ class NextChallengeEdgeCasesTest(TestCase):
         c2 = Challenge.objects.create(
             text="c2", tower=self.tower, difficulty=2,
         )
-        other = _make_team(self.game, self.group, name="o", code="B")
+        other = _make_team(self.game, self.group, name="o")
         TeamTowerChallenge.objects.create(
             team=self.team, tower=self.tower, challenge=c1,
             outcome=TeamTowerChallenge.CONFIRMED,
@@ -623,7 +622,7 @@ class RFIDCaptureTest(TestCase):
             self.game, zone=self.zone, category=Tower.CATEGORY_RFID,
             rfid_code="ABC123", initial_bonus=10,
         )
-        self.team = _make_team(self.game, self.group, code="A")
+        self.team = _make_team(self.game, self.group)
 
     def test_rfid_api_auto_confirms_and_assigns(self):
         client, user = _authed_client(self.team)
@@ -687,7 +686,7 @@ class APIEndpointsTest(TestCase):
             self.game, zone=self.zone, name="rfid",
             category=Tower.CATEGORY_RFID, rfid_code="X1",
         )
-        self.team = _make_team(self.game, self.group, code="E1")
+        self.team = _make_team(self.game, self.group)
         self.challenge = Challenge.objects.create(
             text="c", tower=self.tower, game=self.game, difficulty=1,
         )
@@ -783,7 +782,7 @@ class UnassignAllTest(TestCase):
         self.tower2 = _make_tower(
             self.game, zone=self.zone, name="t2", lng=23.6,
         )
-        self.t1 = _make_team(self.game, self.group, code="A")
+        self.t1 = _make_team(self.game, self.group)
         self.tower1.assign_to_team(self.t1)
         self.tower2.assign_to_team(self.t1)
 
@@ -860,7 +859,7 @@ class AdminCallableTest(TestCase):
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone)
-        self.team = _make_team(self.game, self.group, code="A")
+        self.team = _make_team(self.game, self.group)
         self.challenge = Challenge.objects.create(
             text="short", tower=self.tower, difficulty=1,
         )
@@ -1000,7 +999,7 @@ class AdminSessionsEndpointTest(TestCase):
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone)
-        self.team = _make_team(self.game, self.group, code='T1')
+        self.team = _make_team(self.game, self.group)
         self.session = self.team.session  # auto-created default session
         # Default sessions inherit game.is_active (False) — bump it so
         # the deactivation tests have something to deactivate.
@@ -1088,7 +1087,7 @@ class AdminSessionsEndpointTest(TestCase):
             is_active=True,
         )
         other_team = Team.objects.create(
-            name='other', session=other_session, code='OTH', color='#f00',
+            name='other', session=other_session, color='#f00',
         )
         # Give both teams an active tower ownership.
         self.tower.assign_to_team(self.team)
@@ -1142,7 +1141,7 @@ class PerGameConfigTest(TestCase):
         self.tower = _make_tower(
             self.game, zone=self.zone, lng=23.5, lat=46.5,
         )
-        self.team = _make_team(self.game, self.group, code='T1')
+        self.team = _make_team(self.game, self.group)
         self.challenge = Challenge.objects.create(
             text='c', tower=self.tower, game=self.game, difficulty=1,
         )
@@ -1235,7 +1234,7 @@ class ScopingIsolationTest(TestCase):
             text='ca', tower=self.tower_a, game=self.game_a, difficulty=1,
         )
         self.team_a = _make_team(
-            self.game_a, self.group_a, name='ta', code='TA1',
+            self.game_a, self.group_a, name='ta',
         )
 
         # Game B + its own session, zone, tower, team
@@ -1250,7 +1249,7 @@ class ScopingIsolationTest(TestCase):
             text='cb', tower=self.tower_b, game=self.game_b, difficulty=1,
         )
         self.team_b = _make_team(
-            self.game_b, self.group_b, name='tb', code='TB1',
+            self.game_b, self.group_b, name='tb',
         )
 
         # Two clients, one per session.
@@ -1276,10 +1275,10 @@ class ScopingIsolationTest(TestCase):
         resp_a = self.client_a.get('/api/teams/')
         resp_b = self.client_b.get('/api/teams/')
         self.assertEqual(
-            [t['code'] for t in resp_a.json()], [self.team_a.code],
+            [t['id'] for t in resp_a.json()], [self.team_a.id],
         )
         self.assertEqual(
-            [t['code'] for t in resp_b.json()], [self.team_b.code],
+            [t['id'] for t in resp_b.json()], [self.team_b.id],
         )
 
     def test_user_with_no_current_session_sees_nothing(self):
@@ -1321,12 +1320,10 @@ class ScopingTwoSessionsOneGameTest(TestCase):
             is_active=True,
         )
         self.team_a = Team.objects.create(
-            name='team-a', session=self.session_a,
-            code='TA', color='#111', group=self.group,
+            name='team-a', session=self.session_a, color='#111', group=self.group,
         )
         self.team_b = Team.objects.create(
-            name='team-b', session=self.session_b,
-            code='TB', color='#222', group=self.group,
+            name='team-b', session=self.session_b, color='#222', group=self.group,
         )
         self.client_a, _ = _authed_client(self.team_a, username='pa')
         self.client_b, _ = _authed_client(self.team_b, username='pb')
@@ -1339,10 +1336,10 @@ class ScopingTwoSessionsOneGameTest(TestCase):
         self.assertEqual(ids_b, {self.tower.id})
 
     def test_teams_isolated_between_sessions_of_same_game(self):
-        codes_a = {t['code'] for t in self.client_a.get('/api/teams/').json()}
-        codes_b = {t['code'] for t in self.client_b.get('/api/teams/').json()}
-        self.assertEqual(codes_a, {self.team_a.code})
-        self.assertEqual(codes_b, {self.team_b.code})
+        ids_a = {t['id'] for t in self.client_a.get('/api/teams/').json()}
+        ids_b = {t['id'] for t in self.client_b.get('/api/teams/').json()}
+        self.assertEqual(ids_a, {self.team_a.id})
+        self.assertEqual(ids_b, {self.team_b.id})
 
 
 # ---------------------------------------------------------------------------
@@ -1408,7 +1405,7 @@ class StaffAdminEndpointsTest(TestCase):
         self.group = _make_group(self.game)
         self.zone = _make_zone(self.game, name='Z1')
         self.tower = _make_tower(self.game, name='T1', zone=self.zone)
-        self.team = _make_team(self.game, self.group, code='T1CODE')
+        self.team = _make_team(self.game, self.group)
         self.staff_client, self.staff = _staff_client(
             session=self.team.session, username='admin',
         )

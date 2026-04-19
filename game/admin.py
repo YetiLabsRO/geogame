@@ -72,7 +72,7 @@ class TowerAdmin(LeafletGeoAdmin):
 class TeamAdmin(admin.ModelAdmin):
     list_display = ['__str__', 'group', 'score', 'floating_score', 'description']
     list_filter = ['group', 'session', 'session__game']
-    search_fields = ['name', 'code']
+    search_fields = ['name']
     readonly_fields = ["score", ]
 
 

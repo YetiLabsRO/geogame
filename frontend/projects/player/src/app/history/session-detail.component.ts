@@ -57,9 +57,6 @@ import { extractErrorMessage } from '../auth/form-error';
                         [style.background-color]="e.team_color"
                       ></span>
                       <span class="fw-semibold">{{ e.team_name }}</span>
-                      <span class="text-body-secondary small ms-2">
-                        {{ e.team_code }}
-                      </span>
                     </td>
                     <td class="text-end fw-semibold">{{ e.current_score }}</td>
                   </tr>

@@ -95,7 +95,6 @@ const UNGROUPED_SLUG = '__ungrouped__';
                       [style.background-color]="t.color"
                     ></span>
                     <span class="fw-semibold">{{ t.name }}</span>
-                    <span class="text-body-secondary small ms-2">{{ t.code }}</span>
                   </td>
                   <td class="text-end fw-semibold">{{ t.current_score }}</td>
                 </tr>

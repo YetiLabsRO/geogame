@@ -74,7 +74,6 @@ class Command(BaseCommand):
         team = Team.objects.create(
             name=f'{MARKER} team alpha',
             session=session,
-            code=f'{MARKER[:4].upper()}A1',
             group=group,
             color='#ff3366',
         )

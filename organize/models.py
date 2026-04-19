@@ -107,9 +107,6 @@ class Team(models.Model):
     session = models.ForeignKey(
         Session, on_delete=models.CASCADE, related_name='teams',
     )
-    # `code` is globally unique through Phase 3; T3.4 may move it to
-    # unique-per-session once the team-onboarding flow is revisited.
-    code = models.CharField(max_length=8, unique=True)
     # ChainedForeignKey dropped in T3.2 — with Team.game removed, a
     # single-hop chain from Team to TeamGroup would have to traverse
     # session.game, which smart_selects cannot express.
