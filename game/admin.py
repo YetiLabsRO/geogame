@@ -5,7 +5,15 @@ from django.contrib import admin, messages
 from django.utils.safestring import mark_safe
 from leaflet.admin import LeafletGeoAdmin
 
-from game.models import Challenge, TeamTowerChallenge, TeamTowerOwnership, Tower, Zone
+from game.models import (
+    Challenge,
+    PauseWindow,
+    TeamTowerChallenge,
+    TeamTowerFailCounter,
+    TeamTowerOwnership,
+    Tower,
+    Zone,
+)
 from organize.models import Team, TeamGroup
 
 
@@ -111,9 +119,24 @@ class TeamTowerChallangeAdmin(admin.ModelAdmin):
 class TeamTowerOwnershipAdmin(admin.ModelAdmin):
     pass
 
+
+class PauseWindowAdmin(admin.ModelAdmin):
+    list_display = ('session', 'started_at', 'ended_at', 'restore_on_resume')
+    list_filter = ('session', 'restore_on_resume')
+    readonly_fields = ('tower_ownerships', 'zone_ownerships')
+
+
+class TeamTowerFailCounterAdmin(admin.ModelAdmin):
+    list_display = ('team', 'tower', 'consecutive_fails', 'last_failed_at', 'locked_until')
+    list_filter = ('tower',)
+    search_fields = ('team__name', 'tower__name')
+
+
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
 admin.site.register(Team, TeamAdmin)
 admin.site.register(Challenge, ChallengeAdmin)
 admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)
 admin.site.register(TeamTowerOwnership, TeamTowerOwnershipAdmin)
+admin.site.register(PauseWindow, PauseWindowAdmin)
+admin.site.register(TeamTowerFailCounter, TeamTowerFailCounterAdmin)

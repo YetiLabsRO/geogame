@@ -7,6 +7,29 @@ from django.db import models
 from django.db.models import ManyToManyField
 from django.utils import timezone
 
+# Consecutive-fail counter reset policies (Phase 10, §21.1).
+FAIL_RESET_TOWER_SUCCESS_ONLY = 'TOWER_SUCCESS_ONLY'
+FAIL_RESET_ANY_SUCCESS_ELSEWHERE = 'ANY_SUCCESS_ELSEWHERE'
+FAIL_RESET_ANY_ATTEMPT_ELSEWHERE = 'ANY_ATTEMPT_ELSEWHERE'
+FAIL_RESET_CHOICES = [
+    (FAIL_RESET_TOWER_SUCCESS_ONLY, 'Reset only on a confirmed submission at the same tower'),
+    (FAIL_RESET_ANY_SUCCESS_ELSEWHERE, 'Also reset on a confirmed submission at any other tower'),
+    (FAIL_RESET_ANY_ATTEMPT_ELSEWHERE, 'Also reset on any submission at any other tower'),
+]
+
+# Config fields that live on Game as defaults and are overridable per
+# Session. `Session.effective(field)` resolves override-or-default.
+OVERRIDABLE_CONFIG_FIELDS = (
+    'pause_freezes_floating_score',
+    'pause_restores_ownerships_on_resume',
+    'pause_rejects_submissions',
+    'fail_point_penalty',
+    'fail_cooloff_scaling',
+    'fail_tower_lockout_minutes',
+    'fail_difficulty_rollback',
+    'fail_counter_reset',
+)
+
 
 class Game(models.Model):
     """Reusable event configuration — map, rules, challenge bank.
@@ -28,6 +51,24 @@ class Game(models.Model):
     proximity_meters = models.PositiveSmallIntegerField(default=50)
     cooloff_minutes = models.PositiveSmallIntegerField(default=5)
     initial_bonus_default = models.PositiveIntegerField(default=0)
+
+    # --- Phase 10: day-pausing knobs. Defaults preserve prior behavior;
+    # overridable per Session (see Session.effective). ---
+    pause_freezes_floating_score = models.BooleanField(default=True)
+    pause_restores_ownerships_on_resume = models.BooleanField(default=True)
+    pause_rejects_submissions = models.BooleanField(default=True)
+
+    # --- Phase 10: challenge-failure knobs. All default to "off" so a
+    # rejected submission keeps behaving as a plain cooloff. ---
+    fail_point_penalty = models.PositiveIntegerField(default=0)
+    fail_cooloff_scaling = models.FloatField(default=1.0)
+    fail_tower_lockout_minutes = models.PositiveIntegerField(default=0)
+    fail_difficulty_rollback = models.BooleanField(default=False)
+    fail_counter_reset = models.CharField(
+        max_length=32,
+        choices=FAIL_RESET_CHOICES,
+        default=FAIL_RESET_TOWER_SUCCESS_ONLY,
+    )
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -95,11 +136,33 @@ class Session(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True, null=True)
 
+    # --- Phase 10: per-session overrides. NULL means "inherit the Game
+    # default"; resolve with Session.effective(field). ---
+    pause_freezes_floating_score = models.BooleanField(null=True, blank=True)
+    pause_restores_ownerships_on_resume = models.BooleanField(null=True, blank=True)
+    pause_rejects_submissions = models.BooleanField(null=True, blank=True)
+    fail_point_penalty = models.PositiveIntegerField(null=True, blank=True)
+    fail_cooloff_scaling = models.FloatField(null=True, blank=True)
+    fail_tower_lockout_minutes = models.PositiveIntegerField(null=True, blank=True)
+    fail_difficulty_rollback = models.BooleanField(null=True, blank=True)
+    fail_counter_reset = models.CharField(
+        max_length=32, choices=FAIL_RESET_CHOICES, null=True, blank=True,
+    )
+
     class Meta:
         unique_together = (('game', 'slug'),)
 
     def __str__(self):
         return f'{self.game.slug}/{self.slug}'
+
+    def effective(self, field):
+        """Resolve an overridable config field: session override, else game default."""
+        if field not in OVERRIDABLE_CONFIG_FIELDS:
+            raise ValueError(f'{field!r} is not an overridable config field')
+        value = getattr(self, field)
+        if value is None:
+            return getattr(self.game, field)
+        return value
 
 
 class Team(models.Model):

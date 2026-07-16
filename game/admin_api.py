@@ -9,6 +9,7 @@ from rest_framework.views import APIView
 
 from game.models import (
     Challenge,
+    PauseWindow,
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
@@ -179,6 +180,14 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'base_point', 'base_lat', 'base_lng',
             'base_zoom_level', 'is_active',
             'proximity_meters', 'cooloff_minutes', 'initial_bonus_default',
+            # Phase 10 day-pausing knobs.
+            'pause_freezes_floating_score',
+            'pause_restores_ownerships_on_resume',
+            'pause_rejects_submissions',
+            # Phase 10 failure-consequence knobs.
+            'fail_point_penalty', 'fail_cooloff_scaling',
+            'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
+            'fail_counter_reset',
             'created_at',
         )
         read_only_fields = ('created_at',)
@@ -220,19 +229,41 @@ class AdminGameViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
+    @action(detail=True, methods=['post'])
+    def pause_all(self, request, pk=None):
+        """Pause every active Session of this Game in one call (§20.1)."""
+        game = self.get_object()
+        paused = []
+        for session in game.sessions.filter(is_active=True):
+            if PauseWindow.pause_session(session) is not None:
+                paused.append(session.id)
+        return Response({'paused_sessions': paused}, status=status.HTTP_200_OK)
+
 
 class AdminSessionSerializer(serializers.ModelSerializer):
     game_slug = serializers.CharField(source='game.slug', read_only=True)
     game_name = serializers.CharField(source='game.name', read_only=True)
+    is_paused = serializers.SerializerMethodField()
 
     class Meta:
         model = Session
         fields = (
             'id', 'game', 'game_slug', 'game_name',
             'slug', 'name', 'start_time', 'end_time', 'is_active',
+            'is_paused',
+            # Phase 10 per-session overrides (null = inherit Game default).
+            'pause_freezes_floating_score',
+            'pause_restores_ownerships_on_resume',
+            'pause_rejects_submissions',
+            'fail_point_penalty', 'fail_cooloff_scaling',
+            'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
+            'fail_counter_reset',
             'created_at',
         )
-        read_only_fields = ('created_at', 'game_slug', 'game_name')
+        read_only_fields = ('created_at', 'game_slug', 'game_name', 'is_paused')
+
+    def get_is_paused(self, session):
+        return PauseWindow.is_paused(session)
 
 
 class AdminSessionViewSet(viewsets.ModelViewSet):
@@ -266,6 +297,30 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['post'])
+    def pause(self, request, pk=None):
+        """Open a PauseWindow on this Session (§20.1)."""
+        session = self.get_object()
+        window = PauseWindow.pause_session(session)
+        if window is None:
+            return Response(
+                {'detail': 'Session is already paused.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'])
+    def resume(self, request, pk=None):
+        """Close the open PauseWindow, restoring ownerships if configured."""
+        session = self.get_object()
+        window = PauseWindow.resume_session(session)
+        if window is None:
+            return Response(
+                {'detail': 'Session is not paused.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
 
     @transaction.atomic
     def perform_update(self, serializer):

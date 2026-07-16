@@ -35,13 +35,15 @@ from rest_framework.test import APIClient
 from game.admin import unassign_all
 from game.models import (
     Challenge,
+    PauseWindow,
     TeamTowerChallenge,
+    TeamTowerFailCounter,
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
     Zone,
 )
-from organize.models import Game, Team, TeamGroup, TeamMembership
+from organize.models import Game, Session, Team, TeamGroup, TeamMembership
 
 User = get_user_model()
 
@@ -1778,3 +1780,306 @@ class HealthTest(TestCase):
             resp = self.client.get("/health/")
         self.assertEqual(resp.status_code, 503)
         self.assertEqual(resp.json()["status"], "error")
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Day cut-off pausing (task 4.2)
+# ---------------------------------------------------------------------------
+
+
+class DayPausingTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)  # LINEAR scoring
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.session.is_active = True
+        self.session.save()
+
+    def _open_tower_ownership(self, team=None, tower=None):
+        return TeamTowerOwnership.objects.create(
+            team=team or self.team, tower=tower or self.tower,
+        )
+
+    def _open_zone_ownership(self, team=None, zone=None, age_seconds=0):
+        zo = TeamZoneOwnership.objects.create(team=team or self.team, zone=zone or self.zone)
+        if age_seconds:
+            TeamZoneOwnership.objects.filter(pk=zo.pk).update(
+                timestamp_start=timezone.now() - timedelta(seconds=age_seconds),
+            )
+        return zo
+
+    def test_pause_closes_ownerships_and_opens_window(self):
+        self._open_tower_ownership()
+        self._open_zone_ownership()
+        window = PauseWindow.pause_session(self.session)
+        self.assertIsNotNone(window)
+        self.assertIsNone(window.ended_at)
+        self.assertTrue(PauseWindow.is_paused(self.session))
+        self.assertFalse(TeamTowerOwnership.objects.filter(
+            team=self.team, timestamp_end__isnull=True).exists())
+        self.assertFalse(TeamZoneOwnership.objects.filter(
+            team=self.team, timestamp_end__isnull=True).exists())
+        # A second pause on an already-paused session is a no-op.
+        self.assertIsNone(PauseWindow.pause_session(self.session))
+
+    def test_pause_resume_round_trip_restores_ownerships(self):
+        self._open_tower_ownership()
+        self._open_zone_ownership()
+        PauseWindow.pause_session(self.session)
+        PauseWindow.resume_session(self.session)
+        self.assertFalse(PauseWindow.is_paused(self.session))
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            team=self.team, tower=self.tower, timestamp_end__isnull=True).exists())
+        self.assertTrue(TeamZoneOwnership.objects.filter(
+            team=self.team, zone=self.zone, timestamp_end__isnull=True).exists())
+
+    def test_resume_without_restore_does_not_reopen(self):
+        self.session.pause_restores_ownerships_on_resume = False
+        self.session.save()
+        self._open_tower_ownership()
+        self._open_zone_ownership()
+        window = PauseWindow.pause_session(self.session)
+        self.assertEqual(window.tower_ownerships, [])
+        PauseWindow.resume_session(self.session)
+        self.assertFalse(TeamTowerOwnership.objects.filter(
+            team=self.team, timestamp_end__isnull=True).exists())
+        self.assertFalse(TeamZoneOwnership.objects.filter(
+            team=self.team, timestamp_end__isnull=True).exists())
+
+    def test_frozen_floating_score_stays_stable_during_pause(self):
+        self._open_zone_ownership(age_seconds=120)  # ~2 LINEAR points
+        team = Team.objects.get(pk=self.team.pk)
+        self.assertGreater(team.floating_score(), 0)
+        PauseWindow.pause_session(self.session)  # freeze default True
+        team = Team.objects.get(pk=self.team.pk)
+        self.assertEqual(team.floating_score(), 0)  # nothing open while paused
+        self.assertGreaterEqual(team.score, 2)  # floating locked into score
+        self.assertEqual(team.current_score(), team.current_score())  # stable
+
+    def test_not_freezing_does_not_credit_floating(self):
+        self.session.pause_freezes_floating_score = False
+        self.session.save()
+        self._open_zone_ownership(age_seconds=120)
+        PauseWindow.pause_session(self.session)
+        team = Team.objects.get(pk=self.team.pk)
+        self.assertEqual(team.score, 0)  # in-progress floating not credited
+        self.assertEqual(team.floating_score(), 0)
+
+    def test_pause_and_resume_endpoints(self):
+        client, _ = _staff_client(session=self.session)
+        r = client.post(f'/api/staff/sessions/{self.session.id}/pause/')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertTrue(r.json()['is_paused'])
+        self.assertEqual(
+            client.post(f'/api/staff/sessions/{self.session.id}/pause/').status_code,
+            409,
+        )
+        r3 = client.post(f'/api/staff/sessions/{self.session.id}/resume/')
+        self.assertEqual(r3.status_code, 200)
+        self.assertFalse(r3.json()['is_paused'])
+        self.assertEqual(
+            client.post(f'/api/staff/sessions/{self.session.id}/resume/').status_code,
+            409,
+        )
+
+    def test_pause_all_pauses_every_active_session(self):
+        now = timezone.now()
+        s2 = Session.objects.create(
+            game=self.game, slug='s2', name='S2',
+            start_time=now, end_time=now + timedelta(hours=1), is_active=True,
+        )
+        Team.objects.create(name='t-s2', color='#111111', session=s2, group=self.group)
+        client, _ = _staff_client(session=self.session)
+        r = client.post(f'/api/staff/games/{self.game.id}/pause_all/')
+        self.assertEqual(r.status_code, 200, r.content)
+        self.assertCountEqual(r.json()['paused_sessions'], [self.session.id, s2.id])
+        self.assertTrue(PauseWindow.is_paused(self.session))
+        self.assertTrue(PauseWindow.is_paused(s2))
+
+    def test_submission_returns_409_when_paused_and_rejecting(self):
+        PauseWindow.pause_session(self.session)  # pause_rejects default True
+        client, _ = _authed_client(self.team)
+        r = client.post(
+            '/api/team_tower_challenges/',
+            {'tower': self.tower.id, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(r.status_code, 409, r.content)
+        self.assertFalse(TeamTowerChallenge.objects.filter(
+            team=self.team, tower=self.tower).exists())
+
+    def test_rfid_submission_held_pending_when_not_rejecting(self):
+        self.session.pause_rejects_submissions = False
+        self.session.save()
+        rfid = _make_tower(
+            self.game, zone=self.zone, name='rf',
+            category=Tower.CATEGORY_RFID, rfid_code='PZ1',
+        )
+        PauseWindow.pause_session(self.session)
+        client, _ = _authed_client(self.team)
+        r = client.post(
+            '/api/team_tower_challenges/',
+            {'rfid_code': 'PZ1', 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(r.status_code, 201, r.content)
+        ttc = TeamTowerChallenge.objects.get(team=self.team, tower=rfid)
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)  # held, not confirmed
+        self.assertFalse(TeamTowerOwnership.objects.filter(
+            tower=rfid, team=self.team, timestamp_end__isnull=True).exists())
+
+    def test_per_session_override_beats_game_default(self):
+        self.assertTrue(self.session.effective('pause_rejects_submissions'))
+        self.session.pause_rejects_submissions = False
+        self.session.save()
+        self.assertFalse(self.session.effective('pause_rejects_submissions'))
+
+
+# ---------------------------------------------------------------------------
+# Phase 10 — Challenge-failure consequences (task 7.2)
+# ---------------------------------------------------------------------------
+
+
+class FailureConsequencesTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, name='A')
+        self.tower_b = _make_tower(self.game, zone=self.zone, name='B')
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.session.is_active = True
+        self.session.save()
+        self.challenge = Challenge.objects.create(
+            text='c', tower=self.tower, difficulty=1, game=self.game,
+        )
+
+    def _reject(self, team=None, tower=None):
+        """Drive a PENDING -> REJECTED transition (fires failure consequences)."""
+        ttc = TeamTowerChallenge.objects.create(
+            team=team or self.team, tower=tower or self.tower,
+            challenge=self.challenge, outcome=TeamTowerChallenge.PENDING,
+        )
+        ttc.outcome = TeamTowerChallenge.REJECTED
+        ttc.save()
+        return ttc
+
+    def test_reject_subtracts_points_clamped_to_zero(self):
+        self.game.fail_point_penalty = 10
+        self.game.save()
+        Team.objects.filter(pk=self.team.pk).update(score=25)
+        self._reject()
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 15)
+        self._reject()
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 5)
+        self._reject()  # 5 - 10 clamps to 0, not negative
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 0)
+        self.assertEqual(
+            TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower).consecutive_fails, 3)
+
+    def test_cooloff_scales_with_consecutive_fails(self):
+        self.game.fail_cooloff_scaling = 2.0
+        self.game.cooloff_minutes = 5  # 300s base
+        self.game.save()
+        ttc = self._reject()  # consecutive_fails -> 1, scaled cooloff = 300*2 = 600s
+        TeamTowerChallenge.objects.filter(pk=ttc.pk).update(
+            timestamp_verified=timezone.now() - timedelta(seconds=400),
+        )
+        team = Team.objects.get(pk=self.team.pk)
+        # 400s elapsed is past the 300s base but inside the 600s scaled cooloff.
+        self.assertTrue(self.tower.team_in_cooloff(team))
+
+    def test_cooloff_base_preserved_by_default_scaling(self):
+        ttc = self._reject()  # default scaling 1.0
+        TeamTowerChallenge.objects.filter(pk=ttc.pk).update(
+            timestamp_verified=timezone.now() - timedelta(seconds=400),
+        )
+        team = Team.objects.get(pk=self.team.pk)
+        self.assertFalse(self.tower.team_in_cooloff(team))  # 400s > 300s base
+
+    def test_tower_lockout_blocks_submission(self):
+        self.game.fail_tower_lockout_minutes = 10
+        self.game.save()
+        before = timezone.now()
+        self._reject()
+        counter = TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower)
+        self.assertIsNotNone(counter.locked_until)
+        delta = (counter.locked_until - before).total_seconds()
+        self.assertTrue(590 <= delta <= 610)  # locked ~10 minutes
+        client, _ = _authed_client(self.team)
+        r = client.post(
+            '/api/team_tower_challenges/',
+            {'tower': self.tower.id, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(r.status_code, 409, r.content)
+        # Once the lockout expires the block lifts.
+        TeamTowerFailCounter.objects.filter(pk=counter.pk).update(
+            locked_until=timezone.now() - timedelta(seconds=1),
+        )
+        counter.refresh_from_db()
+        self.assertFalse(counter.is_locked())
+
+    def test_difficulty_rollback_picks_lower_bucket(self):
+        self.game.fail_difficulty_rollback = True
+        self.game.save()
+        c2 = Challenge.objects.create(text='d2', tower=self.tower, difficulty=2, game=self.game)
+        Challenge.objects.create(text='d3', tower=self.tower, difficulty=3, game=self.game)
+        # Team already conquered difficulty 2 on this tower.
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower, challenge=c2,
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+        # No failures yet: next challenge is the difficulty-3 bucket.
+        self.assertEqual(self.tower.get_next_challenge(self.team).difficulty, 3)
+        # After a failure, rollback drops to the next-lower difficulty bucket.
+        self._reject()
+        self.assertEqual(self.tower.get_next_challenge(self.team).difficulty, 1)
+
+    def test_reset_tower_success_only(self):
+        self.game.fail_counter_reset = 'TOWER_SUCCESS_ONLY'
+        self.game.save()
+        self._reject(tower=self.tower)
+        # A success elsewhere does NOT reset tower A's counter.
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower_b, outcome=TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(
+            TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower).consecutive_fails, 1)
+        # A success on tower A resets it.
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower, outcome=TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(
+            TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower).consecutive_fails, 0)
+
+    def test_reset_any_success_elsewhere(self):
+        self.game.fail_counter_reset = 'ANY_SUCCESS_ELSEWHERE'
+        self.game.save()
+        self._reject(tower=self.tower)
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower_b, outcome=TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(
+            TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower).consecutive_fails, 0)
+
+    def test_reset_any_attempt_elsewhere(self):
+        self.game.fail_counter_reset = 'ANY_ATTEMPT_ELSEWHERE'
+        self.game.save()
+        self._reject(tower=self.tower)
+        # A mere pending submission on another tower resets the counter.
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower_b, outcome=TeamTowerChallenge.PENDING)
+        self.assertEqual(
+            TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower).consecutive_fails, 0)
+
+    def test_no_cross_team_side_effects(self):
+        self.game.fail_point_penalty = 10
+        self.game.fail_tower_lockout_minutes = 10
+        self.game.save()
+        team2 = _make_team(self.game, self.group, name='team2')
+        Team.objects.filter(pk=team2.pk).update(score=50)
+        self._reject(team=self.team, tower=self.tower)
+        self.assertEqual(Team.objects.get(pk=team2.pk).score, 50)  # untouched
+        self.assertFalse(TeamTowerFailCounter.objects.filter(team=team2).exists())

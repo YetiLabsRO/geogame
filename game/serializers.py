@@ -1,9 +1,29 @@
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 from rest_framework import serializers
+from rest_framework.exceptions import APIException
 
-from game.models import Challenge, TeamTowerChallenge, Tower, Zone
+from game.models import (
+    Challenge,
+    PauseWindow,
+    TeamTowerChallenge,
+    TeamTowerFailCounter,
+    Tower,
+    Zone,
+)
 from organize.models import Team
+
+
+class SessionPausedError(APIException):
+    status_code = 409
+    default_detail = 'Sesiunea este în pauză; trimiterile sunt oprite.'
+    default_code = 'session_paused'
+
+
+class TowerLockedError(APIException):
+    status_code = 409
+    default_detail = 'Turn blocat temporar după eșecuri consecutive.'
+    default_code = 'tower_locked'
 
 
 class ZoneSerializer(serializers.HyperlinkedModelSerializer):
@@ -167,6 +187,21 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
                 "pentru a putea face provocarea!",
             )
 
+        # Phase 10: paused-session gating.
+        session = attrs['_team'].session
+        if PauseWindow.is_paused(session):
+            if session.effective('pause_rejects_submissions'):
+                raise SessionPausedError()
+            # Accept but hold — do not capture until the session resumes.
+            attrs['_paused_hold'] = True
+
+        # Phase 10: explicit failure lockout on this tower.
+        counter = TeamTowerFailCounter.objects.filter(
+            team=attrs['_team'], tower=tower,
+        ).first()
+        if counter and counter.is_locked():
+            raise TowerLockedError()
+
         return attrs
 
     def create(self, validated_data):
@@ -175,7 +210,13 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
         validated_data.pop('rfid_code', None)
         team = validated_data.pop('_team')
         auto_confirm = validated_data.pop('_auto_confirm')
+        paused_hold = validated_data.pop('_paused_hold', False)
         user = self.context['request'].user
+
+        # A held submission (paused session, rejects disabled) is stored
+        # PENDING and never auto-confirms — capture waits for resume.
+        if paused_hold:
+            auto_confirm = False
 
         ttc = TeamTowerChallenge.objects.create(
             team=team,

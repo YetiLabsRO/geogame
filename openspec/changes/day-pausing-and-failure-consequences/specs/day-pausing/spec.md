@@ -58,12 +58,18 @@ The system SHALL let staff pause every active Session of a Game in one call.
 
 ### Requirement: Pause-aware floating score
 
-The system SHALL freeze floating-score accrual across a pause when configured to do so.
+The system SHALL suspend floating-score accrual across a pause when configured to do so.
 
 #### Scenario: Frozen score during a pause
 
-- **WHEN** a `PauseWindow` is open and the effective `pause_freezes_floating_score` is `True`
-- **THEN** `Team.floating_score()` SHALL evaluate as of `window.started_at` rather than `now`, returning identical values for the duration of the window
+- **WHEN** a Session is paused and the effective `pause_freezes_floating_score` is `True`
+- **THEN** each open zone ownership SHALL be closed at `window.started_at` and the floating it earned up to that instant SHALL be locked into `Team.score`
+- **AND** `Team.current_score()` SHALL stay stable for the duration of the window (no accrual while paused), evaluating as of `window.started_at`
+
+#### Scenario: Not freezing
+
+- **WHEN** a Session is paused and the effective `pause_freezes_floating_score` is `False`
+- **THEN** zone ownerships SHALL still be closed at `window.started_at`, but the in-progress floating for the current window SHALL NOT be credited to `Team.score`
 
 ### Requirement: Submissions while paused
 
