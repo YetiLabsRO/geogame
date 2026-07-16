@@ -63,16 +63,16 @@ VS Code launch configurations in `.vscode/launch.json` wrap these same commands 
 ## Frontend (Angular v21)
 
 The Angular workspace lives at `frontend/`:
-- **Projects**: `player` (default, port 4200), `staff` (port 4201), `shared` (library — `AuthService`, `tokenInterceptor`, and reusable components).
+- **Projects**: `player` (default, dev port 4500), `staff` (dev port 4501), `shared` (library — `AuthService`, `tokenInterceptor`, and reusable components).
 - **Styles**: Bootstrap 5 via node_modules, Leaflet CSS, bootstrap-icons. No ng-bootstrap; use plain Bootstrap classes + the bundled JS.
 - **TypeScript path**: `import { AuthService, tokenInterceptor } from 'shared';` — maps to `projects/shared/src/public-api.ts` at build time (see [tsconfig.json](../frontend/tsconfig.json)).
-- **Dev proxy**: [frontend/proxy.conf.json](../frontend/proxy.conf.json) routes `/api/`, `/admin/`, `/media/`, `/static/`, `/health/` to Django on `:8000`. Start Django on 8000 before `npm start`.
+- **Dev proxy**: [frontend/proxy.conf.json](../frontend/proxy.conf.json) routes `/api/`, `/admin/`, `/media/`, `/static/`, `/health/` to Django on `:8200`. Start Django on 8200 before `npm start`. (E2E tests still run against `:8000` / `:4200` / `:4201` — see playwright.config.ts.)
 
 Common commands (run from `frontend/`):
 
 ```bash
-npm start                 # player on :4200 (proxies to Django on :8000)
-npm run start:staff       # staff on :4201
+npm start                 # player on :4500 (proxies to Django on :8200); launch configs use --port 4500/4501
+npm run start:staff       # staff on :4501
 npm run build:all         # build both apps → frontend/dist/{player,staff}
 npx ng generate component some-name --project=player
 ```
@@ -157,20 +157,18 @@ Key models to be aware of (see `geogame/models.py`):
 
 ## Task Tracking & Requirements
 
-This project uses a structured docs system in [/docs](../docs/):
+This project uses [OpenSpec](../openspec/) (schema `spec-driven`) for planning and specs.
 
-- [`docs/requirements.md`](../docs/requirements.md) — SOURCE OF TRUTH for system behavior, organized by functional area with user stories and SHALL-style acceptance criteria.
-- [`docs/plan.md`](../docs/plan.md) — maps requirement sections to plan items (module/feature groups), with priority and linked requirements.
-- [`docs/tasks.md`](../docs/tasks.md) — technical task list, `[x]`/`[ ]` checked, linked to plan items and requirements as `(Plan: X, Req: Y)`.
+- [`openspec/specs/<capability>/spec.md`](../openspec/specs/) — SOURCE OF TRUTH for shipped behavior. One capability per file (e.g. `scoring`, `sessions`, `challenge-submission`); each holds `### Requirement:` blocks with SHALL statements and `#### Scenario:` (WHEN/THEN) cases. List with `openspec spec list`, read with `openspec show <capability>`.
+- [`openspec/changes/<name>/`](../openspec/changes/) — in-flight proposals not yet shipped, each with `proposal.md`, `design.md`, delta `specs/`, and `tasks.md`. The Phase 10 work (day pausing + challenge-failure consequences) lives in `changes/day-pausing-and-failure-consequences/`. List with `openspec list`.
 
-**When adding or modifying features:**
-1. Check [requirements.md](../docs/requirements.md) first. If the feature isn't documented, ADD a new numbered requirement (user story + SHALL acceptance criteria) BEFORE coding.
-2. Add or update a matching plan item in [plan.md](../docs/plan.md) linked to the requirement.
-3. Add task(s) to [tasks.md](../docs/tasks.md) with `(Plan: X, Req: Y)` references.
-4. Mark tasks `[x]` when done.
-5. If behavior changes, update the relevant acceptance criteria in requirements.md at the same time.
+**When adding or modifying features** (use the `/opsx:*` slash commands, backed by the `openspec-*` skills):
+1. `/opsx:propose "<idea>"` (or `openspec new change "<name>"`) to scaffold a change; author `proposal.md`, delta `specs/` (`## ADDED/MODIFIED/REMOVED Requirements`), and `tasks.md`. Do this BEFORE coding.
+2. Implement against the tasks (`/opsx:apply`), checking off `- [ ]` items as you go.
+3. Validate with `openspec validate <name> --strict`.
+4. When shipped, `/opsx:archive` folds the delta specs into `openspec/specs/` (or `/opsx:sync` to update main specs without archiving). Do NOT hand-edit `openspec/specs/` for new behavior.
 
-**Open items** (not yet specified in detail) live at the bottom of [requirements.md](../docs/requirements.md) and as `T10.*` tasks in [tasks.md](../docs/tasks.md). These are blocked on requirements definition — ask the user for the intended behavior before implementing.
+**Open items** not yet specified in detail become new change proposals — ask the user for the intended behavior before implementing.
 
 ## Security
 

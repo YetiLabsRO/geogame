@@ -1,0 +1,28 @@
+schema: spec-driven
+
+context: |
+  Domain: "geogame" — a Django location-aware scouting geogame. Teams capture
+  physical Towers (GPS/RFID) by answering Challenges; controlling a majority of
+  towers in a Zone grants time-based floating points. See CLAUDE.md and
+  .claude/guidelines.md for stack details and workflow.
+
+  Tech stack: Django 5.1 + PostGIS, DRF, Angular v21 SPAs (player + staff).
+  Two Django apps: `game` (Zone, Tower, Challenge, submissions, ownerships) and
+  `organize` (Game, TeamGroup, Team, Session, accounts/invites). Project module
+  is `geogame` (not `cercetador`).
+
+  Model hierarchy: Game (reusable event config) → Session (one live run with a
+  roster) → Team (scoped to a Session). Ownership records hang off Team.
+
+  Conventions: single quotes in Python; ruff-clean; tests under `game/tests.py`
+  with ≥80% coverage; interpreter at ~/.virtualenvs/cercetador/bin/python.
+
+# Per-artifact rules (optional)
+# Add custom rules for specific artifacts.
+# Example:
+#   rules:
+#     proposal:
+#       - Keep proposals under 500 words
+#       - Always include a "Non-goals" section
+#     tasks:
+#       - Break tasks into chunks of max 2 hours
