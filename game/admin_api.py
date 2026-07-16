@@ -10,6 +10,7 @@ from rest_framework.views import APIView
 from game.models import (
     Challenge,
     PauseWindow,
+    TeamTowerFailCounter,
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
@@ -321,6 +322,51 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['get'])
+    def pause_history(self, request, pk=None):
+        """Current pause state + this session's PauseWindow history (§20 UI)."""
+        session = self.get_object()
+        windows = [
+            {
+                'id': w.id,
+                'started_at': w.started_at,
+                'ended_at': w.ended_at,
+                'restore_on_resume': w.restore_on_resume,
+            }
+            for w in session.pause_windows.order_by('-started_at')
+        ]
+        return Response({
+            'is_paused': PauseWindow.is_paused(session),
+            'windows': windows,
+        })
+
+    @action(detail=True, methods=['get'])
+    def fail_counters(self, request, pk=None):
+        """Current lockouts + consecutive-fail counts for the session (§21 UI)."""
+        session = self.get_object()
+        team_ids = list(session.teams.values_list('id', flat=True))
+        now = timezone.now()
+        counters = (
+            TeamTowerFailCounter.objects
+            .filter(team_id__in=team_ids, consecutive_fails__gt=0)
+            .select_related('team', 'tower')
+            .order_by('-consecutive_fails')
+        )
+        data = [
+            {
+                'team_id': c.team_id,
+                'team_name': c.team.name,
+                'team_color': c.team.color,
+                'tower_id': c.tower_id,
+                'tower_name': c.tower.name,
+                'consecutive_fails': c.consecutive_fails,
+                'locked_until': c.locked_until,
+                'is_locked': bool(c.locked_until and c.locked_until > now),
+            }
+            for c in counters
+        ]
+        return Response(data)
 
     @transaction.atomic
     def perform_update(self, serializer):

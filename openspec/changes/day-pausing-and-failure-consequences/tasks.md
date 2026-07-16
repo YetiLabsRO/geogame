@@ -16,7 +16,7 @@
 
 ## 4. Day Pausing — staff UI & tests
 
-- [ ] 4.1 Staff UI: pause/resume buttons on the Session detail page, a "Pause all sessions" button on the Game page, and current pause state + pause history.
+- [x] 4.1 Staff UI: pause/resume buttons on the Session detail page, a "Pause all sessions" button on the Game page, and current pause state + pause history.
 - [x] 4.2 Tests: pause/resume round-trip restores ownerships; frozen floating score returns identical values during the window; submission returns 409 when configured to reject; per-session override beats game default.
 
 ## 5. Failure Consequences — config & tracking
@@ -33,5 +33,5 @@
 
 ## 7. Failure Consequences — staff UI & tests
 
-- [ ] 7.1 Staff UI: per-Game form for the five failure knobs plus optional per-Session override; scoreboard/timeline shows current lockouts and consecutive-fail counts.
+- [x] 7.1 Staff UI: per-Game form for the five failure knobs plus optional per-Session override; scoreboard/timeline shows current lockouts and consecutive-fail counts.
 - [x] 7.2 Tests: REJECT subtracts points clamped to ≥ 0; cooloff scales as `base × scaling^n`; lockout blocks submissions for exactly `fail_tower_lockout_minutes`; difficulty rollback picks from the lower bucket; each reset-enum value behaves as specified; no cross-team side effects.

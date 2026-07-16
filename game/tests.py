@@ -1937,6 +1937,16 @@ class DayPausingTest(TestCase):
         self.session.save()
         self.assertFalse(self.session.effective('pause_rejects_submissions'))
 
+    def test_pause_history_endpoint(self):
+        client, _ = _staff_client(session=self.session)
+        PauseWindow.pause_session(self.session)
+        r = client.get(f'/api/staff/sessions/{self.session.id}/pause_history/')
+        self.assertEqual(r.status_code, 200, r.content)
+        body = r.json()
+        self.assertTrue(body['is_paused'])
+        self.assertEqual(len(body['windows']), 1)
+        self.assertIsNone(body['windows'][0]['ended_at'])
+
 
 # ---------------------------------------------------------------------------
 # Phase 10 — Challenge-failure consequences (task 7.2)
@@ -2083,3 +2093,16 @@ class FailureConsequencesTest(TestCase):
         self._reject(team=self.team, tower=self.tower)
         self.assertEqual(Team.objects.get(pk=team2.pk).score, 50)  # untouched
         self.assertFalse(TeamTowerFailCounter.objects.filter(team=team2).exists())
+
+    def test_fail_counters_endpoint(self):
+        self.game.fail_tower_lockout_minutes = 10
+        self.game.save()
+        self._reject()
+        client, _ = _staff_client(session=self.session)
+        r = client.get(f'/api/staff/sessions/{self.session.id}/fail_counters/')
+        self.assertEqual(r.status_code, 200, r.content)
+        data = r.json()
+        self.assertEqual(len(data), 1)
+        self.assertEqual(data[0]['consecutive_fails'], 1)
+        self.assertTrue(data[0]['is_locked'])
+        self.assertEqual(data[0]['tower_name'], self.tower.name)

@@ -2,9 +2,19 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators, FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 
-import { AdminGame, AdminGamePayload, StaffApiService } from 'shared';
+import {
+  AdminGame,
+  AdminGamePayload,
+  FailCounterReset,
+  StaffApiService,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+
+type PauseKnob =
+  | 'pause_freezes_floating_score'
+  | 'pause_restores_ownerships_on_resume'
+  | 'pause_rejects_submissions';
 
 interface Row {
   game: AdminGame;
@@ -12,6 +22,7 @@ interface Row {
   dirty: boolean;
   saving: boolean;
   error: string | null;
+  pauseMsg: string | null;
 }
 
 @Component({
@@ -160,22 +171,130 @@ interface Row {
                   </div>
                 </td>
                 <td class="text-end">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-primary"
-                    [disabled]="!row.dirty || row.saving"
-                    (click)="save(row)"
-                  >
-                    @if (row.saving) {
-                      <span class="spinner-border spinner-border-sm me-1"></span>
-                    }
-                    Save
-                  </button>
+                  <div class="d-flex gap-2 justify-content-end">
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-outline-secondary"
+                      (click)="toggleRules(row.game.id)"
+                    >
+                      Rules
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-outline-warning"
+                      (click)="pauseAll(row)"
+                    >
+                      Pause all sessions
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-primary"
+                      [disabled]="!row.dirty || row.saving"
+                      (click)="save(row)"
+                    >
+                      @if (row.saving) {
+                        <span class="spinner-border spinner-border-sm me-1"></span>
+                      }
+                      Save
+                    </button>
+                  </div>
                   @if (row.error; as msg) {
                     <div class="small text-danger mt-1">{{ msg }}</div>
                   }
+                  @if (row.pauseMsg; as msg) {
+                    <div class="small text-body-secondary mt-1">{{ msg }}</div>
+                  }
                 </td>
               </tr>
+              @if (expanded().has(row.game.id)) {
+                <tr class="table-light">
+                  <td colspan="7">
+                    <div class="row g-3 py-2">
+                      <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">Day pausing</div>
+                        @for (k of pauseKnobs; track k.field) {
+                          <div class="form-check form-switch">
+                            <input
+                              type="checkbox"
+                              class="form-check-input"
+                              role="switch"
+                              [id]="k.field + '-' + row.game.id"
+                              [ngModel]="row.draft[k.field]"
+                              (ngModelChange)="update(row, k.field, $event)"
+                            />
+                            <label class="form-check-label small" [for]="k.field + '-' + row.game.id">
+                              {{ k.label }}
+                            </label>
+                          </div>
+                        }
+                      </div>
+                      <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">Failure consequences</div>
+                        <div class="row g-2">
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Point penalty</label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="0"
+                              [ngModel]="row.draft.fail_point_penalty"
+                              (ngModelChange)="update(row, 'fail_point_penalty', $event)"
+                            />
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Cooloff scaling (≥1)</label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="1"
+                              step="0.1"
+                              [ngModel]="row.draft.fail_cooloff_scaling"
+                              (ngModelChange)="update(row, 'fail_cooloff_scaling', $event)"
+                            />
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Tower lockout (min)</label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="0"
+                              [ngModel]="row.draft.fail_tower_lockout_minutes"
+                              (ngModelChange)="update(row, 'fail_tower_lockout_minutes', $event)"
+                            />
+                          </div>
+                          <div class="col-6 d-flex align-items-end">
+                            <div class="form-check form-switch">
+                              <input
+                                type="checkbox"
+                                class="form-check-input"
+                                role="switch"
+                                [id]="'rollback-' + row.game.id"
+                                [ngModel]="row.draft.fail_difficulty_rollback"
+                                (ngModelChange)="update(row, 'fail_difficulty_rollback', $event)"
+                              />
+                              <label class="form-check-label small" [for]="'rollback-' + row.game.id">
+                                Difficulty rollback
+                              </label>
+                            </div>
+                          </div>
+                          <div class="col-12">
+                            <label class="form-label small mb-0">Counter reset</label>
+                            <select
+                              class="form-select form-select-sm"
+                              [ngModel]="row.draft.fail_counter_reset"
+                              (ngModelChange)="update(row, 'fail_counter_reset', $event)"
+                            >
+                              @for (o of resetOptions; track o.value) {
+                                <option [ngValue]="o.value">{{ o.label }}</option>
+                              }
+                            </select>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </td>
+                </tr>
+              }
             }
           </tbody>
         </table>
@@ -193,6 +312,20 @@ export class GamesComponent {
   protected readonly creating = signal(false);
   protected readonly createError = signal<string | null>(null);
 
+  protected readonly expanded = signal<Set<number>>(new Set<number>());
+
+  protected readonly pauseKnobs: { field: PauseKnob; label: string }[] = [
+    { field: 'pause_freezes_floating_score', label: 'Freeze floating score while paused' },
+    { field: 'pause_restores_ownerships_on_resume', label: 'Restore ownerships on resume' },
+    { field: 'pause_rejects_submissions', label: 'Reject submissions while paused' },
+  ];
+
+  protected readonly resetOptions: { value: FailCounterReset; label: string }[] = [
+    { value: 'TOWER_SUCCESS_ONLY', label: 'Reset only on success at the same tower' },
+    { value: 'ANY_SUCCESS_ELSEWHERE', label: 'Reset on any confirmed submission' },
+    { value: 'ANY_ATTEMPT_ELSEWHERE', label: 'Reset on any submission anywhere' },
+  ];
+
   protected readonly createForm = this.fb.group({
     slug: ['', [Validators.required]],
     name: ['', [Validators.required]],
@@ -202,6 +335,29 @@ export class GamesComponent {
 
   constructor() {
     this.refresh();
+  }
+
+  protected toggleRules(id: number): void {
+    this.expanded.update((set) => {
+      const next = new Set(set);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  protected pauseAll(row: Row): void {
+    this.patch(row, { pauseMsg: 'Pausing…' });
+    this.api.pauseAllSessions(row.game.id).subscribe({
+      next: (res) => {
+        const n = res.paused_sessions.length;
+        this.patch(row, {
+          pauseMsg: n
+            ? `Paused ${n} active session${n === 1 ? '' : 's'}.`
+            : 'No active sessions to pause.',
+        });
+      },
+      error: (err) => this.patch(row, { pauseMsg: extractErrorMessage(err) }),
+    });
   }
 
   private refresh(): void {
@@ -216,6 +372,7 @@ export class GamesComponent {
             dirty: false,
             saving: false,
             error: null,
+            pauseMsg: null,
           })),
         );
         this.loading.set(false);
@@ -281,6 +438,14 @@ export class GamesComponent {
         proximity_meters: row.draft.proximity_meters,
         cooloff_minutes: row.draft.cooloff_minutes,
         initial_bonus_default: row.draft.initial_bonus_default,
+        pause_freezes_floating_score: row.draft.pause_freezes_floating_score,
+        pause_restores_ownerships_on_resume: row.draft.pause_restores_ownerships_on_resume,
+        pause_rejects_submissions: row.draft.pause_rejects_submissions,
+        fail_point_penalty: row.draft.fail_point_penalty,
+        fail_cooloff_scaling: row.draft.fail_cooloff_scaling,
+        fail_tower_lockout_minutes: row.draft.fail_tower_lockout_minutes,
+        fail_difficulty_rollback: row.draft.fail_difficulty_rollback,
+        fail_counter_reset: row.draft.fail_counter_reset,
       })
       .subscribe({
         next: (updated) => {
@@ -293,6 +458,7 @@ export class GamesComponent {
                     dirty: false,
                     saving: false,
                     error: null,
+                    pauseMsg: null,
                   }
                 : r,
             ),

@@ -67,7 +67,24 @@ export interface AdminChallenge {
   difficulty: number;
 }
 
-export interface AdminGame {
+export type FailCounterReset =
+  | 'TOWER_SUCCESS_ONLY'
+  | 'ANY_SUCCESS_ELSEWHERE'
+  | 'ANY_ATTEMPT_ELSEWHERE';
+
+/** Phase 10 config knobs shared by Game (defaults) and Session (overrides). */
+export interface Phase10Config {
+  pause_freezes_floating_score: boolean;
+  pause_restores_ownerships_on_resume: boolean;
+  pause_rejects_submissions: boolean;
+  fail_point_penalty: number;
+  fail_cooloff_scaling: number;
+  fail_tower_lockout_minutes: number;
+  fail_difficulty_rollback: boolean;
+  fail_counter_reset: FailCounterReset;
+}
+
+export interface AdminGame extends Phase10Config {
   id: number;
   slug: string;
   name: string;
@@ -87,7 +104,12 @@ export type AdminGamePayload = Partial<
   base_lng?: number | null;
 };
 
-export interface AdminSession {
+/** Per-session overrides: null means "inherit the Game default". */
+export type Phase10Overrides = {
+  [K in keyof Phase10Config]: Phase10Config[K] | null;
+};
+
+export interface AdminSession extends Phase10Overrides {
   id: number;
   game: number;
   game_slug: string;
@@ -97,12 +119,36 @@ export interface AdminSession {
   start_time: string;
   end_time: string;
   is_active: boolean;
+  is_paused: boolean;
   created_at: string | null;
 }
 
 export type AdminSessionPayload = Partial<
-  Omit<AdminSession, 'id' | 'game_slug' | 'game_name' | 'created_at'>
+  Omit<AdminSession, 'id' | 'game_slug' | 'game_name' | 'is_paused' | 'created_at'>
 >;
+
+export interface PauseWindowInfo {
+  id: number;
+  started_at: string;
+  ended_at: string | null;
+  restore_on_resume: boolean;
+}
+
+export interface PauseHistory {
+  is_paused: boolean;
+  windows: PauseWindowInfo[];
+}
+
+export interface FailCounterInfo {
+  team_id: number;
+  team_name: string;
+  team_color: string;
+  tower_id: number;
+  tower_name: string;
+  consecutive_fails: number;
+  locked_until: string | null;
+  is_locked: boolean;
+}
 
 @Injectable({ providedIn: 'root' })
 export class StaffApiService {
@@ -211,6 +257,10 @@ export class StaffApiService {
     return this.http.get<AdminSession[]>(`/api/staff/sessions/${query}`);
   }
 
+  getSession(id: number): Observable<AdminSession> {
+    return this.http.get<AdminSession>(`/api/staff/sessions/${id}/`);
+  }
+
   createSession(payload: AdminSessionPayload): Observable<AdminSession> {
     return this.http.post<AdminSession>('/api/staff/sessions/', payload);
   }
@@ -220,5 +270,32 @@ export class StaffApiService {
     payload: AdminSessionPayload,
   ): Observable<AdminSession> {
     return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
+  }
+
+  // ---- Phase 10: day pausing + failure observability -----------------------
+
+  pauseSession(id: number): Observable<AdminSession> {
+    return this.http.post<AdminSession>(`/api/staff/sessions/${id}/pause/`, {});
+  }
+
+  resumeSession(id: number): Observable<AdminSession> {
+    return this.http.post<AdminSession>(`/api/staff/sessions/${id}/resume/`, {});
+  }
+
+  pauseAllSessions(gameId: number): Observable<{ paused_sessions: number[] }> {
+    return this.http.post<{ paused_sessions: number[] }>(
+      `/api/staff/games/${gameId}/pause_all/`,
+      {},
+    );
+  }
+
+  sessionPauseHistory(id: number): Observable<PauseHistory> {
+    return this.http.get<PauseHistory>(`/api/staff/sessions/${id}/pause_history/`);
+  }
+
+  sessionFailCounters(id: number): Observable<FailCounterInfo[]> {
+    return this.http.get<FailCounterInfo[]>(
+      `/api/staff/sessions/${id}/fail_counters/`,
+    );
   }
 }
