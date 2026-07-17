@@ -6,7 +6,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/manage.py",
-      "args": ["runserver", "8000"],
+      "args": ["runserver", "8200"],
       "django": true,
       "env": {
         "DJANGO_SETTINGS_MODULE": "geogame.settings"
@@ -20,7 +20,7 @@
       "type": "debugpy",
       "request": "launch",
       "program": "${workspaceFolder}/manage.py",
-      "args": ["runserver", "8000", "--noreload"],
+      "args": ["runserver", "8200", "--noreload"],
       "django": true,
       "env": {
         "DJANGO_SETTINGS_MODULE": "geogame.settings"
@@ -86,14 +86,14 @@
       "name": "ng serve: player",
       "type": "node-terminal",
       "request": "launch",
-      "command": "npx ng serve player --port 4200",
+      "command": "npx ng serve player --port 4500",
       "cwd": "${workspaceFolder}/frontend"
     },
     {
       "name": "ng serve: staff",
       "type": "node-terminal",
       "request": "launch",
-      "command": "npx ng serve staff --port 4201",
+      "command": "npx ng serve staff --port 4501",
       "cwd": "${workspaceFolder}/frontend"
     }
   ],

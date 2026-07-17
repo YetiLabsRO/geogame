@@ -4,7 +4,7 @@
     {
       "label": "Django: runserver",
       "type": "shell",
-      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8000",
+      "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8200",
       "options": {
         "cwd": "${workspaceFolder}",
         "env": {

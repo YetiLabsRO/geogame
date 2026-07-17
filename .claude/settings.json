@@ -31,8 +31,8 @@
       "Bash(/home/yeti/.virtualenvs/cercetador/bin/pip:*)",
       "Bash(source .envrc)",
       "Bash(source /home/yeti/.virtualenvs/cercetador/bin/activate)",
-      "Bash(curl -s http://localhost:8000/*)",
-      "Bash(curl -s http://127.0.0.1:8000/*)"
+      "Bash(curl -s http://localhost:8200/*)",
+      "Bash(curl -s http://127.0.0.1:8200/*)"
     ]
   }
 }

@@ -1,26 +1,26 @@
 {
   "/api": {
-    "target": "http://localhost:8000",
+    "target": "http://localhost:8200",
     "secure": false,
     "changeOrigin": true
   },
   "/admin": {
-    "target": "http://localhost:8000",
+    "target": "http://localhost:8200",
     "secure": false,
     "changeOrigin": true
   },
   "/media": {
-    "target": "http://localhost:8000",
+    "target": "http://localhost:8200",
     "secure": false,
     "changeOrigin": true
   },
   "/static": {
-    "target": "http://localhost:8000",
+    "target": "http://localhost:8200",
     "secure": false,
     "changeOrigin": true
   },
   "/health": {
-    "target": "http://localhost:8000",
+    "target": "http://localhost:8200",
     "secure": false,
     "changeOrigin": true
   }
