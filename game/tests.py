@@ -26,7 +26,9 @@ from datetime import timezone as dt_timezone
 
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
-from django.test import TestCase
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -2131,3 +2133,580 @@ class FailureConsequencesTest(TestCase):
         self.assertEqual(data[0]['consecutive_fails'], 1)
         self.assertTrue(data[0]['is_locked'])
         self.assertEqual(data[0]['tower_name'], self.tower.name)
+
+
+# ---------------------------------------------------------------------------
+# Points repository & collections (change: points-repository-and-collections)
+# ---------------------------------------------------------------------------
+
+
+class CollectionModelTest(TestCase):
+    """Task 1.1 — Collection fields + membership semantics."""
+
+    def test_collection_fields(self):
+        user = User.objects.create_user(
+            username='curator', email='c@x.com', password='pw',
+        )
+        collection = Collection.objects.create(
+            name='Old town', slug='old-town',
+            description='Historic centre points', created_by=user,
+        )
+        self.assertEqual(str(collection), 'Old town')
+        self.assertEqual(collection.slug, 'old-town')
+        self.assertEqual(collection.created_by, user)
+        self.assertIsNotNone(collection.created_at)
+
+    def test_slug_is_unique(self):
+        from django.db import IntegrityError
+        Collection.objects.create(name='A', slug='same')
+        with self.assertRaises(IntegrityError):
+            Collection.objects.create(name='B', slug='same')
+
+    def test_membership_removal_keeps_repository_rows(self):
+        collection = Collection.objects.create(name='Map', slug='map')
+        zone = Zone.objects.create(
+            name='Z', scoring_type=Zone.SCORE_LIN,
+            shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
+        )
+        tower = Tower.objects.create(
+            name='T', zone=zone, location=Point(23.5, 46.5),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+        )
+        collection.zones.add(zone)
+        collection.towers.add(tower)
+
+        collection.towers.remove(tower)
+        collection.zones.remove(zone)
+        # Orphan library assets survive with no collection memberships.
+        tower.refresh_from_db()
+        zone.refresh_from_db()
+        self.assertEqual(tower.collections.count(), 0)
+        self.assertEqual(zone.collections.count(), 0)
+
+    def test_asset_may_belong_to_multiple_collections(self):
+        tower = Tower.objects.create(
+            name='T', location=Point(23.5, 46.5),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+        )
+        c1 = Collection.objects.create(name='One', slug='one')
+        c2 = Collection.objects.create(name='Two', slug='two')
+        c1.towers.add(tower)
+        c2.towers.add(tower)
+        self.assertEqual(tower.collections.count(), 2)
+
+
+class GeometryResolverTest(TestCase):
+    """Tasks 1.2 / 1.3 — Game and Session geometry resolvers."""
+
+    def test_game_resolvers_return_collection_members(self):
+        game = _make_game(name='Resolver Game')
+        zone = _make_zone(game)
+        tower = _make_tower(game, zone=zone)
+        self.assertEqual(list(game.towers()), [tower])
+        self.assertEqual(list(game.zones()), [zone])
+
+    def test_distinct_union_across_multiple_collections(self):
+        game = _make_game(name='Union Game')
+        t1 = _make_tower(game, name='T1')
+        # A second collection holding a new tower AND the first tower.
+        extra = Collection.objects.create(name='Extra map', slug='extra-map')
+        t2 = Tower.objects.create(
+            name='T2', location=Point(23.6, 46.6),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+        )
+        extra.towers.add(t1, t2)
+        game.collections.add(extra)
+        towers = list(game.towers())
+        self.assertEqual(len(towers), 2)  # t1 not duplicated
+        self.assertEqual(set(towers), {t1, t2})
+
+    def test_game_without_collections_sees_no_geometry(self):
+        game = _make_game(name='Bare Game')
+        self.assertEqual(game.towers().count(), 0)
+        self.assertEqual(game.zones().count(), 0)
+
+    def test_session_resolvers_delegate_to_game(self):
+        game = _make_game(name='Delegate Game')
+        zone = _make_zone(game)
+        tower = _make_tower(game, zone=zone)
+        session = _default_session(game)
+        self.assertEqual(list(session.towers()), [tower])
+        self.assertEqual(list(session.zones()), [zone])
+
+
+class SharedCollectionTest(TestCase):
+    """Task 6.2 — two Games linking the same Collection share rows by PK,
+    while ownership records stay per-Session."""
+
+    def setUp(self):
+        self.game_a = _make_game(name='Shared A', slug='shared-a')
+        self.game_b = _make_game(name='Shared B', slug='shared-b')
+        self.zone = _make_zone(self.game_a, name='SharedZone')
+        self.tower = _make_tower(self.game_a, zone=self.zone, name='SharedTower')
+        # Link Game A's collection into Game B too — one map, two games.
+        self.collection = self.game_a.collections.first()
+        self.game_b.collections.add(self.collection)
+        self.group_a = _make_group(self.game_a, slug='sa')
+        self.group_b = _make_group(self.game_b, slug='sb')
+        self.team_a = _make_team(self.game_a, self.group_a, name='team-sa')
+        self.team_b = _make_team(self.game_b, self.group_b, name='team-sb')
+        self.client_a, _ = _authed_client(self.team_a, username='shared-a')
+        self.client_b, _ = _authed_client(self.team_b, username='shared-b')
+
+    def test_both_games_resolve_identical_tower_rows(self):
+        self.assertEqual(
+            list(self.game_a.towers().values_list('pk', flat=True)),
+            list(self.game_b.towers().values_list('pk', flat=True)),
+        )
+        ids_a = {t['id'] for t in self.client_a.get('/api/towers/').json()}
+        ids_b = {t['id'] for t in self.client_b.get('/api/towers/').json()}
+        self.assertEqual(ids_a, {self.tower.id})
+        self.assertEqual(ids_b, {self.tower.id})
+
+    def test_both_games_resolve_identical_zone_rows(self):
+        names_a = [z['name'] for z in self.client_a.get('/api/zones/').json()]
+        names_b = [z['name'] for z in self.client_b.get('/api/zones/').json()]
+        self.assertEqual(names_a, ['SharedZone'])
+        self.assertEqual(names_b, ['SharedZone'])
+
+    def test_ownership_never_leaks_between_games(self):
+        self.tower.assign_to_team(self.team_a)
+        self.assertEqual(self.tower.tower_control(self.group_a), self.team_a)
+        # Game B's group sees the shared tower as uncontrolled.
+        self.assertIsNone(self.tower.tower_control(self.group_b))
+        # And no ownership rows exist for Game B's session.
+        self.assertFalse(
+            TeamTowerOwnership.objects.filter(
+                team__session=self.team_b.session,
+            ).exists(),
+        )
+
+
+class CollectionAPITest(TestCase):
+    """Tasks 4.1 / 4.2 / 4.3 — collections CRUD, membership, repository
+    scoping and usage reporting."""
+
+    def setUp(self):
+        self.game = _make_game(name='Repo Game')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, name='RZ')
+        self.tower = _make_tower(self.game, name='RT', zone=self.zone)
+        self.collection = self.game.collections.first()
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='repo-admin',
+        )
+        self.player_client, _ = _authed_client(self.team, username='repo-player')
+
+    def test_collections_require_staff(self):
+        self.assertEqual(
+            self.player_client.get('/api/staff/collections/').status_code, 403,
+        )
+
+    def test_collection_crud(self):
+        resp = self.staff_client.post(
+            '/api/staff/collections/',
+            {'name': 'New Map', 'description': 'Fresh'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['slug'], 'new-map')  # auto-generated
+        self.assertEqual(body['created_by'], self.staff.id)
+        collection_id = body['id']
+
+        resp = self.staff_client.get('/api/staff/collections/')
+        self.assertEqual(resp.status_code, 200)
+        names = [c['name'] for c in resp.json()]
+        self.assertIn('New Map', names)
+
+        resp = self.staff_client.patch(
+            f'/api/staff/collections/{collection_id}/',
+            {'name': 'Renamed Map'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['name'], 'Renamed Map')
+
+        resp = self.staff_client.delete(
+            f'/api/staff/collections/{collection_id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(Collection.objects.filter(pk=collection_id).exists())
+
+    def test_deleting_collection_keeps_repository_rows(self):
+        tower_pk = self.tower.pk
+        resp = self.staff_client.delete(
+            f'/api/staff/collections/{self.collection.id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+        self.assertTrue(Tower.objects.filter(pk=tower_pk).exists())
+
+    def test_membership_add_and_remove(self):
+        resp = self.staff_client.post(
+            '/api/staff/collections/', {'name': 'Curated'}, format='json',
+        )
+        cid = resp.json()['id']
+
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{cid}/add-towers/',
+            {'tower_ids': [self.tower.id]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()['towers'], [self.tower.id])
+
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{cid}/add-zones/',
+            {'zone_ids': [self.zone.id]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['zones'], [self.zone.id])
+
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{cid}/remove-towers/',
+            {'tower_ids': [self.tower.id]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['towers'], [])
+        # Removal only touched membership.
+        self.assertTrue(Tower.objects.filter(pk=self.tower.pk).exists())
+
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{cid}/remove-zones/',
+            {'zone_ids': [self.zone.id]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['zones'], [])
+
+    def test_membership_rejects_unknown_ids(self):
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{self.collection.id}/add-towers/',
+            {'tower_ids': [999999]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.staff_client.post(
+            f'/api/staff/collections/{self.collection.id}/add-towers/',
+            {'tower_ids': 'nope'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_staff_towers_are_repository_scoped_with_collection_filter(self):
+        # A tower in a different collection, not linked to any game.
+        other_collection = Collection.objects.create(name='Other', slug='other')
+        other_tower = Tower.objects.create(
+            name='Elsewhere', location=Point(24.0, 47.0),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+        )
+        other_collection.towers.add(other_tower)
+
+        # Unfiltered: the whole repository is visible to staff.
+        resp = self.staff_client.get('/api/staff/towers/')
+        ids = {t['id'] for t in resp.json()}
+        self.assertEqual(ids, {self.tower.id, other_tower.id})
+
+        # Filtered by collection.
+        resp = self.staff_client.get(
+            f'/api/staff/towers/?collection={other_collection.id}',
+        )
+        ids = {t['id'] for t in resp.json()}
+        self.assertEqual(ids, {other_tower.id})
+
+        resp = self.staff_client.get(
+            f'/api/staff/zones/?collection={self.collection.id}',
+        )
+        self.assertEqual(
+            {z['id'] for z in resp.json()}, {self.zone.id},
+        )
+
+    def test_usage_reporting_on_towers_and_zones(self):
+        resp = self.staff_client.get(f'/api/staff/towers/{self.tower.id}/')
+        body = resp.json()
+        self.assertEqual(
+            body['collections'],
+            [{'id': self.collection.id, 'name': self.collection.name}],
+        )
+        self.assertEqual(
+            body['games'], [{'id': self.game.id, 'name': self.game.name}],
+        )
+
+        resp = self.staff_client.get(f'/api/staff/zones/{self.zone.id}/')
+        body = resp.json()
+        self.assertEqual(
+            [c['id'] for c in body['collections']], [self.collection.id],
+        )
+        self.assertEqual(
+            [g['id'] for g in body['games']], [self.game.id],
+        )
+
+
+class CloneGameTest(TestCase):
+    """Tasks 3.1–3.3 / 6.3 — creator vs runner roles and template cloning."""
+
+    def setUp(self):
+        self.game = _make_game(name='Original', slug='original')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text='original challenge', tower=self.tower,
+            game=self.game, difficulty=1,
+        )
+        self.collection = self.game.collections.first()
+        self.creator_client, self.creator = _staff_client(username='creator')
+        self.game.created_by = self.creator
+        self.game.save(update_fields=['created_by'])
+        self.runner_client, self.runner = _staff_client(username='runner')
+
+    def _clone(self, client=None, payload=None):
+        return (client or self.runner_client).post(
+            f'/api/staff/games/{self.game.id}/clone/',
+            payload or {},
+            format='json',
+        )
+
+    def test_clone_copies_template_and_shares_geometry(self):
+        resp = self._clone()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['cloned_from'], self.game.id)
+        self.assertEqual(body['created_by'], self.runner.id)
+        self.assertEqual(body['collections'], [self.collection.id])
+        self.assertEqual(body['slug'], 'original-clone')
+        self.assertFalse(body['is_active'])
+
+        clone = Game.objects.get(pk=body['id'])
+        # Geometry shared by PK — no new Tower/Zone rows.
+        self.assertEqual(Tower.objects.count(), 1)
+        self.assertEqual(Zone.objects.count(), 1)
+        self.assertEqual(
+            list(clone.towers().values_list('pk', flat=True)), [self.tower.pk],
+        )
+        self.assertEqual(
+            list(clone.zones().values_list('pk', flat=True)), [self.zone.pk],
+        )
+        # Template rows deep-copied: new Challenge and TeamGroup rows.
+        clone_challenge = clone.challenges.get()
+        self.assertEqual(clone_challenge.text, 'original challenge')
+        self.assertNotEqual(clone_challenge.pk, self.challenge.pk)
+        self.assertEqual(clone_challenge.tower_id, self.tower.pk)  # shared tower
+        clone_group = TeamGroup.objects.get(game=clone)
+        self.assertEqual(clone_group.slug, self.group.slug)
+        self.assertNotEqual(clone_group.pk, self.group.pk)
+        # Rules config copied.
+        self.assertEqual(clone.proximity_meters, self.game.proximity_meters)
+        self.assertEqual(clone.cooloff_minutes, self.game.cooloff_minutes)
+
+    def test_clone_accepts_custom_name_and_slug(self):
+        resp = self._clone(payload={'name': 'My Run', 'slug': 'my-run'})
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['name'], 'My Run')
+        self.assertEqual(resp.json()['slug'], 'my-run')
+
+    def test_clone_rejects_duplicate_slug(self):
+        resp = self._clone(payload={'slug': 'original'})
+        self.assertEqual(resp.status_code, 400)
+
+    def test_clone_edits_do_not_affect_original(self):
+        clone_id = self._clone().json()['id']
+        resp = self.runner_client.patch(
+            f'/api/staff/games/{clone_id}/',
+            {'cooloff_minutes': 9, 'name': 'Runner special'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.game.refresh_from_db()
+        self.assertEqual(self.game.cooloff_minutes, 5)
+        self.assertEqual(self.game.name, 'Original')
+
+        # Runner adds a challenge to their clone — original bank untouched.
+        resp = self.runner_client.post(
+            '/api/staff/challenges/',
+            {'game': clone_id, 'text': 'runner extra', 'difficulty': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(self.game.challenges.count(), 1)
+        self.assertEqual(Game.objects.get(pk=clone_id).challenges.count(), 2)
+
+    def test_runner_cannot_mutate_original_template(self):
+        resp = self.runner_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'cooloff_minutes': 1},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.runner_client.post(
+            '/api/staff/challenges/',
+            {'game': self.game.id, 'text': 'sneaky', 'difficulty': 1},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.runner_client.delete(f'/api/staff/games/{self.game.id}/')
+        self.assertEqual(resp.status_code, 403)
+        self.assertTrue(Game.objects.filter(pk=self.game.pk).exists())
+
+    def test_creator_can_mutate_own_template(self):
+        resp = self.creator_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'cooloff_minutes': 7},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.game.refresh_from_db()
+        self.assertEqual(self.game.cooloff_minutes, 7)
+
+    def test_creator_collaborator_can_edit(self):
+        GameCollaborator.objects.create(
+            game=self.game, user=self.runner,
+            role=GameCollaborator.ROLE_CREATOR,
+        )
+        resp = self.runner_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'cooloff_minutes': 8},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_runner_collaborator_cannot_edit(self):
+        GameCollaborator.objects.create(
+            game=self.game, user=self.runner,
+            role=GameCollaborator.ROLE_RUNNER,
+        )
+        resp = self.runner_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'cooloff_minutes': 8},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_legacy_game_without_creator_stays_open_to_staff(self):
+        legacy = _make_game(name='Legacy Open', slug='legacy-open')
+        resp = self.runner_client.patch(
+            f'/api/staff/games/{legacy.id}/',
+            {'cooloff_minutes': 3},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+    def test_runner_can_run_sessions_under_foreign_game(self):
+        # Runner may create + control a Session under the creator's game.
+        now = timezone.now()
+        resp = self.runner_client.post(
+            '/api/staff/sessions/',
+            {
+                'game': self.game.id,
+                'slug': 'runner-run',
+                'name': 'Runner run',
+                'start_time': now.isoformat(),
+                'end_time': (now + timedelta(hours=2)).isoformat(),
+                'is_active': True,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        session_id = resp.json()['id']
+        resp = self.runner_client.post(f'/api/staff/sessions/{session_id}/pause/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        resp = self.runner_client.post(f'/api/staff/sessions/{session_id}/resume/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+
+class CollectionBackfillMigrationTest(TransactionTestCase):
+    """Task 6.1 — the data migration gives every existing Game a
+    Collection resolving the exact Towers/Zones it owned before."""
+
+    # Pre-backfill state: Collection exists, Tower.game/Zone.game still present.
+    migrate_from = [
+        ('game', '0022_collection'),
+        ('organize', '0011_game_collections_roles_cloning'),
+    ]
+    # Post-removal state: geometry reachable only through collections.
+    migrate_to = [('game', '0024_remove_tower_zone_game_fk')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        # Leave the schema at head for the rest of the suite.
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_each_game_resolves_identical_geometry_after_migration(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldGame = old_apps.get_model('organize', 'Game')
+        OldZone = old_apps.get_model('game', 'Zone')
+        OldTower = old_apps.get_model('game', 'Tower')
+
+        bbox = Polygon.from_bbox((23.0, 46.0, 24.0, 47.0))
+        g1 = OldGame.objects.create(name='Legacy One', slug='legacy-one')
+        g2 = OldGame.objects.create(name='Legacy Two', slug='legacy-two')
+        z1 = OldZone.objects.create(
+            name='Z1', scoring_type=3, shape=bbox, game=g1, color='#000000',
+        )
+        z2 = OldZone.objects.create(
+            name='Z2', scoring_type=3, shape=bbox, game=g2, color='#000000',
+        )
+        t1a = OldTower.objects.create(
+            name='T1a', game=g1, zone=z1, location=Point(23.5, 46.5),
+            is_active=True, category=1,
+        )
+        t1b = OldTower.objects.create(
+            name='T1b', game=g1, zone=z1, location=Point(23.6, 46.6),
+            is_active=True, category=1,
+        )
+        t2 = OldTower.objects.create(
+            name='T2', game=g2, zone=z2, location=Point(23.7, 46.7),
+            is_active=True, category=1,
+        )
+
+        new_apps = self._migrate(self.migrate_to)
+        NewGame = new_apps.get_model('organize', 'Game')
+        NewCollection = new_apps.get_model('game', 'Collection')
+        NewTower = new_apps.get_model('game', 'Tower')
+        NewZone = new_apps.get_model('game', 'Zone')
+
+        # One collection per game, named '<game name> map'.
+        c1 = NewCollection.objects.get(name='Legacy One map')
+        c2 = NewCollection.objects.get(name='Legacy Two map')
+
+        game1 = NewGame.objects.get(slug='legacy-one')
+        game2 = NewGame.objects.get(slug='legacy-two')
+        self.assertEqual(
+            [c.pk for c in game1.collections.all()], [c1.pk],
+        )
+        self.assertEqual(
+            [c.pk for c in game2.collections.all()], [c2.pk],
+        )
+
+        # Exactly the same Tower/Zone rows resolve for each game.
+        self.assertEqual(
+            set(NewTower.objects.filter(collections__games=game1)
+                .values_list('pk', flat=True)),
+            {t1a.pk, t1b.pk},
+        )
+        self.assertEqual(
+            set(NewZone.objects.filter(collections__games=game1)
+                .values_list('pk', flat=True)),
+            {z1.pk},
+        )
+        self.assertEqual(
+            set(NewTower.objects.filter(collections__games=game2)
+                .values_list('pk', flat=True)),
+            {t2.pk},
+        )
+        self.assertEqual(
+            set(NewZone.objects.filter(collections__games=game2)
+                .values_list('pk', flat=True)),
+            {z2.pk},
+        )
