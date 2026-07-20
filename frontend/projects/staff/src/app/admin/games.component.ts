@@ -10,6 +10,7 @@ import {
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+import { GameRolesPanelComponent } from './game-roles-panel.component';
 
 type PauseKnob =
   | 'pause_freezes_floating_score'
@@ -29,7 +30,7 @@ interface Row {
   selector: 'app-admin-games',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, FormsModule, RouterLink],
+  imports: [ReactiveFormsModule, FormsModule, RouterLink, GameRolesPanelComponent],
   template: `
     <h1 class="h3 mb-3">Games</h1>
     <p class="text-body-secondary small">
@@ -181,6 +182,13 @@ interface Row {
                     </button>
                     <button
                       type="button"
+                      class="btn btn-sm btn-outline-secondary"
+                      (click)="toggleRoles(row.game.id)"
+                    >
+                      Roles
+                    </button>
+                    <button
+                      type="button"
                       class="btn btn-sm btn-outline-warning"
                       (click)="pauseAll(row)"
                     >
@@ -206,6 +214,13 @@ interface Row {
                   }
                 </td>
               </tr>
+              @if (rolesExpanded().has(row.game.id)) {
+                <tr class="table-light">
+                  <td colspan="7">
+                    <app-game-roles-panel [gameId]="row.game.id" />
+                  </td>
+                </tr>
+              }
               @if (expanded().has(row.game.id)) {
                 <tr class="table-light">
                   <td colspan="7">
@@ -313,6 +328,7 @@ export class GamesComponent {
   protected readonly createError = signal<string | null>(null);
 
   protected readonly expanded = signal<Set<number>>(new Set<number>());
+  protected readonly rolesExpanded = signal<Set<number>>(new Set<number>());
 
   protected readonly pauseKnobs: { field: PauseKnob; label: string }[] = [
     { field: 'pause_freezes_floating_score', label: 'Freeze floating score while paused' },
@@ -339,6 +355,14 @@ export class GamesComponent {
 
   protected toggleRules(id: number): void {
     this.expanded.update((set) => {
+      const next = new Set(set);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  protected toggleRoles(id: number): void {
+    this.rolesExpanded.update((set) => {
       const next = new Set(set);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;

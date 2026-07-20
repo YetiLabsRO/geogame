@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 import { AdminTeam, AdminTeamGroup, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+import { TeamRosterPanelComponent } from './team-roster-panel.component';
 
 interface Row {
   team: AdminTeam;
@@ -17,7 +18,7 @@ interface Row {
   selector: 'app-admin-teams',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule],
+  imports: [FormsModule, TeamRosterPanelComponent],
   template: `
     <h1 class="h3 mb-3">Teams</h1>
 
@@ -84,22 +85,41 @@ interface Row {
                   />
                 </td>
                 <td class="text-end">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-primary"
-                    [disabled]="!row.dirty || row.saving"
-                    (click)="save(row)"
-                  >
-                    @if (row.saving) {
-                      <span class="spinner-border spinner-border-sm me-1"></span>
-                    }
-                    Save
-                  </button>
+                  <div class="d-flex gap-2 justify-content-end">
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-outline-secondary"
+                      (click)="toggleRoster(row.team.id)"
+                    >
+                      Roster
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-primary"
+                      [disabled]="!row.dirty || row.saving"
+                      (click)="save(row)"
+                    >
+                      @if (row.saving) {
+                        <span class="spinner-border spinner-border-sm me-1"></span>
+                      }
+                      Save
+                    </button>
+                  </div>
                   @if (row.error; as msg) {
                     <div class="small text-danger mt-1">{{ msg }}</div>
                   }
                 </td>
               </tr>
+              @if (rosterExpanded().has(row.team.id)) {
+                <tr class="table-light">
+                  <td colspan="5">
+                    <app-team-roster-panel
+                      [teamId]="row.team.id"
+                      [gameId]="row.team.game"
+                    />
+                  </td>
+                </tr>
+              }
             }
           </tbody>
         </table>
@@ -114,6 +134,15 @@ export class TeamsComponent {
   protected readonly groups = signal<AdminTeamGroup[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
+  protected readonly rosterExpanded = signal<Set<number>>(new Set<number>());
+
+  protected toggleRoster(id: number): void {
+    this.rosterExpanded.update((set) => {
+      const next = new Set(set);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
 
   constructor() {
     this.refresh();

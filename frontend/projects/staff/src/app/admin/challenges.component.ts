@@ -2,7 +2,7 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { FormsModule } from '@angular/forms';
 
-import { AdminChallenge, AdminTower, StaffApiService } from 'shared';
+import { AdminChallenge, AdminGameRole, AdminTower, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -94,6 +94,7 @@ interface Row {
               <th>Text</th>
               <th style="min-width: 12rem">Tower</th>
               <th style="max-width: 6rem">Difficulty</th>
+              <th style="min-width: 14rem">Role requirement</th>
               <th></th>
             </tr>
           </thead>
@@ -128,6 +129,61 @@ interface Row {
                     [ngModel]="row.draft.difficulty"
                     (ngModelChange)="update(row, 'difficulty', $event)"
                   />
+                </td>
+                <td>
+                  <select
+                    class="form-select form-select-sm mb-1"
+                    [ngModel]="row.draft.role_requirement_mode"
+                    (ngModelChange)="update(row, 'role_requirement_mode', $event)"
+                  >
+                    <option [ngValue]="'NONE'">No role requirement</option>
+                    <option [ngValue]="'ANY'">Any of the roles…</option>
+                    <option [ngValue]="'ALL'">One of each role…</option>
+                  </select>
+                  @if (row.draft.role_requirement_mode !== 'NONE') {
+                    @for (role of roles(); track role.id) {
+                      <div class="form-check">
+                        <input
+                          type="checkbox"
+                          class="form-check-input"
+                          [id]="'req-' + row.challenge.id + '-' + role.id"
+                          [checked]="row.draft.required_roles.includes(role.id)"
+                          (change)="toggleRequiredRole(row, role.id)"
+                        />
+                        <label
+                          class="form-check-label small"
+                          [for]="'req-' + row.challenge.id + '-' + role.id"
+                        >
+                          {{ role.name }}
+                        </label>
+                      </div>
+                    } @empty {
+                      <div class="small text-warning">
+                        No roles defined for this game yet.
+                      </div>
+                    }
+                    <div class="form-check">
+                      <input
+                        type="checkbox"
+                        class="form-check-input"
+                        [id]="'holders-' + row.challenge.id"
+                        [checked]="row.draft.require_holders_present"
+                        (change)="
+                          update(
+                            row,
+                            'require_holders_present',
+                            !row.draft.require_holders_present
+                          )
+                        "
+                      />
+                      <label
+                        class="form-check-label small"
+                        [for]="'holders-' + row.challenge.id"
+                      >
+                        Holders must be present (presence rules)
+                      </label>
+                    </div>
+                  }
                 </td>
                 <td class="text-end">
                   <div class="d-flex gap-2 justify-content-end">
@@ -169,6 +225,7 @@ export class ChallengesComponent {
 
   protected readonly rows = signal<Row[]>([]);
   protected readonly towers = signal<AdminTower[]>([]);
+  protected readonly roles = signal<AdminGameRole[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
   protected readonly creating = signal(false);
@@ -186,6 +243,19 @@ export class ChallengesComponent {
       next: (list) => this.towers.set(list),
       error: () => {},
     });
+    // Roles of the current session's Game (server-side fallback scope).
+    this.api.listGameRoles().subscribe({
+      next: (list) => this.roles.set(list),
+      error: () => {},
+    });
+  }
+
+  protected toggleRequiredRole(row: Row, roleId: number): void {
+    const current = row.draft.required_roles;
+    const next = current.includes(roleId)
+      ? current.filter((id) => id !== roleId)
+      : [...current, roleId];
+    this.update(row, 'required_roles', next);
   }
 
   private refresh(): void {
@@ -224,6 +294,11 @@ export class ChallengesComponent {
         // game is derived server-side once T3.5 scoping lands; in the
         // meantime the backfill migration covers existing rows.
         game: null,
+        // Role requirement defaults to "none"; edit it on the row after
+        // creation (team-roles capability).
+        role_requirement_mode: 'NONE',
+        required_roles: [],
+        require_holders_present: false,
       })
       .subscribe({
         next: () => {

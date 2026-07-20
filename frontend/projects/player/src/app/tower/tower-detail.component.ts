@@ -105,6 +105,39 @@ interface Position {
                   Next challenge · difficulty {{ c.difficulty }}
                 </div>
                 <div class="fs-5" style="white-space: pre-line">{{ c.text }}</div>
+                @if (c.role_requirement; as req) {
+                  <hr class="my-2" />
+                  <div class="small text-body-secondary mb-1">
+                    @if (req.mode === 'ALL') {
+                      Requires one holder for <strong>each</strong> role:
+                    } @else {
+                      Requires <strong>at least one</strong> of the roles:
+                    }
+                  </div>
+                  <div class="mb-1">
+                    @for (role of req.required_roles; track role.slug) {
+                      <span
+                        class="badge me-1"
+                        [class.text-bg-success]="!req.missing_roles.includes(role.slug)"
+                        [class.text-bg-danger]="req.missing_roles.includes(role.slug)"
+                      >
+                        {{ role.name }}
+                      </span>
+                    }
+                  </div>
+                  @if (req.team_satisfies) {
+                    <div class="small text-success">
+                      <i class="bi bi-check-circle"></i>
+                      Your team covers the required roles.
+                    </div>
+                  } @else {
+                    <div class="small text-danger">
+                      <i class="bi bi-exclamation-triangle"></i>
+                      Your team is missing: {{ req.missing_roles.join(', ') }}.
+                      Ask staff to assign the role, then try again.
+                    </div>
+                  }
+                }
               </div>
             </div>
 

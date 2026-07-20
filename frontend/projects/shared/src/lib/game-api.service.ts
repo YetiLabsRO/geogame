@@ -2,6 +2,14 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
+export interface RoleRequirementInfo {
+  mode: 'ALL' | 'ANY';
+  required_roles: { slug: string; name: string }[];
+  require_holders_present: boolean;
+  team_satisfies: boolean;
+  missing_roles: string[];
+}
+
 export interface TowerState {
   id: number;
   name: string;
@@ -9,7 +17,13 @@ export interface TowerState {
   location: { type: 'Point'; coordinates: [number, number] };
   has_initial_bonus: boolean;
   ownership: { team_id: number; team_name: string; team_color: string } | null;
-  next_challenge: { id: number; text: string; difficulty: number; tower: number | null } | null;
+  next_challenge: {
+    id: number;
+    text: string;
+    difficulty: number;
+    tower: number | null;
+    role_requirement: RoleRequirementInfo | null;
+  } | null;
   pending_submission: boolean;
   cooloff_until: string | null;
   proximity_meters: number;
@@ -132,6 +146,38 @@ export class GameApiService {
   teams(): Observable<TeamSummary[]> {
     return this.http.get<TeamSummary[]>('/api/teams/');
   }
+
+  myTeam(): Observable<MyTeam> {
+    return this.http.get<MyTeam>('/api/my-team/');
+  }
+}
+
+// ---- team-roles ------------------------------------------------------------
+
+export interface MemberRole {
+  id: number;
+  slug: string;
+  name: string;
+  builtin_power?: string;
+}
+
+export interface MyTeamMember {
+  user_id: number;
+  username: string;
+  first_name: string;
+  last_name: string;
+  joined_at: string;
+  roles: MemberRole[];
+}
+
+export interface MyTeam {
+  id: number;
+  name: string;
+  color: string;
+  score: number;
+  current_score: number;
+  members: MyTeamMember[];
+  can_invite: boolean;
 }
 
 export interface SessionScoreboardEntry {
@@ -166,6 +212,12 @@ export interface SessionTimeline {
   events: SessionTimelineEvent[];
 }
 
+export interface TeamSummaryMember {
+  user_id: number;
+  username: string;
+  roles: { id: number; slug: string; name: string }[];
+}
+
 export interface TeamSummary {
   id: number;
   name: string;
@@ -174,4 +226,5 @@ export interface TeamSummary {
   group_slug: string | null;
   current_score: number;
   color: string;
+  members: TeamSummaryMember[];
 }

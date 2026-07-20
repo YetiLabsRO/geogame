@@ -10,6 +10,13 @@ export interface AuthResponse {
   username: string;
 }
 
+export interface ActiveRole {
+  id: number;
+  slug: string;
+  name: string;
+  builtin_power: string;
+}
+
 export interface UserProfile {
   id: number;
   username: string;
@@ -19,6 +26,7 @@ export interface UserProfile {
   current_session: number | null;
   current_game: number | null;
   active_team_id: number | null;
+  active_roles: ActiveRole[];
   is_staff: boolean;
 }
 
