@@ -560,13 +560,18 @@ class PauseWindow(models.Model):
                     # Lock the floating earned up to the pause into the score.
                     zo.team.update_score(zo.get_score())
 
-            return cls.objects.create(
+            window = cls.objects.create(
                 session=session,
                 started_at=when,
                 restore_on_resume=restore,
                 tower_ownerships=[list(p) for p in tower_pairs] if restore else [],
                 zone_ownerships=[list(p) for p in zone_pairs] if restore else [],
             )
+            # Keep the explicit lifecycle state in lockstep with the
+            # open-window predicate (session-lifecycle invariant).
+            session.state = session.PAUSED
+            session.save(update_fields=['state'])
+            return window
 
     @classmethod
     def resume_session(cls, session, when=None):
@@ -580,6 +585,9 @@ class PauseWindow(models.Model):
             window.save(update_fields=['ended_at'])
             if window.restore_on_resume:
                 window._reopen_ownerships(when)
+            # Lockstep with the lifecycle state (see pause_session).
+            session.state = session.RUNNING
+            session.save(update_fields=['state'])
         return window
 
     def _reopen_ownerships(self, when):

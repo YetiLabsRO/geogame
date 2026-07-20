@@ -66,7 +66,7 @@ class Command(BaseCommand):
             name=f'{MARKER}-default-session',
             start_time=now - timedelta(hours=1),
             end_time=now + timedelta(hours=4),
-            is_active=True,
+            state=Session.RUNNING,
         )
         group = TeamGroup.objects.create(
             name=f'{MARKER} Explorers', game=game, slug=f'{MARKER}-explo',

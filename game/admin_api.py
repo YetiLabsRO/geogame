@@ -3,13 +3,13 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.models import (
     Challenge,
-    PauseWindow,
     TeamTowerFailCounter,
     TeamTowerOwnership,
     TeamZoneOwnership,
@@ -17,7 +17,15 @@ from game.models import (
     Zone,
 )
 from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
-from organize.models import Game, Session, Team, TeamGroup
+from organize.models import Game, IllegalTransition, Session, Team, TeamGroup
+
+
+class RosterClosedError(APIException):
+    """Team creation attempted while the session's roster is closed."""
+
+    status_code = 409
+    default_detail = 'Team rosters are closed in this session state.'
+    default_code = 'roster_closed'
 
 
 class AdminZoneSerializer(serializers.ModelSerializer):
@@ -101,12 +109,26 @@ class AdminTowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
 
 
 class AdminTeamViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for Teams."""
+    """Staff-only CRUD for Teams.
+
+    Team creation follows the session lifecycle: rosters form while the
+    Session is OPEN_FOR_PARTICIPANTS (and, for now, while RUNNING or
+    PAUSED); DRAFT and FINISHED reject creation with 409.
+    """
 
     permission_classes = [IsAdminUser]
     queryset = Team.objects.all().order_by('name')
     serializer_class = AdminTeamSerializer
     session_scope_field = 'session'
+
+    def perform_create(self, serializer):
+        session = serializer.validated_data.get('session')
+        if session is not None and not session.accepts_roster_changes():
+            raise RosterClosedError(
+                f'Teams cannot be created while the session is {session.state}. '
+                'Open participation first.',
+            )
+        serializer.save()
 
 
 class AdminTeamGroupList(GameScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
@@ -232,25 +254,35 @@ class AdminGameViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'])
     def pause_all(self, request, pk=None):
-        """Pause every active Session of this Game in one call (§20.1)."""
+        """Pause every RUNNING Session of this Game in one call (§20.1).
+
+        Routed through the same `pause` lifecycle transition as the
+        per-session endpoint so every affected Session lands in PAUSED
+        with its open PauseWindow (session-lifecycle invariant).
+        """
         game = self.get_object()
         paused = []
-        for session in game.sessions.filter(is_active=True):
-            if PauseWindow.pause_session(session) is not None:
-                paused.append(session.id)
+        for session in game.sessions.filter(state=Session.RUNNING):
+            session.transition('pause', actor=request.user)
+            paused.append(session.id)
         return Response({'paused_sessions': paused}, status=status.HTTP_200_OK)
 
 
 class AdminSessionSerializer(serializers.ModelSerializer):
     game_slug = serializers.CharField(source='game.slug', read_only=True)
     game_name = serializers.CharField(source='game.name', read_only=True)
+    # Lifecycle: `state` changes only through the transition actions, and
+    # `is_active` is a derived read-only property of it.
+    is_active = serializers.BooleanField(read_only=True)
     is_paused = serializers.SerializerMethodField()
+    allowed_transitions = serializers.SerializerMethodField()
 
     class Meta:
         model = Session
         fields = (
             'id', 'game', 'game_slug', 'game_name',
-            'slug', 'name', 'start_time', 'end_time', 'is_active',
+            'slug', 'name', 'start_time', 'end_time', 'scheduled_start',
+            'state', 'allowed_transitions', 'is_active',
             'is_paused',
             # Phase 10 per-session overrides (null = inherit Game default).
             'pause_freezes_floating_score',
@@ -261,22 +293,29 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'fail_counter_reset',
             'created_at',
         )
-        read_only_fields = ('created_at', 'game_slug', 'game_name', 'is_paused')
+        read_only_fields = (
+            'created_at', 'game_slug', 'game_name', 'state',
+            'allowed_transitions', 'is_active', 'is_paused',
+        )
 
     def get_is_paused(self, session):
-        return PauseWindow.is_paused(session)
+        return session.is_paused()
+
+    def get_allowed_transitions(self, session):
+        return session.allowed_transitions
 
 
 class AdminSessionViewSet(viewsets.ModelViewSet):
-    """Staff-only CRUD for Sessions.
+    """Staff-only CRUD + lifecycle transitions for Sessions.
 
     Not session-scoped for the same reason as AdminGameViewSet.
-    Accepts ?game=<id> to filter to one Game's sessions for the UI.
+    Accepts ?game=<id> to filter to one Game's sessions for the UI;
+    ?is_active=true|false filters on the derived active-state set, and
+    ?state=<STATE> on the exact lifecycle state.
 
-    Deactivating a session (is_active True → False) closes every open
-    TeamTowerOwnership / TeamZoneOwnership for teams in that session
-    and locks in floating scores. Mirrors unassign_all but scoped to
-    the session.
+    The lifecycle `state` is never writable through create/update — it
+    changes only through the transition actions below, each mapping one
+    edge of the Session.TRANSITIONS table; illegal transitions are 409.
     """
 
     permission_classes = [IsAdminUser]
@@ -291,37 +330,63 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
         is_active = self.request.query_params.get('is_active')
         if is_active is not None:
             if is_active.lower() in ('true', '1'):
-                qs = qs.filter(is_active=True)
+                qs = qs.filter(state__in=Session.ACTIVE_STATES)
             elif is_active.lower() in ('false', '0'):
-                qs = qs.filter(is_active=False)
+                qs = qs.exclude(state__in=Session.ACTIVE_STATES)
+        state = self.request.query_params.get('state')
+        if state:
+            qs = qs.filter(state=state.upper())
         return qs
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
 
-    @action(detail=True, methods=['post'])
-    def pause(self, request, pk=None):
-        """Open a PauseWindow on this Session (§20.1)."""
+    # ---- Lifecycle transition actions (session-lifecycle) ------------------
+
+    def _transition(self, request, action_name):
+        """Drive one lifecycle action; 409 on illegal transitions."""
         session = self.get_object()
-        window = PauseWindow.pause_session(session)
-        if window is None:
-            return Response(
-                {'detail': 'Session is already paused.'},
-                status=status.HTTP_409_CONFLICT,
+        override = bool(request.data.get('override', False))
+        try:
+            session.transition(
+                action_name, actor=request.user, override=override,
             )
+        except IllegalTransition as exc:
+            payload = {'detail': str(exc)}
+            if exc.requires_override:
+                payload['requires_override'] = True
+            return Response(payload, status=status.HTTP_409_CONFLICT)
         return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=['post'])
+    def open_participation(self, request, pk=None):
+        """DRAFT → OPEN_FOR_PARTICIPANTS: open the roster window."""
+        return self._transition(request, 'open_participation')
+
+    @action(detail=True, methods=['post'])
+    def close_participation(self, request, pk=None):
+        """OPEN_FOR_PARTICIPANTS → DRAFT: re-close the roster window."""
+        return self._transition(request, 'close_participation')
+
+    @action(detail=True, methods=['post'])
+    def start(self, request, pk=None):
+        """OPEN_FOR_PARTICIPANTS → RUNNING: start the Session clock."""
+        return self._transition(request, 'start')
+
+    @action(detail=True, methods=['post'])
+    def finish(self, request, pk=None):
+        """RUNNING|PAUSED → FINISHED: close ownerships, keep history."""
+        return self._transition(request, 'finish')
+
+    @action(detail=True, methods=['post'])
+    def pause(self, request, pk=None):
+        """RUNNING → PAUSED: open a PauseWindow atomically (§20.1)."""
+        return self._transition(request, 'pause')
+
+    @action(detail=True, methods=['post'])
     def resume(self, request, pk=None):
-        """Close the open PauseWindow, restoring ownerships if configured."""
-        session = self.get_object()
-        window = PauseWindow.resume_session(session)
-        if window is None:
-            return Response(
-                {'detail': 'Session is not paused.'},
-                status=status.HTTP_409_CONFLICT,
-            )
-        return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
+        """PAUSED → RUNNING: close the newest open PauseWindow."""
+        return self._transition(request, 'resume')
 
     @action(detail=True, methods=['get'])
     def pause_history(self, request, pk=None):
@@ -337,7 +402,7 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
             for w in session.pause_windows.order_by('-started_at')
         ]
         return Response({
-            'is_paused': PauseWindow.is_paused(session),
+            'is_paused': session.is_paused(),
             'windows': windows,
         })
 
@@ -368,32 +433,3 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
         ]
         return Response(data)
 
-    @transaction.atomic
-    def perform_update(self, serializer):
-        # Read is_active straight from the DB so we're not sensitive to
-        # when the serializer mutates its own instance.
-        was_active = Session.objects.filter(pk=serializer.instance.pk).values_list(
-            'is_active', flat=True,
-        ).first()
-        session = serializer.save()
-        if was_active and not session.is_active:
-            self._close_ownerships(session)
-
-    def _close_ownerships(self, session):
-        now = timezone.now()
-        team_ids = list(session.teams.values_list('id', flat=True))
-
-        TeamTowerOwnership.objects.filter(
-            team_id__in=team_ids, timestamp_end__isnull=True,
-        ).update(timestamp_end=now)
-
-        # Zone ownerships lock in floating scores before they close.
-        zone_ownerships = list(
-            TeamZoneOwnership.objects
-            .filter(team_id__in=team_ids, timestamp_end__isnull=True)
-            .select_related('team', 'zone')
-        )
-        for zo in zone_ownerships:
-            zo.timestamp_end = now
-            zo.save()
-            zo.team.update_score(zo.get_score())

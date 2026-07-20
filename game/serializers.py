@@ -5,7 +5,6 @@ from rest_framework.exceptions import APIException
 
 from game.models import (
     Challenge,
-    PauseWindow,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     Tower,
@@ -187,9 +186,10 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
                 "pentru a putea face provocarea!",
             )
 
-        # Phase 10: paused-session gating.
+        # Phase 10: paused-session gating (lifecycle state is the source
+        # of truth; equivalent to the open-PauseWindow predicate).
         session = attrs['_team'].session
-        if PauseWindow.is_paused(session):
+        if session.is_paused():
             if session.effective('pause_rejects_submissions'):
                 raise SessionPausedError()
             # Accept but hold — do not capture until the session resumes.

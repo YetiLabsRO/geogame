@@ -4,7 +4,9 @@ from datetime import timedelta
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
-from django.test import TestCase
+from django.db import connection
+from django.db.migrations.executor import MigrationExecutor
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.encoding import force_bytes
@@ -36,7 +38,7 @@ def _make_game(name='Game A', slug=None):
 
 
 def _default_session(game):
-    from organize.models import Session
+    """Create-or-get the default Session, RUNNING so joins/scoring work."""
     session = Session.objects.filter(game=game, slug='default').first()
     if session is None:
         now = timezone.now()
@@ -46,7 +48,7 @@ def _default_session(game):
             name='Default session',
             start_time=now,
             end_time=now + timedelta(hours=1),
-            is_active=game.is_active,
+            state=Session.RUNNING,
         )
     return session
 
@@ -290,13 +292,13 @@ class TeamMembershipUniquenessTest(TestCase):
         self.session_a = Session.objects.create(
             game=self.game, slug='morning', name='Morning',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.session_b = Session.objects.create(
             game=self.game, slug='afternoon', name='Afternoon',
             start_time=now + timedelta(hours=2),
             end_time=now + timedelta(hours=4),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.team_a = Team.objects.create(
             name='a', session=self.session_a, color='#111',
@@ -345,7 +347,7 @@ class TeamMembershipUniquenessTest(TestCase):
         other_session = Session.objects.create(
             game=other_game, slug='default', name='O',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         other_team = Team.objects.create(
             name='o', session=other_session, color='#333',
@@ -370,18 +372,17 @@ class SessionModelTest(TestCase):
         self.game = _make_game()
 
     def test_can_host_multiple_sessions_per_game(self):
-        from organize.models import Session
         now = timezone.now()
         s1 = Session.objects.create(
             game=self.game, slug='morning', name='Morning',
             start_time=now, end_time=now + timedelta(hours=2),
-            is_active=True,
+            state=Session.RUNNING,
         )
         s2 = Session.objects.create(
             game=self.game, slug='afternoon', name='Afternoon',
             start_time=now + timedelta(hours=3),
             end_time=now + timedelta(hours=5),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.assertEqual(self.game.sessions.count(), 2)
         self.assertNotEqual(s1.pk, s2.pk)
@@ -464,7 +465,7 @@ class CurrentSessionTest(TestCase):
         self.session = Session.objects.create(
             game=self.game, slug='default', name='Live default',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         # Give the tester an active membership so the auto-resolver has
         # a candidate. Dedicated tests below cover the 0- and multi-
@@ -499,7 +500,7 @@ class CurrentSessionTest(TestCase):
         )
 
     def test_get_404_when_no_active_session(self):
-        self.session.is_active = False
+        self.session.state = Session.FINISHED
         self.session.save()
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 404)
@@ -549,7 +550,7 @@ class CurrentSessionAutoResolveTest(TestCase):
         return Session.objects.create(
             game=game, slug=slug, name=slug.title(),
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=active,
+            state=Session.RUNNING if active else Session.FINISHED,
         )
 
     def _join(self, session, name='team'):
@@ -644,13 +645,13 @@ class SessionHistoryTest(TestCase):
         self.session = Session.objects.create(
             game=self.game, slug='default', name='Default',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.past_session = Session.objects.create(
             game=self.game, slug='past', name='Past',
             start_time=now - timedelta(days=7),
             end_time=now - timedelta(days=6),
-            is_active=False,
+            state=Session.FINISHED,
         )
         self.team = Team.objects.create(
             name='alpha', session=self.session, color='#111',
@@ -889,7 +890,7 @@ class InviteAPITest(TestCase):
             game=self.team.session.game,
             slug='second', name='Second',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         second_team = Team.objects.create(
             name='rival', session=second_session, color='#888',
@@ -994,3 +995,64 @@ class InviteModelTest(TestCase):
             accepted_by=self.creator, accepted_at=timezone.now(),
         )
         self.assertFalse(invite.is_usable())
+
+
+class SessionStateMigrationTest(TransactionTestCase):
+    """game-lifecycle-states 7.2 — the 0012 backfill maps the legacy
+    boolean (and open pause windows) onto the new lifecycle states, and
+    the derived-active set matches the pre-migration is_active set."""
+
+    migrate_from = [
+        ('organize', '0011_session_state'),
+        ('game', '0021_pausewindow_teamtowerfailcounter'),
+    ]
+    migrate_to = [('organize', '0012_backfill_session_state')]
+
+    def _executor(self):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        return executor
+
+    def tearDown(self):
+        # Return the schema to the latest migration for the tests after us.
+        executor = self._executor()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_backfill_maps_boolean_and_open_windows_to_states(self):
+        executor = self._executor()
+        executor.migrate(self.migrate_from)
+        old_apps = executor.loader.project_state(self.migrate_from).apps
+        OldGame = old_apps.get_model('organize', 'Game')
+        OldSession = old_apps.get_model('organize', 'Session')
+        OldPauseWindow = old_apps.get_model('game', 'PauseWindow')
+
+        now = timezone.now()
+        game = OldGame.objects.create(name='Mig', slug='mig-state')
+
+        def _make(slug, active):
+            return OldSession.objects.create(
+                game=game, slug=slug, name=slug.title(),
+                start_time=now, end_time=now + timedelta(hours=1),
+                is_active=active,
+            )
+
+        running = _make('running', True)
+        finished = _make('finished', False)
+        paused = _make('paused', True)
+        OldPauseWindow.objects.create(session_id=paused.id, started_at=now)
+        active_before = {running.id, paused.id}
+
+        executor = self._executor()
+        executor.migrate(self.migrate_to)
+
+        states = dict(Session.objects.values_list('id', 'state'))
+        self.assertEqual(states[running.id], Session.RUNNING)
+        self.assertEqual(states[finished.id], Session.FINISHED)
+        self.assertEqual(states[paused.id], Session.PAUSED)
+        # The same set of Sessions is "active" (derived) after migration.
+        derived_active = {
+            session_id for session_id, state in states.items()
+            if state in Session.ACTIVE_STATES
+        }
+        self.assertEqual(derived_active, active_before)

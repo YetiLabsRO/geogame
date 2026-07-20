@@ -12,8 +12,8 @@ class GameAdmin(admin.ModelAdmin):
 
 @admin.register(Session)
 class SessionAdmin(admin.ModelAdmin):
-    list_display = ('name', 'game', 'slug', 'is_active', 'start_time', 'end_time')
-    list_filter = ('is_active', 'game')
+    list_display = ('name', 'game', 'slug', 'state', 'is_active', 'start_time', 'scheduled_start', 'end_time')
+    list_filter = ('state', 'game')
     search_fields = ('name', 'slug', 'game__name')
     autocomplete_fields = ('game', 'created_by')
 
