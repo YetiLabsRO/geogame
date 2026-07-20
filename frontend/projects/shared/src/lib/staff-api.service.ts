@@ -59,12 +59,50 @@ export interface AdminTeamGroup {
   slug: string;
 }
 
+export type RoleRequirementMode = 'NONE' | 'ALL' | 'ANY';
+
 export interface AdminChallenge {
   id: number;
   game: number | null;
   text: string;
   tower: number | null;
   difficulty: number;
+  role_requirement_mode: RoleRequirementMode;
+  required_roles: number[];
+  require_holders_present: boolean;
+}
+
+export type BuiltinPower = 'NONE' | 'INVITER';
+
+export interface AdminGameRole {
+  id: number;
+  game: number;
+  name: string;
+  slug: string;
+  description: string;
+  builtin_power: BuiltinPower;
+  created_at: string | null;
+}
+
+export type AdminGameRolePayload = Partial<Omit<AdminGameRole, 'id' | 'created_at'>>;
+
+export interface RoleSummary {
+  id: number;
+  slug: string;
+  name: string;
+  builtin_power: BuiltinPower;
+}
+
+export interface AdminMembership {
+  id: number;
+  team: number;
+  user: number;
+  username: string;
+  first_name: string;
+  last_name: string;
+  is_active: boolean;
+  joined_at: string;
+  roles: RoleSummary[];
 }
 
 export type FailCounterReset =
@@ -227,6 +265,44 @@ export class StaffApiService {
 
   deleteChallenge(id: number): Observable<void> {
     return this.http.delete<void>(`/api/staff/challenges/${id}/`);
+  }
+
+  // ---- team-roles: role definitions + roster assignment --------------------
+
+  listGameRoles(gameId?: number): Observable<AdminGameRole[]> {
+    const query = gameId ? `?game=${gameId}` : '';
+    return this.http.get<AdminGameRole[]>(`/api/staff/game_roles/${query}`);
+  }
+
+  createGameRole(payload: AdminGameRolePayload): Observable<AdminGameRole> {
+    return this.http.post<AdminGameRole>('/api/staff/game_roles/', payload);
+  }
+
+  updateGameRole(id: number, patch: AdminGameRolePayload): Observable<AdminGameRole> {
+    return this.http.patch<AdminGameRole>(`/api/staff/game_roles/${id}/`, patch);
+  }
+
+  deleteGameRole(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/game_roles/${id}/`);
+  }
+
+  listMemberships(teamId?: number): Observable<AdminMembership[]> {
+    const query = teamId ? `?team=${teamId}` : '';
+    return this.http.get<AdminMembership[]>(`/api/staff/memberships/${query}`);
+  }
+
+  assignRole(membershipId: number, roleId: number): Observable<AdminMembership> {
+    return this.http.post<AdminMembership>(
+      `/api/staff/memberships/${membershipId}/assign_role/`,
+      { role: roleId },
+    );
+  }
+
+  unassignRole(membershipId: number, roleId: number): Observable<AdminMembership> {
+    return this.http.post<AdminMembership>(
+      `/api/staff/memberships/${membershipId}/unassign_role/`,
+      { role: roleId },
+    );
   }
 
   resetScores(): Observable<{ teams_reset: number }> {

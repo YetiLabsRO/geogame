@@ -1,6 +1,14 @@
 from django.contrib import admin
 
-from organize.models import Game, Invite, Session, TeamMembership, UserProfile
+from organize.models import (
+    Game,
+    GameRole,
+    Invite,
+    Session,
+    TeamMembership,
+    TeamRole,
+    UserProfile,
+)
 
 
 @admin.register(Game)
@@ -27,6 +35,21 @@ class UserProfileAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at', 'updated_at')
 
 
+@admin.register(GameRole)
+class GameRoleAdmin(admin.ModelAdmin):
+    list_display = ('name', 'game', 'slug', 'builtin_power', 'created_at')
+    list_filter = ('game', 'builtin_power')
+    search_fields = ('name', 'slug', 'game__name')
+    readonly_fields = ('created_at',)
+
+
+class TeamRoleInline(admin.TabularInline):
+    model = TeamRole
+    extra = 0
+    autocomplete_fields = ('role', 'assigned_by')
+    readonly_fields = ('assigned_at',)
+
+
 @admin.register(TeamMembership)
 class TeamMembershipAdmin(admin.ModelAdmin):
     list_display = ('team', 'user', 'is_active', 'joined_at', 'left_at')
@@ -34,6 +57,16 @@ class TeamMembershipAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'user__user__username', 'user__user__email')
     autocomplete_fields = ('team', 'user')
     readonly_fields = ('joined_at',)
+    inlines = (TeamRoleInline,)
+
+
+@admin.register(TeamRole)
+class TeamRoleAdmin(admin.ModelAdmin):
+    list_display = ('membership', 'role', 'assigned_by', 'assigned_at')
+    list_filter = ('role__game', 'role')
+    search_fields = ('membership__team__name', 'membership__user__user__username', 'role__slug')
+    autocomplete_fields = ('membership', 'role', 'assigned_by')
+    readonly_fields = ('assigned_at',)
 
 
 @admin.register(Invite)

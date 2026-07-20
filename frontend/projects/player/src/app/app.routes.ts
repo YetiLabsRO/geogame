@@ -25,6 +25,12 @@ export const routes: Routes = [
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },
   {
+    path: 'team',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./team/my-team.component').then((m) => m.MyTeamComponent),
+  },
+  {
     path: 'pick-session',
     canActivate: [authGuard],
     loadComponent: () =>

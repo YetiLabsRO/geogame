@@ -3,7 +3,8 @@ import uuid
 from colorfield.fields import ColorField
 from django.conf import settings
 from django.contrib.gis.db.models import PointField
-from django.db import models
+from django.core.exceptions import ValidationError
+from django.db import models, transaction
 from django.db.models import ManyToManyField
 from django.utils import timezone
 
@@ -15,6 +16,16 @@ FAIL_RESET_CHOICES = [
     (FAIL_RESET_TOWER_SUCCESS_ONLY, 'Reset only on a confirmed submission at the same tower'),
     (FAIL_RESET_ANY_SUCCESS_ELSEWHERE, 'Also reset on a confirmed submission at any other tower'),
     (FAIL_RESET_ANY_ATTEMPT_ELSEWHERE, 'Also reset on any submission at any other tower'),
+]
+
+# Built-in role powers (team-roles-as-mechanics). Most GameRoles are
+# arbitrary flavor with no engine behavior (NONE); a few opt into a
+# known power. New powers become new enum values, not new models.
+BUILTIN_POWER_NONE = 'NONE'
+BUILTIN_POWER_INVITER = 'INVITER'
+BUILTIN_POWER_CHOICES = [
+    (BUILTIN_POWER_NONE, 'No built-in power'),
+    (BUILTIN_POWER_INVITER, 'Inviter — may invite players into their team'),
 ]
 
 # Config fields that live on Game as defaults and are overridable per
@@ -82,6 +93,88 @@ class Game(models.Model):
     def __str__(self):
         return self.name
 
+    def clone(self, slug, name=None, created_by=None):
+        """Deep-copy this Game template.
+
+        Copies config fields, TeamGroups, GameRoles, and Challenges,
+        remapping each cloned Challenge's `required_roles` to the
+        clone's own roles so the clone never references the original's
+        roles. Zones/Towers are not cloned yet — that belongs to the
+        `game-authoring-roles` capability, which extends this routine;
+        until then tower-linked challenges are copied as generic
+        (tower=None).
+        """
+        from game.models import Challenge
+
+        with transaction.atomic():
+            clone = Game.objects.get(pk=self.pk)
+            clone.pk = None
+            clone._state.adding = True
+            clone.slug = slug
+            clone.name = name or f'{self.name} (copy)'
+            clone.is_active = False
+            clone.created_by = created_by
+            clone.created_at = None  # auto_now_add repopulates on save
+            clone.save()
+
+            for group in TeamGroup.objects.filter(game=self):
+                TeamGroup.objects.create(game=clone, name=group.name, slug=group.slug)
+
+            role_map = {}
+            for role in self.roles.all():
+                role_map[role.pk] = GameRole.objects.create(
+                    game=clone,
+                    name=role.name,
+                    slug=role.slug,
+                    description=role.description,
+                    builtin_power=role.builtin_power,
+                )
+
+            challenges = Challenge.objects.filter(game=self).prefetch_related('required_roles')
+            for challenge in challenges:
+                required = list(challenge.required_roles.all())
+                challenge_clone = Challenge.objects.create(
+                    game=clone,
+                    text=challenge.text,
+                    tower=None,
+                    difficulty=challenge.difficulty,
+                    role_requirement_mode=challenge.role_requirement_mode,
+                    require_holders_present=challenge.require_holders_present,
+                )
+                if required:
+                    challenge_clone.required_roles.set(
+                        [role_map[r.pk] for r in required],
+                    )
+            return clone
+
+
+class GameRole(models.Model):
+    """A creator-defined, per-Game in-game role (COOK, NAVIGATOR, …).
+
+    Part of the Game template's authored rule set — mirrors TeamGroup's
+    per-Game shape so authoring and cloning behave consistently. Not a
+    staff/admin permission: `builtin_power` opts a role into a known
+    engine behavior (currently only INVITER); everything else is flavor
+    usable purely through challenge role requirements.
+    """
+
+    game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='roles')
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=64)
+    description = models.TextField(blank=True, default='')
+    builtin_power = models.CharField(
+        max_length=16,
+        choices=BUILTIN_POWER_CHOICES,
+        default=BUILTIN_POWER_NONE,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (('game', 'slug'),)
+
+    def __str__(self):
+        return f'{self.game.slug}/{self.slug}'
+
 
 class UserProfile(models.Model):
     user = models.OneToOneField(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='profile')
@@ -99,6 +192,24 @@ class UserProfile(models.Model):
 
     def __str__(self):
         return self.user.get_username()
+
+    def can_invite_to(self, team):
+        """INVITER built-in power: may this user create invites for `team`?
+
+        True for staff (the pre-existing path, unchanged), or when the
+        user's ACTIVE membership on that team holds a role whose
+        `builtin_power` is INVITER. With no INVITER role defined or
+        assigned this returns False for non-staff — invite creation
+        stays staff-only exactly as before this change.
+        """
+        if self.user.is_staff:
+            return True
+        return TeamRole.objects.filter(
+            membership__user=self,
+            membership__team=team,
+            membership__is_active=True,
+            role__builtin_power=BUILTIN_POWER_INVITER,
+        ).exists()
 
 
 class TeamGroup(models.Model):
@@ -208,6 +319,18 @@ class Team(models.Model):
     def current_score(self):
         return round(self.score + self.floating_score(), 2)
 
+    def active_role_slugs(self):
+        """Distinct role slugs held by this team's ACTIVE memberships.
+
+        The unit of role coverage for rule evaluation: head-count never
+        matters, only which distinct roles the active roster covers.
+        """
+        return set(
+            TeamRole.objects.filter(
+                membership__team=self, membership__is_active=True,
+            ).values_list('role__slug', flat=True),
+        )
+
 
 class TeamMembership(models.Model):
     team = models.ForeignKey(Team, on_delete=models.CASCADE, related_name='memberships')
@@ -245,6 +368,67 @@ class TeamMembership(models.Model):
         if self.team_id is not None:
             self.game_id = self.team.session.game_id
         super().save(*args, **kwargs)
+
+    def role_slugs(self):
+        """Slugs of the GameRoles this membership holds."""
+        return list(self.roles.values_list('role__slug', flat=True))
+
+
+class TeamRole(models.Model):
+    """Assignment of a GameRole to a specific TeamMembership.
+
+    "This member, in this team, in this run, holds this role." Attached
+    to the membership (not the Team or the user globally) so roles
+    travel with the roster, respect the membership lifecycle
+    (`is_active`/`left_at`), and never leak across Sessions.
+    """
+
+    membership = models.ForeignKey(
+        TeamMembership, on_delete=models.CASCADE, related_name='roles',
+    )
+    role = models.ForeignKey(
+        GameRole, on_delete=models.CASCADE, related_name='assignments',
+    )
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='team_roles_assigned',
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (('membership', 'role'),)
+
+    def __str__(self):
+        return f'{self.membership} as {self.role.slug}'
+
+    def clean(self):
+        if self.role_id is not None and self.membership_id is not None:
+            if self.role.game_id != self.membership.game_id:
+                raise ValidationError(
+                    'Role must belong to the same Game as the membership.',
+                )
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+
+def user_can_invite_to_team(user, team):
+    """May `user` create invites for `team`? Staff, or INVITER holder.
+
+    Seam for the invite flow (coordinates with the `team-invites` /
+    `team-formation` capabilities): call this wherever invite creation
+    is authorized instead of a bare `is_staff` check.
+    """
+    if user is None or not user.is_authenticated:
+        return False
+    profile = getattr(user, 'profile', None)
+    if profile is None:
+        return user.is_staff
+    return profile.can_invite_to(team)
 
 
 def _default_invite_expiry():

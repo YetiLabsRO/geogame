@@ -10,13 +10,20 @@ from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import generics, serializers, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import (
+    SAFE_METHODS,
+    AllowAny,
+    BasePermission,
+    IsAdminUser,
+    IsAuthenticated,
+)
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.scoping import SessionScopedViewSetMixin
 from organize.emails import send_invite_email
-from organize.models import Invite, TeamMembership
+from organize.models import Invite, TeamMembership, user_can_invite_to_team
 
 User = get_user_model()
 
@@ -66,15 +73,26 @@ class UserProfileSerializer(serializers.Serializer):
     current_session = serializers.PrimaryKeyRelatedField(read_only=True)
     current_game = serializers.SerializerMethodField()
     active_team_id = serializers.SerializerMethodField()
+    active_roles = serializers.SerializerMethodField()
     is_staff = serializers.BooleanField(source='user.is_staff', read_only=True)
 
     def get_current_game(self, profile):
         session = profile.current_session
         return session.game_id if session is not None else None
 
+    def _active_membership(self, profile):
+        return profile.memberships.filter(is_active=True).select_related('team').first()
+
     def get_active_team_id(self, profile):
-        membership = profile.memberships.filter(is_active=True).select_related('team').first()
+        membership = self._active_membership(profile)
         return membership.team_id if membership else None
+
+    def get_active_roles(self, profile):
+        """In-game roles held on the caller's active membership."""
+        membership = self._active_membership(profile)
+        if membership is None:
+            return []
+        return _membership_roles(membership)
 
     def update(self, profile, validated_data):
         user_data = validated_data.pop('user', {})
@@ -84,12 +102,29 @@ class UserProfileSerializer(serializers.Serializer):
         return profile
 
 
+def _membership_roles(membership):
+    """Serialize a membership's held GameRoles for API payloads."""
+    return [
+        {
+            'id': tr.role.id,
+            'slug': tr.role.slug,
+            'name': tr.role.name,
+            'builtin_power': tr.role.builtin_power,
+        }
+        for tr in membership.roles.select_related('role').all()
+    ]
+
+
 class TeamMemberSerializer(serializers.Serializer):
     user_id = serializers.IntegerField(source='user.user.id')
     username = serializers.CharField(source='user.user.username')
     first_name = serializers.CharField(source='user.user.first_name')
     last_name = serializers.CharField(source='user.user.last_name')
     joined_at = serializers.DateTimeField()
+    roles = serializers.SerializerMethodField()
+
+    def get_roles(self, membership):
+        return _membership_roles(membership)
 
 
 class MyTeamSerializer(serializers.Serializer):
@@ -99,13 +134,26 @@ class MyTeamSerializer(serializers.Serializer):
     score = serializers.IntegerField()
     current_score = serializers.SerializerMethodField()
     members = serializers.SerializerMethodField()
+    can_invite = serializers.SerializerMethodField()
 
     def get_current_score(self, team):
         return team.current_score()
 
     def get_members(self, team):
-        active = team.memberships.filter(is_active=True).select_related('user__user')
+        active = (
+            team.memberships
+            .filter(is_active=True)
+            .select_related('user__user')
+            .prefetch_related('roles__role')
+        )
         return TeamMemberSerializer(active, many=True).data
+
+    def get_can_invite(self, team):
+        """INVITER affordance: may the caller create invites for this team?"""
+        request = self.context.get('request')
+        if request is None:
+            return False
+        return user_can_invite_to_team(request.user, team)
 
 
 # ---------- Views ----------
@@ -231,7 +279,9 @@ class MyTeamView(APIView):
             return Response(
                 {'detail': 'You are not a member of any team.'}, status=status.HTTP_404_NOT_FOUND,
             )
-        return Response(MyTeamSerializer(membership.team).data)
+        return Response(
+            MyTeamSerializer(membership.team, context={'request': request}).data,
+        )
 
 
 class GameConfigSerializer(serializers.Serializer):
@@ -578,9 +628,30 @@ class InviteAcceptSerializer(serializers.Serializer):
     last_name = serializers.CharField(required=False, allow_blank=True)
 
 
+class InviteCreatePermission(BasePermission):
+    """Staff everywhere; authenticated players may POST (INVITER power).
+
+    Listing stays staff-only. A non-staff POST is allowed through here
+    and then object-checked in `perform_create` against
+    `user_can_invite_to_team` — holders of a role with
+    `builtin_power=INVITER` may create invites for their own team; with
+    no INVITER role assigned, creation remains staff-only as before.
+    Deliberately a minimal hook: the invite flow itself is being
+    reworked by the `player-team-formation` change.
+    """
+
+    def has_permission(self, request, view):
+        user = request.user
+        if user is None or not user.is_authenticated:
+            return False
+        if user.is_staff:
+            return True
+        return request.method not in SAFE_METHODS
+
+
 class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
     serializer_class = InviteSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [InviteCreatePermission]
     queryset = Invite.objects.select_related('team', 'created_by', 'accepted_by')
     # Invites are scoped through the team's session. Staff viewing one
     # session's roster will not see invites intended for another
@@ -602,6 +673,11 @@ class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
         return qs
 
     def perform_create(self, serializer):
+        team = serializer.validated_data['team']
+        if not user_can_invite_to_team(self.request.user, team):
+            raise PermissionDenied(
+                'You may only create invites for a team where you hold an INVITER role.',
+            )
         invite = serializer.save(created_by=self.request.user)
         if invite.email:
             send_invite_email(invite)

@@ -64,19 +64,45 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 class TeamSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(source='group.name', read_only=True, default=None)
     group_slug = serializers.CharField(source='group.slug', read_only=True, default=None)
+    members = serializers.SerializerMethodField()
 
     class Meta:
         model = Team
         fields = [
             "id", "name", "group", "group_name", "group_slug",
-            "current_score", "color",
+            "current_score", "color", "members",
+        ]
+
+    def get_members(self, team):
+        """Active members with their in-game roles (team-roles)."""
+        memberships = (
+            team.memberships
+            .filter(is_active=True)
+            .select_related('user__user')
+            .prefetch_related('roles__role')
+        )
+        return [
+            {
+                'user_id': m.user.user.id,
+                'username': m.user.user.username,
+                'roles': [
+                    {'id': tr.role.id, 'slug': tr.role.slug, 'name': tr.role.name}
+                    for tr in m.roles.all()
+                ],
+            }
+            for m in memberships
         ]
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
+    required_role_slugs = serializers.SerializerMethodField()
+
     class Meta:
         model = Challenge
-        fields = ["text", "tower", "difficulty"]
+        fields = ["text", "tower", "difficulty", "role_requirement_mode", "required_role_slugs"]
+
+    def get_required_role_slugs(self, challenge):
+        return [role.slug for role in challenge.required_roles.all()]
 
 
 class Base64ImageField(serializers.ImageField):
@@ -119,6 +145,11 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
     derived from that membership — NEVER sent by the client. RFID captures
     send `rfid_code` and skip `tower`; the serializer resolves the matching
     active RFID tower and marks the submission CONFIRMED.
+
+    Check order: membership → tower/RFID resolution → GPS proximity →
+    challenge role requirement (team-roles) → paused session → failure
+    lockout. The role gate runs after proximity so "you are too far" wins
+    over "you lack a role", and before the pause/lockout state checks.
     """
 
     class Meta:
@@ -186,6 +217,23 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
                 f"Trebuie să fii la maxim {proximity} de metri de turn "
                 "pentru a putea face provocarea!",
             )
+
+        # team-roles: role-requirement gate. Evaluated on the submitting
+        # team's ACTIVE role holders, independent of head-count. A
+        # `require_holders_present` challenge defers the presence test to
+        # the presence-rules capability; until that ships, assignment
+        # alone suffices (the default path).
+        challenge = attrs.get('challenge')
+        if challenge is not None:
+            ok, missing = challenge.team_satisfies_roles(attrs['_team'])
+            if not ok:
+                raise serializers.ValidationError({
+                    'detail': (
+                        'Echipa nu îndeplinește rolurile cerute de provocare. '
+                        f"Roluri lipsă: {', '.join(missing)}."
+                    ),
+                    'missing_roles': missing,
+                })
 
         # Phase 10: paused-session gating.
         session = attrs['_team'].session

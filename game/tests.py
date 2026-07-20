@@ -34,6 +34,9 @@ from rest_framework.test import APIClient
 
 from game.admin import unassign_all
 from game.models import (
+    ROLE_REQUIREMENT_ALL,
+    ROLE_REQUIREMENT_ANY,
+    ROLE_REQUIREMENT_NONE,
     Challenge,
     PauseWindow,
     TeamTowerChallenge,
@@ -43,7 +46,15 @@ from game.models import (
     Tower,
     Zone,
 )
-from organize.models import Game, Session, Team, TeamGroup, TeamMembership
+from organize.models import (
+    Game,
+    GameRole,
+    Session,
+    Team,
+    TeamGroup,
+    TeamMembership,
+    TeamRole,
+)
 
 User = get_user_model()
 
@@ -2106,3 +2117,459 @@ class FailureConsequencesTest(TestCase):
         self.assertEqual(data[0]['consecutive_fails'], 1)
         self.assertTrue(data[0]['is_locked'])
         self.assertEqual(data[0]['tower_name'], self.tower.name)
+
+
+# ---------------------------------------------------------------------------
+# team-roles-as-mechanics — role gating, staff APIs, player surface
+# ---------------------------------------------------------------------------
+
+
+def _add_member(team, username):
+    """Create a user with an active membership on `team`; return the membership."""
+    user = User.objects.create_user(
+        username=username, email=f'{username}@example.com', password='password123',
+    )
+    return TeamMembership.objects.create(
+        team=team, user=user.profile, is_active=True,
+    )
+
+
+class TeamSatisfiesRolesTest(TestCase):
+    """8.2 — head-count-independent role coverage evaluation."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.medic = GameRole.objects.create(game=self.game, name='Medic', slug='medic')
+        self.navigator = GameRole.objects.create(
+            game=self.game, name='Navigator', slug='navigator',
+        )
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='task', difficulty=1,
+        )
+
+    def _set_requirement(self, mode, roles):
+        self.challenge.role_requirement_mode = mode
+        self.challenge.save()
+        self.challenge.required_roles.set(roles)
+
+    def test_none_mode_always_passes(self):
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    def test_non_none_mode_with_no_roles_passes(self):
+        # Defensive: config validation forbids this, but evaluation is a no-op.
+        self._set_requirement(ROLE_REQUIREMENT_ALL, [])
+        ok, _ = self.challenge.team_satisfies_roles(self.team)
+        self.assertTrue(ok)
+
+    def test_any_fails_when_no_required_role_held(self):
+        self._set_requirement(ROLE_REQUIREMENT_ANY, [self.cook, self.medic])
+        membership = _add_member(self.team, 'nav')
+        TeamRole.objects.create(membership=membership, role=self.navigator)
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertFalse(ok)
+        self.assertEqual(set(missing), {'cook', 'medic'})
+
+    def test_any_passes_on_one_covered_role(self):
+        self._set_requirement(ROLE_REQUIREMENT_ANY, [self.cook, self.medic])
+        membership = _add_member(self.team, 'doc')
+        TeamRole.objects.create(membership=membership, role=self.medic)
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    def test_all_fails_until_every_role_covered(self):
+        self._set_requirement(ROLE_REQUIREMENT_ALL, [self.cook, self.medic])
+        m1 = _add_member(self.team, 'chef')
+        TeamRole.objects.create(membership=m1, role=self.cook)
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertFalse(ok)
+        self.assertEqual(missing, ['medic'])
+
+        m2 = _add_member(self.team, 'doc')
+        TeamRole.objects.create(membership=m2, role=self.medic)
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertTrue(ok)
+        self.assertEqual(missing, [])
+
+    def test_one_member_holding_two_roles_satisfies_all(self):
+        self._set_requirement(ROLE_REQUIREMENT_ALL, [self.cook, self.medic])
+        membership = _add_member(self.team, 'hero')
+        TeamRole.objects.create(membership=membership, role=self.cook)
+        TeamRole.objects.create(membership=membership, role=self.medic)
+        ok, _ = self.challenge.team_satisfies_roles(self.team)
+        self.assertTrue(ok)
+
+    def test_many_members_holding_none_fail(self):
+        self._set_requirement(ROLE_REQUIREMENT_ALL, [self.cook])
+        for i in range(10):
+            _add_member(self.team, f'crowd{i}')
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertFalse(ok)
+        self.assertEqual(missing, ['cook'])
+
+    def test_inactive_holder_does_not_count(self):
+        self._set_requirement(ROLE_REQUIREMENT_ALL, [self.cook])
+        membership = _add_member(self.team, 'gone')
+        TeamRole.objects.create(membership=membership, role=self.cook)
+        membership.is_active = False
+        membership.left_at = timezone.now()
+        membership.save()
+        ok, missing = self.challenge.team_satisfies_roles(self.team)
+        self.assertFalse(ok)
+        self.assertEqual(missing, ['cook'])
+
+
+class RoleGatedSubmissionTest(TestCase):
+    """8.3 / 8.5 — submission-time enforcement with clear missing-role errors."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, lng=23.5, lat=46.5)
+        self.team = _make_team(self.game, self.group)
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='cook something', tower=self.tower, difficulty=1,
+            role_requirement_mode=ROLE_REQUIREMENT_ALL,
+        )
+        self.challenge.required_roles.set([self.cook])
+        self.client_api, self.user = _authed_client(self.team)
+        self.membership = TeamMembership.objects.get(
+            team=self.team, user=self.user.profile,
+        )
+
+    def _submit(self):
+        return self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+
+    def test_missing_role_refused_with_roles_named(self):
+        resp = self._submit()
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()['missing_roles'], ['cook'])
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_same_team_passes_after_assignment(self):
+        TeamRole.objects.create(membership=self.membership, role=self.cook)
+        resp = self._submit()
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertTrue(TeamTowerChallenge.objects.exists())
+
+    def test_default_none_mode_unchanged(self):
+        plain = Challenge.objects.create(
+            game=self.game, text='plain', tower=self.tower, difficulty=1,
+        )
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': plain.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+
+class AdminGameRolesEndpointTest(TestCase):
+    """5.1 — staff CRUD for per-Game role definitions."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.client_api, self.staff = _staff_client(self.session)
+
+    def test_requires_staff(self):
+        group = _make_group(self.game)
+        team = _make_team(self.game, group)
+        player_client, _ = _authed_client(team)
+        resp = player_client.get('/api/staff/game_roles/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_create_and_list_role(self):
+        resp = self.client_api.post('/api/staff/game_roles/', {
+            'game': self.game.id,
+            'name': 'Inviter',
+            'slug': 'inviter',
+            'description': 'Brings in new players',
+            'builtin_power': 'INVITER',
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        resp = self.client_api.get('/api/staff/game_roles/')
+        body = resp.json()
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]['slug'], 'inviter')
+        self.assertEqual(body[0]['builtin_power'], 'INVITER')
+
+    def test_list_defaults_to_current_session_game(self):
+        other = _make_game(name='Other')
+        GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        GameRole.objects.create(game=other, name='Alien', slug='alien')
+        resp = self.client_api.get('/api/staff/game_roles/')
+        slugs = [r['slug'] for r in resp.json()]
+        self.assertEqual(slugs, ['cook'])
+
+    def test_list_filters_by_game_param(self):
+        other = _make_game(name='Other')
+        GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        GameRole.objects.create(game=other, name='Alien', slug='alien')
+        resp = self.client_api.get(f'/api/staff/game_roles/?game={other.id}')
+        slugs = [r['slug'] for r in resp.json()]
+        self.assertEqual(slugs, ['alien'])
+
+    def test_update_and_delete_role(self):
+        role = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        resp = self.client_api.patch(
+            f'/api/staff/game_roles/{role.id}/', {'name': 'Head cook'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        role.refresh_from_db()
+        self.assertEqual(role.name, 'Head cook')
+        resp = self.client_api.delete(f'/api/staff/game_roles/{role.id}/')
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(GameRole.objects.exists())
+
+    def test_duplicate_slug_within_game_rejected(self):
+        GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        resp = self.client_api.post('/api/staff/game_roles/', {
+            'game': self.game.id, 'name': 'Chef', 'slug': 'cook',
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+
+class AdminMembershipRolesEndpointTest(TestCase):
+    """5.2 — roster listing plus role assign/unassign actions."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.membership = _add_member(self.team, 'scout')
+        self.client_api, self.staff = _staff_client(self.session)
+
+    def test_list_roster_by_team(self):
+        resp = self.client_api.get(f'/api/staff/memberships/?team={self.team.id}')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(len(body), 1)
+        self.assertEqual(body[0]['username'], 'scout')
+        self.assertEqual(body[0]['roles'], [])
+
+    def test_assign_role_records_assigner(self):
+        resp = self.client_api.post(
+            f'/api/staff/memberships/{self.membership.id}/assign_role/',
+            {'role': self.cook.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual([r['slug'] for r in resp.json()['roles']], ['cook'])
+        team_role = TeamRole.objects.get(membership=self.membership, role=self.cook)
+        self.assertEqual(team_role.assigned_by, self.staff)
+
+    def test_assign_role_is_idempotent(self):
+        for _ in range(2):
+            resp = self.client_api.post(
+                f'/api/staff/memberships/{self.membership.id}/assign_role/',
+                {'role': self.cook.id}, format='json',
+            )
+            self.assertEqual(resp.status_code, 200)
+        self.assertEqual(TeamRole.objects.count(), 1)
+
+    def test_unassign_role(self):
+        TeamRole.objects.create(membership=self.membership, role=self.cook)
+        resp = self.client_api.post(
+            f'/api/staff/memberships/{self.membership.id}/unassign_role/',
+            {'role': self.cook.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['roles'], [])
+        self.assertFalse(TeamRole.objects.exists())
+
+    def test_assign_role_from_other_game_rejected(self):
+        other = _make_game(name='Other')
+        alien = GameRole.objects.create(game=other, name='Alien', slug='alien')
+        resp = self.client_api.post(
+            f'/api/staff/memberships/{self.membership.id}/assign_role/',
+            {'role': alien.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamRole.objects.exists())
+
+    def test_assign_role_requires_role_param(self):
+        resp = self.client_api.post(
+            f'/api/staff/memberships/{self.membership.id}/assign_role/',
+            {}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_requires_staff(self):
+        player_client, _ = _authed_client(self.team, username='pleb')
+        resp = player_client.get('/api/staff/memberships/')
+        self.assertEqual(resp.status_code, 403)
+
+
+class AdminChallengeRoleConfigTest(TestCase):
+    """2.3 / 5.3 — role-requirement validation on the staff challenge API."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.client_api, _ = _staff_client(self.session)
+
+    def test_non_none_mode_requires_roles(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'bad config',
+            'difficulty': 1,
+            'role_requirement_mode': ROLE_REQUIREMENT_ALL,
+            'required_roles': [],
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_required_roles_must_belong_to_challenge_game(self):
+        other = _make_game(name='Other')
+        alien = GameRole.objects.create(game=other, name='Alien', slug='alien')
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'cross game',
+            'difficulty': 1,
+            'role_requirement_mode': ROLE_REQUIREMENT_ANY,
+            'required_roles': [alien.id],
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_valid_role_requirement_accepted(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'needs a cook',
+            'difficulty': 1,
+            'role_requirement_mode': ROLE_REQUIREMENT_ANY,
+            'required_roles': [self.cook.id],
+            'require_holders_present': True,
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['role_requirement_mode'], ROLE_REQUIREMENT_ANY)
+        self.assertEqual(body['required_roles'], [self.cook.id])
+        self.assertTrue(body['require_holders_present'])
+
+    def test_patch_to_non_none_without_roles_rejected(self):
+        challenge = Challenge.objects.create(
+            game=self.game, text='plain', difficulty=1,
+        )
+        resp = self.client_api.patch(
+            f'/api/staff/challenges/{challenge.id}/',
+            {'role_requirement_mode': ROLE_REQUIREMENT_ALL}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_patch_mode_with_roles_accepted(self):
+        challenge = Challenge.objects.create(
+            game=self.game, text='plain', difficulty=1,
+        )
+        resp = self.client_api.patch(
+            f'/api/staff/challenges/{challenge.id}/',
+            {
+                'role_requirement_mode': ROLE_REQUIREMENT_ALL,
+                'required_roles': [self.cook.id],
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+
+
+class TowerStateRoleRequirementTest(TestCase):
+    """5.4 — player challenge surface exposes requirement + satisfaction."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='cook it', tower=self.tower, difficulty=1,
+            role_requirement_mode=ROLE_REQUIREMENT_ALL,
+        )
+        self.challenge.required_roles.set([self.cook])
+        self.client_api, self.user = _authed_client(self.team)
+        self.membership = TeamMembership.objects.get(
+            team=self.team, user=self.user.profile,
+        )
+
+    def _state(self):
+        resp = self.client_api.get(f'/api/towers/{self.tower.id}/state/')
+        self.assertEqual(resp.status_code, 200)
+        return resp.json()
+
+    def test_unsatisfied_requirement_reported(self):
+        req = self._state()['next_challenge']['role_requirement']
+        self.assertEqual(req['mode'], ROLE_REQUIREMENT_ALL)
+        self.assertEqual([r['slug'] for r in req['required_roles']], ['cook'])
+        self.assertFalse(req['team_satisfies'])
+        self.assertEqual(req['missing_roles'], ['cook'])
+        self.assertFalse(req['require_holders_present'])
+
+    def test_satisfied_after_assignment(self):
+        TeamRole.objects.create(membership=self.membership, role=self.cook)
+        req = self._state()['next_challenge']['role_requirement']
+        self.assertTrue(req['team_satisfies'])
+        self.assertEqual(req['missing_roles'], [])
+
+    def test_none_mode_has_null_requirement(self):
+        self.challenge.role_requirement_mode = ROLE_REQUIREMENT_NONE
+        self.challenge.save()
+        self.assertIsNone(self._state()['next_challenge']['role_requirement'])
+
+
+class RoleBackwardCompatTest(TestCase):
+    """8.5 — a Game defining no roles behaves exactly as before the change."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='plain', tower=self.tower, difficulty=1,
+        )
+        self.client_api, _ = _authed_client(self.team)
+
+    def test_submission_flow_unchanged(self):
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_teams_api_members_have_empty_roles(self):
+        resp = self.client_api.get('/api/teams/')
+        self.assertEqual(resp.status_code, 200)
+        team = resp.json()[0]
+        self.assertEqual(team['name'], self.team.name)
+        self.assertEqual(len(team['members']), 1)
+        self.assertEqual(team['members'][0]['roles'], [])

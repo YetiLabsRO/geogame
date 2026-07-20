@@ -8,6 +8,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.models import (
+    ROLE_REQUIREMENT_NONE,
     Challenge,
     PauseWindow,
     TeamTowerFailCounter,
@@ -17,7 +18,15 @@ from game.models import (
     Zone,
 )
 from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
-from organize.models import Game, Session, Team, TeamGroup
+from organize.models import (
+    Game,
+    GameRole,
+    Session,
+    Team,
+    TeamGroup,
+    TeamMembership,
+    TeamRole,
+)
 
 
 class AdminZoneSerializer(serializers.ModelSerializer):
@@ -57,7 +66,40 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
 class AdminChallengeSerializer(serializers.ModelSerializer):
     class Meta:
         model = Challenge
-        fields = ('id', 'game', 'text', 'tower', 'difficulty')
+        fields = (
+            'id', 'game', 'text', 'tower', 'difficulty',
+            'role_requirement_mode', 'required_roles', 'require_holders_present',
+        )
+
+    def validate(self, attrs):
+        """team-roles config validation (task 2.3).
+
+        `required_roles` must belong to the challenge's Game, and a
+        non-NONE `role_requirement_mode` needs a non-empty role set.
+        """
+        instance = self.instance
+        mode = attrs.get(
+            'role_requirement_mode',
+            instance.role_requirement_mode if instance else ROLE_REQUIREMENT_NONE,
+        )
+        if 'required_roles' in attrs:
+            required = list(attrs['required_roles'])
+        elif instance is not None:
+            required = list(instance.required_roles.all())
+        else:
+            required = []
+        game = attrs.get('game', instance.game if instance else None)
+
+        if mode != ROLE_REQUIREMENT_NONE and not required:
+            raise serializers.ValidationError(
+                'A role requirement mode other than NONE needs at least one required role.',
+            )
+        foreign = [r.slug for r in required if game is None or r.game_id != game.id]
+        if foreign:
+            raise serializers.ValidationError(
+                f'required_roles must belong to the challenge\'s Game: {", ".join(foreign)}.',
+            )
+        return attrs
 
 
 class AdminZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
@@ -125,6 +167,138 @@ class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Challenge.objects.all().order_by('difficulty', 'id')
     serializer_class = AdminChallengeSerializer
     game_scope_field = 'game'
+
+
+# ---------------------------------------------------------------------------
+# team-roles: role definitions + roster role assignment
+# ---------------------------------------------------------------------------
+
+
+class AdminGameRoleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GameRole
+        fields = (
+            'id', 'game', 'name', 'slug', 'description',
+            'builtin_power', 'created_at',
+        )
+        read_only_fields = ('created_at',)
+
+
+class AdminGameRoleViewSet(viewsets.ModelViewSet):
+    """Staff CRUD for per-Game role definitions (team-roles capability).
+
+    Like AdminSessionViewSet, not session-scoped: the Games page manages
+    any Game's roles via ?game=<id>. A list without the param falls back
+    to the caller's current Session's Game so scoped pages (e.g. the
+    challenge editor) get the right roles with no extra plumbing.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = GameRole.objects.select_related('game').order_by('name')
+    serializer_class = AdminGameRoleSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        game_id = self.request.query_params.get('game')
+        if game_id:
+            return qs.filter(game_id=game_id)
+        if getattr(self, 'action', None) == 'list':
+            profile = getattr(self.request.user, 'profile', None)
+            session = profile.current_session if profile else None
+            if session is None:
+                return qs.none()
+            return qs.filter(game_id=session.game_id)
+        return qs
+
+
+class RoleSummarySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = GameRole
+        fields = ('id', 'slug', 'name', 'builtin_power')
+
+
+class AdminTeamMembershipSerializer(serializers.ModelSerializer):
+    username = serializers.CharField(source='user.user.username', read_only=True)
+    first_name = serializers.CharField(source='user.user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.user.last_name', read_only=True)
+    roles = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TeamMembership
+        fields = (
+            'id', 'team', 'user', 'username', 'first_name', 'last_name',
+            'is_active', 'joined_at', 'roles',
+        )
+
+    def get_roles(self, membership):
+        role_assignments = membership.roles.select_related('role').all()
+        return RoleSummarySerializer(
+            [tr.role for tr in role_assignments], many=True,
+        ).data
+
+
+class AdminTeamMembershipViewSet(SessionScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
+    """Staff roster view + role assign/unassign actions (team-roles).
+
+    List supports ?team=<id> for a single team's roster. The assignable
+    roles are strictly the membership's Game's roles — a role from
+    another Game is rejected before it ever reaches the model layer.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = (
+        TeamMembership.objects
+        .select_related('user__user', 'team')
+        .prefetch_related('roles__role')
+        .order_by('team__name', 'user__user__username')
+    )
+    serializer_class = AdminTeamMembershipSerializer
+    session_scope_field = 'team__session'
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        team_id = self.request.query_params.get('team')
+        if team_id:
+            qs = qs.filter(team_id=team_id)
+        return qs
+
+    def _resolve_role(self, request, membership):
+        role_id = request.data.get('role')
+        if not role_id:
+            return None, Response(
+                {'detail': 'role is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        role = GameRole.objects.filter(
+            pk=role_id, game_id=membership.game_id,
+        ).first()
+        if role is None:
+            return None, Response(
+                {'detail': 'Role not found on this membership\'s Game.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return role, None
+
+    @action(detail=True, methods=['post'])
+    def assign_role(self, request, pk=None):
+        membership = self.get_object()
+        role, error = self._resolve_role(request, membership)
+        if error is not None:
+            return error
+        TeamRole.objects.get_or_create(
+            membership=membership, role=role,
+            defaults={'assigned_by': request.user},
+        )
+        return Response(self.get_serializer(membership).data)
+
+    @action(detail=True, methods=['post'])
+    def unassign_role(self, request, pk=None):
+        membership = self.get_object()
+        role, error = self._resolve_role(request, membership)
+        if error is not None:
+            return error
+        TeamRole.objects.filter(membership=membership, role=role).delete()
+        return Response(self.get_serializer(membership).data)
 
 
 class ResetScoresView(APIView):
