@@ -18,6 +18,7 @@ import {
   AdminGame,
   AdminSession,
   AdminSessionPayload,
+  SessionState,
   StaffApiService,
 } from 'shared';
 
@@ -61,8 +62,10 @@ interface GameGroup {
     </div>
     <p class="text-body-secondary small">
       A Session is one live run of a Game — its own roster and scoreboard.
-      Multiple Sessions on the same Game run independently. Deactivating a
-      Session closes every open tower/zone ownership and locks in scores.
+      Multiple Sessions on the same Game run independently. New Sessions
+      start in DRAFT; drive them through
+      DRAFT → OPEN_FOR_PARTICIPANTS → RUNNING ⇄ PAUSED → FINISHED from the
+      session page. Finishing closes every open ownership and keeps history.
     </p>
 
     <div class="card mb-4">
@@ -155,7 +158,7 @@ interface GameGroup {
                     <th>Name</th>
                     <th>Start</th>
                     <th>End</th>
-                    <th>Active</th>
+                    <th>State</th>
                     <th></th>
                   </tr>
                 </thead>
@@ -178,15 +181,9 @@ interface GameGroup {
                         {{ row.session.end_time | date: 'short' }}
                       </td>
                       <td class="text-center">
-                        <div class="form-check form-switch d-inline-block">
-                          <input
-                            type="checkbox"
-                            class="form-check-input"
-                            role="switch"
-                            [ngModel]="row.draft.is_active"
-                            (ngModelChange)="update(row, 'is_active', $event)"
-                          />
-                        </div>
+                        <span class="badge" [class]="stateBadgeClass(row.session.state)">
+                          {{ row.session.state }}
+                        </span>
                       </td>
                       <td class="text-end">
                         <div class="d-flex gap-2 justify-content-end">
@@ -280,6 +277,10 @@ export class SessionsComponent {
     this.activeFilter.set(filter);
   }
 
+  protected stateBadgeClass(state: SessionState): string {
+    return STATE_BADGES[state] ?? 'text-bg-secondary';
+  }
+
   private refresh(): void {
     this.loading.set(true);
     this.loadError.set(null);
@@ -313,13 +314,14 @@ export class SessionsComponent {
     this.creating.set(true);
     this.createError.set(null);
     const raw = this.createForm.getRawValue();
+    // New Sessions start in DRAFT; lifecycle actions on the session
+    // page drive them to OPEN_FOR_PARTICIPANTS / RUNNING.
     const payload: AdminSessionPayload = {
       game: raw.game as number,
       slug: raw.slug,
       name: raw.name,
       start_time: new Date(raw.start_time).toISOString(),
       end_time: new Date(raw.end_time).toISOString(),
-      is_active: true,
     };
     this.api.createSession(payload).subscribe({
       next: () => {
@@ -360,7 +362,6 @@ export class SessionsComponent {
     this.api
       .updateSession(row.session.id, {
         name: row.draft.name,
-        is_active: row.draft.is_active,
       })
       .subscribe({
         next: (updated) => {
@@ -390,6 +391,14 @@ export class SessionsComponent {
     );
   }
 }
+
+const STATE_BADGES: Record<SessionState, string> = {
+  DRAFT: 'text-bg-secondary',
+  OPEN_FOR_PARTICIPANTS: 'text-bg-info',
+  RUNNING: 'text-bg-success',
+  PAUSED: 'text-bg-warning',
+  FINISHED: 'text-bg-dark',
+};
 
 function isDirty<T extends object>(a: T, b: T): boolean {
   return (Object.keys(a) as (keyof T)[]).some((k) => a[k] !== b[k]);

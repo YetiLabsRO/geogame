@@ -109,6 +109,23 @@ export type Phase10Overrides = {
   [K in keyof Phase10Config]: Phase10Config[K] | null;
 };
 
+/** Session lifecycle states (session-lifecycle capability). */
+export type SessionState =
+  | 'DRAFT'
+  | 'OPEN_FOR_PARTICIPANTS'
+  | 'RUNNING'
+  | 'PAUSED'
+  | 'FINISHED';
+
+/** Lifecycle actions, each driving one edge of the transition table. */
+export type SessionTransitionAction =
+  | 'open_participation'
+  | 'close_participation'
+  | 'start'
+  | 'pause'
+  | 'resume'
+  | 'finish';
+
 export interface AdminSession extends Phase10Overrides {
   id: number;
   game: number;
@@ -118,13 +135,26 @@ export interface AdminSession extends Phase10Overrides {
   name: string;
   start_time: string;
   end_time: string;
+  scheduled_start: string | null;
+  state: SessionState;
+  allowed_transitions: SessionTransitionAction[];
   is_active: boolean;
   is_paused: boolean;
   created_at: string | null;
 }
 
 export type AdminSessionPayload = Partial<
-  Omit<AdminSession, 'id' | 'game_slug' | 'game_name' | 'is_paused' | 'created_at'>
+  Omit<
+    AdminSession,
+    | 'id'
+    | 'game_slug'
+    | 'game_name'
+    | 'state'
+    | 'allowed_transitions'
+    | 'is_active'
+    | 'is_paused'
+    | 'created_at'
+  >
 >;
 
 export interface PauseWindowInfo {
@@ -272,14 +302,27 @@ export class StaffApiService {
     return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
   }
 
+  // ---- Session lifecycle transitions (session-lifecycle) -------------------
+
+  transitionSession(
+    id: number,
+    action: SessionTransitionAction,
+    override = false,
+  ): Observable<AdminSession> {
+    return this.http.post<AdminSession>(
+      `/api/staff/sessions/${id}/${action}/`,
+      override ? { override: true } : {},
+    );
+  }
+
   // ---- Phase 10: day pausing + failure observability -----------------------
 
   pauseSession(id: number): Observable<AdminSession> {
-    return this.http.post<AdminSession>(`/api/staff/sessions/${id}/pause/`, {});
+    return this.transitionSession(id, 'pause');
   }
 
   resumeSession(id: number): Observable<AdminSession> {
-    return this.http.post<AdminSession>(`/api/staff/sessions/${id}/resume/`, {});
+    return this.transitionSession(id, 'resume');
   }
 
   pauseAllSessions(gameId: number): Observable<{ paused_sessions: number[] }> {
