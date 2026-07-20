@@ -64,6 +64,9 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 class TeamSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(source='group.name', read_only=True, default=None)
     group_slug = serializers.CharField(source='group.slug', read_only=True, default=None)
+    # Optional on create — the viewset fills in a random color for
+    # player-created teams (team-formation capability).
+    color = serializers.CharField(required=False)
 
     class Meta:
         model = Team

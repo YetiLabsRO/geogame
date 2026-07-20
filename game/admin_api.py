@@ -1,3 +1,6 @@
+import random
+import secrets
+
 from django.contrib.gis.geos import Point
 from django.db import transaction
 from django.utils import timezone
@@ -17,7 +20,14 @@ from game.models import (
     Zone,
 )
 from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
-from organize.models import Game, Session, Team, TeamGroup
+from organize.models import (
+    Game,
+    Session,
+    Team,
+    TeamGroup,
+    TeamMembership,
+    UserProfile,
+)
 
 
 class AdminZoneSerializer(serializers.ModelSerializer):
@@ -39,13 +49,25 @@ class AdminTeamSerializer(serializers.ModelSerializer):
     # Read-only `game` derived from session.game for convenience in the
     # staff UI. Writes always go through `session`.
     game = serializers.IntegerField(source='session.game_id', read_only=True)
+    captain_username = serializers.CharField(
+        source='captain.username', read_only=True, default=None,
+    )
+    member_count = serializers.SerializerMethodField()
 
     class Meta:
         model = Team
         fields = (
             'id', 'name', 'session', 'game',
             'group', 'color', 'description',
+            # Team-formation fields: captain + per-team confirmation
+            # override (null = inherit Game default) + untied join code.
+            'captain', 'captain_username', 'team_join_confirmation',
+            'join_code', 'member_count',
         )
+        read_only_fields = ('join_code',)
+
+    def get_member_count(self, team):
+        return team.memberships.filter(is_active=True).count()
 
 
 class AdminTeamGroupSerializer(serializers.ModelSerializer):
@@ -189,6 +211,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Team-formation knobs (defaults preserve staff-only rosters).
+            'allow_player_team_creation', 'team_join_confirmation',
             'created_at',
         )
         read_only_fields = ('created_at',)
@@ -259,6 +283,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Team-formation override (null = inherit Game default).
+            'allow_player_team_creation',
             'created_at',
         )
         read_only_fields = ('created_at', 'game_slug', 'game_name', 'is_paused')
@@ -367,6 +393,127 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
             for c in counters
         ]
         return Response(data)
+
+    # ---- Team shuffle / balanced build (team-formation, lower priority) ----
+
+    def _unassigned_profiles(self, session):
+        """Non-staff profiles pointed at this session without an active
+        membership in its game — the pool the builders draw from."""
+        return list(
+            UserProfile.objects
+            .filter(current_session=session, user__is_staff=False)
+            .exclude(
+                memberships__is_active=True,
+                memberships__game=session.game,
+            )
+            .select_related('user')
+        )
+
+    def _build_teams(self, session, team_count):
+        existing = set(session.teams.values_list('name', flat=True))
+        teams = []
+        index = 1
+        while len(teams) < team_count:
+            name = f'Team {index}'
+            index += 1
+            if name in existing:
+                continue
+            teams.append(Team.objects.create(
+                name=name,
+                session=session,
+                color=f'#{secrets.randbelow(0xFFFFFF):06X}',
+            ))
+        return teams
+
+    def _assignment_payload(self, teams):
+        return {
+            'teams': [
+                {
+                    'id': t.id,
+                    'name': t.name,
+                    'members': [
+                        m.user.user.get_username()
+                        for m in t.memberships.filter(is_active=True).select_related('user__user')
+                    ],
+                }
+                for t in teams
+            ],
+            'assigned': sum(
+                t.memberships.filter(is_active=True).count() for t in teams
+            ),
+        }
+
+    @action(detail=True, methods=['post'], url_path='shuffle-teams')
+    @transaction.atomic
+    def shuffle_teams(self, request, pk=None):
+        """Randomly distribute the session's unassigned players into N
+        new teams. Best-effort; the result stays editable before start."""
+        session = self.get_object()
+        try:
+            team_count = int(request.data.get('team_count', 0))
+        except (TypeError, ValueError):
+            team_count = 0
+        if team_count < 1:
+            return Response(
+                {'detail': 'team_count must be a positive integer.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        players = self._unassigned_profiles(session)
+        if not players:
+            return Response(
+                {'detail': 'No unassigned players in this session.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        random.shuffle(players)
+        teams = self._build_teams(session, team_count)
+        for i, profile in enumerate(players):
+            TeamMembership.objects.create(
+                team=teams[i % team_count], user=profile, is_active=True,
+            )
+        return Response(self._assignment_payload(teams), status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=['post'], url_path='balance-teams')
+    @transaction.atomic
+    def balance_teams(self, request, pk=None):
+        """Bucket unassigned players by profile attribute key(s) and deal
+        them round-robin so each bucket spreads evenly across N teams."""
+        session = self.get_object()
+        try:
+            team_count = int(request.data.get('team_count', 0))
+        except (TypeError, ValueError):
+            team_count = 0
+        keys = request.data.get('attribute_keys') or []
+        if isinstance(keys, str):
+            keys = [keys]
+        if team_count < 1 or not keys:
+            return Response(
+                {'detail': 'team_count (positive integer) and attribute_keys are required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        players = self._unassigned_profiles(session)
+        if not players:
+            return Response(
+                {'detail': 'No unassigned players in this session.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        buckets = {}
+        for profile in players:
+            attrs = profile.attributes or {}
+            bucket_key = tuple(str(attrs.get(k)) for k in keys)
+            buckets.setdefault(bucket_key, []).append(profile)
+        for members in buckets.values():
+            random.shuffle(members)
+        teams = self._build_teams(session, team_count)
+        # Deal bucket by bucket (largest first), continuing the same
+        # round-robin cursor so buckets spread evenly across teams.
+        cursor = 0
+        for _, members in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            for profile in members:
+                TeamMembership.objects.create(
+                    team=teams[cursor % team_count], user=profile, is_active=True,
+                )
+                cursor += 1
+        return Response(self._assignment_payload(teams), status=status.HTTP_200_OK)
 
     @transaction.atomic
     def perform_update(self, serializer):

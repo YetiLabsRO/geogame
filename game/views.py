@@ -1,9 +1,13 @@
+import secrets
+import uuid
+
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
-from django.db import OperationalError, connection
+from django.db import OperationalError, connection, transaction
 from django.db.models import Count, Q
 from django.http import JsonResponse
-from rest_framework import permissions, viewsets
+from rest_framework import permissions, status, viewsets
+from rest_framework.response import Response
 
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
 from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
@@ -14,7 +18,12 @@ from game.serializers import (
     TowerSerializer,
     ZoneSerializer,
 )
-from organize.models import Team, TeamGroup
+from organize.models import (
+    Team,
+    TeamGroup,
+    TeamMembership,
+    effective_allow_player_team_creation,
+)
 
 
 class ZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
@@ -58,6 +67,10 @@ class TowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
         return queryset
 
 
+def _random_team_color():
+    return f'#{secrets.randbelow(0xFFFFFF):06X}'
+
+
 class TeamViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Team.objects.all()
     serializer_class = TeamSerializer
@@ -75,6 +88,82 @@ class TeamViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet):
         context = super(TeamViewSet, self).get_serializer_context()
         context['category'] = self.request.query_params.get('category', 0)
         return context
+
+    @transaction.atomic
+    def create(self, request, *args, **kwargs):
+        """Create a team in the caller's current Session.
+
+        Staff may always create teams. A player may create one only when
+        the effective `allow_player_team_creation` toggle is enabled for
+        their current Session; the creator becomes the captain and first
+        member (see the team-formation capability).
+        """
+        user = request.user
+        session = user.profile.current_session
+        if session is None:
+            return Response(
+                {'detail': 'You are not in any session.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        is_player_create = not user.is_staff
+        if is_player_create:
+            if not effective_allow_player_team_creation(session):
+                return Response(
+                    {'detail': 'Player team creation is not enabled for this session.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            if Team.objects.filter(session=session, captain=user).exists():
+                return Response(
+                    {'detail': 'You have already created a team in this session.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            membership = (
+                TeamMembership.objects
+                .filter(user=user.profile, is_active=True, game=session.game)
+                .select_related('team')
+                .first()
+            )
+            if membership is not None:
+                return Response(
+                    {
+                        'detail': (
+                            f'You are already on team "{membership.team.name}" in '
+                            f'"{session.game.name}". Leave that team before '
+                            'creating another in the same game.'
+                        ),
+                    },
+                    status=status.HTTP_409_CONFLICT,
+                )
+
+        data = request.data.copy()
+        if not data.get('color'):
+            data['color'] = _random_team_color()
+        serializer = self.get_serializer(data=data)
+        serializer.is_valid(raise_exception=True)
+
+        group = serializer.validated_data.get('group')
+        if group is not None and group.game_id != session.game_id:
+            return Response(
+                {'detail': 'That team group belongs to a different game.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        extra = {'session': session}
+        if is_player_create:
+            # The creator becomes captain and gets an untied join code to
+            # share right away. Role-based invite powers are a future
+            # change (team-roles-as-mechanics).
+            extra['captain'] = user
+            extra['join_code'] = uuid.uuid4()
+        team = serializer.save(**extra)
+        if is_player_create:
+            TeamMembership.objects.create(
+                team=team, user=user.profile, is_active=True,
+            )
+        headers = self.get_success_headers(serializer.data)
+        return Response(
+            serializer.data, status=status.HTTP_201_CREATED, headers=headers,
+        )
 
 
 class ChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):

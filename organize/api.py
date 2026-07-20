@@ -3,6 +3,7 @@ from django.contrib.auth import authenticate, get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core.mail import send_mail
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.encoding import force_bytes, force_str
@@ -10,15 +11,53 @@ from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import generics, serializers, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
+from rest_framework.exceptions import PermissionDenied
+from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.scoping import SessionScopedViewSetMixin
 from organize.emails import send_invite_email
-from organize.models import Invite, TeamMembership
+from organize.models import (
+    JOIN_CONFIRM_AUTO_APPROVE,
+    Invite,
+    Team,
+    TeamJoinRequest,
+    TeamMembership,
+    active_membership_conflict,
+    effective_allow_player_team_creation,
+    effective_team_join_confirmation,
+)
 
 User = get_user_model()
+
+
+def _can_manage_team_invites(user, team):
+    """Staff manage any team's invites; a captain manages their own
+    team's only while player team formation is enabled for its Session."""
+    if user.is_staff:
+        return True
+    if team.captain_id != user.id:
+        return False
+    return effective_allow_player_team_creation(team.session)
+
+
+def _can_decide_join_request(user, team):
+    """Approve/reject rights: staff for any team, captain for their own."""
+    return user.is_staff or team.captain_id == user.id
+
+
+def _membership_conflict_response(conflict, game):
+    return Response(
+        {
+            'detail': (
+                f'You are already on team "{conflict.team.name}" in '
+                f'"{game.name}". Leave that team before joining '
+                'another in the same game.'
+            ),
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
 
 
 # ---------- Serializers ----------
@@ -67,6 +106,8 @@ class UserProfileSerializer(serializers.Serializer):
     current_game = serializers.SerializerMethodField()
     active_team_id = serializers.SerializerMethodField()
     is_staff = serializers.BooleanField(source='user.is_staff', read_only=True)
+    allow_player_team_creation = serializers.SerializerMethodField()
+    captain_of_team_id = serializers.SerializerMethodField()
 
     def get_current_game(self, profile):
         session = profile.current_session
@@ -74,6 +115,21 @@ class UserProfileSerializer(serializers.Serializer):
 
     def get_active_team_id(self, profile):
         membership = profile.memberships.filter(is_active=True).select_related('team').first()
+        return membership.team_id if membership else None
+
+    def get_allow_player_team_creation(self, profile):
+        session = profile.current_session
+        if session is None:
+            return False
+        return effective_allow_player_team_creation(session)
+
+    def get_captain_of_team_id(self, profile):
+        membership = (
+            profile.memberships
+            .filter(is_active=True, team__captain=profile.user)
+            .select_related('team')
+            .first()
+        )
         return membership.team_id if membership else None
 
     def update(self, profile, validated_data):
@@ -250,6 +306,9 @@ class GameConfigSerializer(serializers.Serializer):
     proximity_meters = serializers.IntegerField()
     cooloff_minutes = serializers.IntegerField()
     initial_bonus_default = serializers.IntegerField()
+    allow_player_team_creation = serializers.BooleanField()
+    team_join_confirmation = serializers.CharField()
+    team_groups = serializers.SerializerMethodField()
 
     def get_base_point(self, game):
         if game.base_point is None:
@@ -258,6 +317,12 @@ class GameConfigSerializer(serializers.Serializer):
             'type': 'Point',
             'coordinates': [game.base_point.x, game.base_point.y],
         }
+
+    def get_team_groups(self, game):
+        return [
+            {'id': g.id, 'name': g.name, 'slug': g.slug}
+            for g in game.teamgroup_set.order_by('name')
+        ]
 
 
 class CurrentSessionSerializer(serializers.Serializer):
@@ -268,6 +333,12 @@ class CurrentSessionSerializer(serializers.Serializer):
     start_time = serializers.DateTimeField()
     end_time = serializers.DateTimeField()
     game = GameConfigSerializer()
+    # Effective (Session override, else Game default) player-team-creation
+    # toggle for this session.
+    allow_player_team_creation = serializers.SerializerMethodField()
+
+    def get_allow_player_team_creation(self, session):
+        return effective_allow_player_team_creation(session)
 
 
 class MySessionsView(APIView):
@@ -447,9 +518,13 @@ class CurrentSessionView(APIView):
             return False
         if user.is_staff:
             return True
-        return user.profile.memberships.filter(
+        if user.profile.memberships.filter(
             is_active=True, team__session=session,
-        ).exists()
+        ).exists():
+            return True
+        # A teamless player may stay in an "open" session (player team
+        # formation enabled) so they can create or browse teams there.
+        return effective_allow_player_team_creation(session)
 
     def _staff_fallback(self):
         from organize.models import Session
@@ -522,12 +597,15 @@ class CurrentSessionView(APIView):
             )
 
         # Players can only set the current session to one they have an
-        # active membership in. Staff can switch freely.
+        # active membership in — or an active "open" session (player
+        # team formation enabled), so teamless players can go create or
+        # join a team there. Staff can switch freely.
         if not request.user.is_staff:
             is_member = request.user.profile.memberships.filter(
                 is_active=True, team__session=session,
             ).exists()
-            if not is_member:
+            is_open = session.is_active and effective_allow_player_team_creation(session)
+            if not is_member and not is_open:
                 return Response(
                     {'detail': 'You are not a member of that session.'},
                     status=status.HTTP_403_FORBIDDEN,
@@ -547,7 +625,7 @@ class InviteSerializer(serializers.ModelSerializer):
     class Meta:
         model = Invite
         fields = (
-            'id', 'token', 'team', 'team_name', 'email',
+            'id', 'token', 'team', 'team_name', 'email', 'kind',
             'created_by', 'created_by_username', 'created_at',
             'expires_at', 'accepted_by', 'accepted_at', 'revoked', 'status',
         )
@@ -562,11 +640,20 @@ class InviteSerializer(serializers.ModelSerializer):
             return 'expired'
         return 'pending'
 
+    def validate(self, attrs):
+        if attrs.get('kind') == Invite.KIND_LINK and not attrs.get('email'):
+            raise serializers.ValidationError(
+                'A recipient-bound LINK invite requires a recipient email.',
+            )
+        return attrs
+
 
 class InvitePreviewSerializer(serializers.Serializer):
     team_name = serializers.CharField()
     team_group = serializers.CharField(allow_blank=True)
     expires_at = serializers.DateTimeField()
+    kind = serializers.CharField()
+    recipient_bound = serializers.BooleanField()
 
 
 class InviteAcceptSerializer(serializers.Serializer):
@@ -579,8 +666,17 @@ class InviteAcceptSerializer(serializers.Serializer):
 
 
 class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
+    """List/create invites.
+
+    Staff manage every invite in their current session. A team captain
+    manages their own team's invites while player team formation is
+    enabled for that session (see the team-formation capability). A
+    role-based INVITER power can plug into `_can_manage_team_invites`
+    when team-roles-as-mechanics lands.
+    """
+
     serializer_class = InviteSerializer
-    permission_classes = [IsAdminUser]
+    permission_classes = [IsAuthenticated]
     queryset = Invite.objects.select_related('team', 'created_by', 'accepted_by')
     # Invites are scoped through the team's session. Staff viewing one
     # session's roster will not see invites intended for another
@@ -589,6 +685,8 @@ class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        if not self.request.user.is_staff:
+            qs = qs.filter(team__captain=self.request.user)
         status_filter = self.request.query_params.get('status')
         now = timezone.now()
         if status_filter == 'pending':
@@ -602,6 +700,12 @@ class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
         return qs
 
     def perform_create(self, serializer):
+        team = serializer.validated_data['team']
+        if not _can_manage_team_invites(self.request.user, team):
+            raise PermissionDenied(
+                'Only staff, or the team captain while player team '
+                'formation is enabled, may create invites for this team.',
+            )
         invite = serializer.save(created_by=self.request.user)
         if invite.email:
             send_invite_email(invite)
@@ -609,18 +713,36 @@ class InviteListCreate(SessionScopedViewSetMixin, generics.ListCreateAPIView):
 
 class InviteDestroy(generics.DestroyAPIView):
     """Revoke a pending invite (soft-delete via revoked=True)."""
-    permission_classes = [IsAdminUser]
-    queryset = Invite.objects.all()
+    permission_classes = [IsAuthenticated]
+    queryset = Invite.objects.select_related('team__session__game')
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if not self.request.user.is_staff:
+            qs = qs.filter(team__captain=self.request.user)
+        return qs
 
     def perform_destroy(self, invite):
+        if not _can_manage_team_invites(self.request.user, invite.team):
+            raise PermissionDenied(
+                'Only staff, or the team captain while player team '
+                'formation is enabled, may revoke this invite.',
+            )
         invite.revoked = True
         invite.save(update_fields=['revoked'])
 
 
 @api_view(['POST'])
-@permission_classes([IsAdminUser])
+@permission_classes([IsAuthenticated])
 def invite_resend(request, pk):
-    invite = get_object_or_404(Invite, pk=pk)
+    invite = get_object_or_404(
+        Invite.objects.select_related('team__session__game'), pk=pk,
+    )
+    if not _can_manage_team_invites(request.user, invite.team):
+        return Response(
+            {'detail': 'You may not manage invites for this team.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
     if not invite.is_usable():
         return Response(
             {'detail': 'Invite is not in a resendable state.'},
@@ -647,6 +769,8 @@ def invite_preview(request, token):
         'team_name': invite.team.name,
         'team_group': invite.team.group.name if invite.team.group else '',
         'expires_at': invite.expires_at,
+        'kind': invite.kind,
+        'recipient_bound': invite.is_recipient_bound(),
     }
     return Response(InvitePreviewSerializer(data).data)
 
@@ -667,7 +791,17 @@ def invite_accept(request, token):
     if not invite.is_usable():
         return Response({'detail': 'Invite is no longer usable.'}, status=status.HTTP_410_GONE)
 
+    bound_email = invite.email if invite.is_recipient_bound() else None
+
     if request.user.is_authenticated:
+        # Recipient binding: a LINK invite may only be accepted by the
+        # account whose email matches the bound recipient (403 so a
+        # forwarded link cannot be redeemed by someone else).
+        if bound_email and request.user.email.lower() != bound_email.lower():
+            return Response(
+                {'detail': 'This invite link is bound to a different recipient.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
         user = request.user
     else:
         serializer = InviteAcceptSerializer(data=request.data)
@@ -679,6 +813,13 @@ def invite_accept(request, token):
             return Response(
                 {'detail': f'Missing required fields: {", ".join(missing)}.'},
                 status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Recipient binding for fresh registrations: the new account must
+        # be registered on the bound email itself.
+        if bound_email and data['email'].lower() != bound_email.lower():
+            return Response(
+                {'detail': 'This invite link is bound to a different recipient.'},
+                status=status.HTTP_403_FORBIDDEN,
             )
         if User.objects.filter(username__iexact=data['username']).exists():
             return Response(
@@ -699,31 +840,38 @@ def invite_accept(request, token):
     # One active membership per game per player. Surface a friendly 409
     # before letting the DB constraint trip.
     invite_game = invite.team.session.game
-    existing = (
-        TeamMembership.objects
-        .filter(user=user.profile, is_active=True, game=invite_game)
-        .exclude(team=invite.team)
-        .select_related('team')
-        .first()
-    )
+    existing = active_membership_conflict(user.profile, invite.team)
     if existing is not None:
-        return Response(
-            {
-                'detail': (
-                    f'You are already on team "{existing.team.name}" in '
-                    f'"{invite_game.name}". Leave that team before joining '
-                    'another in the same game.'
-                ),
-            },
-            status=status.HTTP_409_CONFLICT,
-        )
+        return _membership_conflict_response(existing, invite_game)
 
-    membership, _ = TeamMembership.objects.get_or_create(
-        team=invite.team, user=user.profile, is_active=True,
-    )
     invite.accepted_by = user
     invite.accepted_at = timezone.now()
     invite.save(update_fields=['accepted_by', 'accepted_at'])
+
+    # Route through the team's effective confirmation policy: membership
+    # right away under AUTO_APPROVE, else a pending join request that a
+    # captain or staff must approve (see the team-formation capability).
+    policy = effective_team_join_confirmation(invite.team)
+    if policy == JOIN_CONFIRM_AUTO_APPROVE:
+        TeamMembership.objects.get_or_create(
+            team=invite.team, user=user.profile, is_active=True,
+        )
+        membership_status = 'ACTIVE'
+        join_request_id = None
+    else:
+        source = (
+            TeamJoinRequest.SOURCE_LINK
+            if invite.kind == Invite.KIND_LINK
+            else TeamJoinRequest.SOURCE_QR
+        )
+        join_request, _ = TeamJoinRequest.objects.get_or_create(
+            team=invite.team,
+            user=user.profile,
+            status=TeamJoinRequest.STATUS_PENDING,
+            defaults={'source': source},
+        )
+        membership_status = 'PENDING'
+        join_request_id = join_request.id
 
     token_obj, _ = Token.objects.get_or_create(user=user)
     return Response({
@@ -732,4 +880,327 @@ def invite_accept(request, token):
         'username': user.username,
         'team_id': invite.team.id,
         'team_name': invite.team.name,
+        'membership_status': membership_status,
+        'join_request_id': join_request_id,
     })
+
+
+# ---------- Team formation: join codes, browsing, join requests ----------
+
+class TeamJoinRequestSerializer(serializers.ModelSerializer):
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    username = serializers.CharField(source='user.user.username', read_only=True)
+    first_name = serializers.CharField(source='user.user.first_name', read_only=True)
+    last_name = serializers.CharField(source='user.user.last_name', read_only=True)
+    decided_by_username = serializers.CharField(
+        source='decided_by.username', read_only=True, default=None,
+    )
+
+    class Meta:
+        model = TeamJoinRequest
+        fields = (
+            'id', 'team', 'team_name', 'username', 'first_name', 'last_name',
+            'status', 'source', 'note', 'requested_at',
+            'decided_by_username', 'decided_at',
+        )
+        read_only_fields = fields
+
+
+def _join_code_payload(team):
+    code = str(team.join_code) if team.join_code else None
+    return {
+        'team': team.id,
+        'team_name': team.name,
+        'join_code': code,
+        'join_url': f'{settings.BASE_URL}/join/{code}' if code else None,
+    }
+
+
+class TeamJoinCodeView(APIView):
+    """Read / rotate / revoke a team's untied, shareable join code.
+
+    Captain-of-that-team or staff only. The code is untied — anyone
+    holding it may use it while set — so rotating invalidates every
+    previously shared copy at once.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def _team(self, request, pk):
+        team = get_object_or_404(Team.objects.select_related('session__game'), pk=pk)
+        if not (request.user.is_staff or team.captain_id == request.user.id):
+            raise PermissionDenied(
+                'Only the team captain or staff may manage the join code.',
+            )
+        return team
+
+    def get(self, request, pk):
+        return Response(_join_code_payload(self._team(request, pk)))
+
+    def post(self, request, pk):
+        team = self._team(request, pk)
+        action = request.data.get('action', 'rotate')
+        if action == 'rotate':
+            team.rotate_join_code()
+        elif action == 'revoke':
+            team.revoke_join_code()
+        else:
+            return Response(
+                {'detail': 'action must be "rotate" or "revoke".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(_join_code_payload(team))
+
+
+def _joinable_team_entry(team, profile):
+    my_request = (
+        team.join_requests.filter(user=profile).order_by('-requested_at').first()
+        if profile is not None else None
+    )
+    return {
+        'id': team.id,
+        'name': team.name,
+        'color': team.color,
+        'group_name': team.group.name if team.group else None,
+        'member_count': team.memberships.filter(is_active=True).count(),
+        'join_confirmation': effective_team_join_confirmation(team),
+        'my_request_status': my_request.status if my_request else None,
+    }
+
+
+@api_view(['GET'])
+@permission_classes([AllowAny])
+def join_code_preview(request, code):
+    """Public preview for the untied join QR/link (pre-login rendering)."""
+    team = (
+        Team.objects
+        .filter(join_code=code)
+        .select_related('session__game', 'group')
+        .first()
+    )
+    if team is None:
+        return Response(
+            {'detail': 'Invalid or revoked join code.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    return Response({
+        'team_name': team.name,
+        'team_group': team.group.name if team.group else '',
+        'color': team.color,
+        'session_name': team.session.name,
+        'game_name': team.session.game.name,
+        'join_confirmation': effective_team_join_confirmation(team),
+    })
+
+
+class JoinableTeamsView(APIView):
+    """Teams in the caller's current Session that they may request to join."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        profile = request.user.profile
+        session = profile.current_session
+        if session is None:
+            return Response(
+                {'detail': 'You are not in any session.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        if not request.user.is_staff and not effective_allow_player_team_creation(session):
+            return Response(
+                {'detail': 'Player team formation is not enabled for this session.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+        teams = (
+            Team.objects
+            .filter(session=session)
+            .exclude(memberships__user=profile, memberships__is_active=True)
+            .select_related('group', 'session__game')
+            .order_by('name')
+        )
+        return Response([_joinable_team_entry(t, profile) for t in teams])
+
+
+class JoinRequestListCreateView(APIView):
+    """GET: requests the caller may see. POST: request to join a team.
+
+    Visibility: a player sees their own requests, a captain additionally
+    their team's, staff see every request in their current session.
+
+    POST accepts either `{team: <id>}` (source BROWSE, current-session
+    teams only) or `{code: <uuid>}` (source QR, resolved from the team's
+    untied join code). The team's effective confirmation policy decides
+    between immediate membership (AUTO_APPROVE) and a pending request.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request):
+        profile = request.user.profile
+        qs = TeamJoinRequest.objects.select_related(
+            'team', 'user__user', 'decided_by',
+        )
+        if request.user.is_staff:
+            session = profile.current_session
+            if session is None:
+                qs = qs.none()
+            else:
+                qs = qs.filter(team__session=session)
+        else:
+            qs = qs.filter(
+                Q(user=profile) | Q(team__captain=request.user),
+            )
+        status_filter = request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter.upper())
+        qs = qs.order_by('-requested_at')
+        return Response(TeamJoinRequestSerializer(qs, many=True).data)
+
+    @transaction.atomic
+    def post(self, request):
+        profile = request.user.profile
+        code = request.data.get('code')
+        team_id = request.data.get('team')
+
+        if code:
+            team = (
+                Team.objects
+                .filter(join_code=code)
+                .select_related('session__game')
+                .first()
+            )
+            if team is None:
+                return Response(
+                    {'detail': 'Invalid or revoked join code.'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            source = TeamJoinRequest.SOURCE_QR
+        elif team_id:
+            session = profile.current_session
+            if session is None:
+                return Response(
+                    {'detail': 'You are not in any session.'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            if not effective_allow_player_team_creation(session):
+                return Response(
+                    {'detail': 'Player team formation is not enabled for this session.'},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+            team = (
+                Team.objects
+                .filter(pk=team_id, session=session)
+                .select_related('session__game')
+                .first()
+            )
+            if team is None:
+                return Response(
+                    {'detail': 'Team not found in your current session.'},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+            source = TeamJoinRequest.SOURCE_BROWSE
+        else:
+            return Response(
+                {'detail': 'Provide either "team" or "code".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if TeamMembership.objects.filter(
+            team=team, user=profile, is_active=True,
+        ).exists():
+            return Response(
+                {'detail': 'You are already a member of this team.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        conflict = active_membership_conflict(profile, team)
+        if conflict is not None:
+            return _membership_conflict_response(conflict, team.session.game)
+
+        note = request.data.get('note') or ''
+        policy = effective_team_join_confirmation(team)
+        if policy == JOIN_CONFIRM_AUTO_APPROVE:
+            join_request = TeamJoinRequest.objects.create(
+                team=team, user=profile, source=source, note=note,
+                status=TeamJoinRequest.STATUS_APPROVED,
+                decided_at=timezone.now(),
+            )
+            TeamMembership.objects.get_or_create(
+                team=team, user=profile, is_active=True,
+            )
+            # Joining a team drops the player into its session.
+            if profile.current_session_id != team.session_id:
+                profile.current_session = team.session
+                profile.save(update_fields=['current_session'])
+            created = True
+        else:
+            join_request, created = TeamJoinRequest.objects.get_or_create(
+                team=team,
+                user=profile,
+                status=TeamJoinRequest.STATUS_PENDING,
+                defaults={'source': source, 'note': note},
+            )
+        return Response(
+            TeamJoinRequestSerializer(join_request).data,
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def join_request_approve(request, pk):
+    join_request = get_object_or_404(
+        TeamJoinRequest.objects
+        .select_for_update()
+        .select_related('team__session__game', 'user'),
+        pk=pk,
+    )
+    if not _can_decide_join_request(request.user, join_request.team):
+        return Response(
+            {'detail': 'Only the team captain or staff may decide this request.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if join_request.status != TeamJoinRequest.STATUS_PENDING:
+        return Response(
+            {'detail': 'This request has already been decided.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    conflict = active_membership_conflict(join_request.user, join_request.team)
+    if conflict is not None:
+        return Response(
+            {
+                'detail': (
+                    f'{join_request.user.user.get_username()} is already on team '
+                    f'"{conflict.team.name}" in '
+                    f'"{join_request.team.session.game.name}". They must leave '
+                    'that team before joining another in the same game.'
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
+    join_request.approve(decided_by=request.user)
+    return Response(TeamJoinRequestSerializer(join_request).data)
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+@transaction.atomic
+def join_request_reject(request, pk):
+    join_request = get_object_or_404(
+        TeamJoinRequest.objects
+        .select_for_update()
+        .select_related('team__session__game', 'user'),
+        pk=pk,
+    )
+    if not _can_decide_join_request(request.user, join_request.team):
+        return Response(
+            {'detail': 'Only the team captain or staff may decide this request.'},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+    if join_request.status != TeamJoinRequest.STATUS_PENDING:
+        return Response(
+            {'detail': 'This request has already been decided.'},
+            status=status.HTTP_409_CONFLICT,
+        )
+    join_request.reject(decided_by=request.user)
+    return Response(TeamJoinRequestSerializer(join_request).data)
