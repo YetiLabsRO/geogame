@@ -23,7 +23,7 @@ from rest_framework.views import APIView
 
 from game.scoping import SessionScopedViewSetMixin
 from organize.emails import send_invite_email
-from organize.models import Invite, TeamMembership, user_can_invite_to_team
+from organize.models import Invite, Session, TeamMembership, user_can_invite_to_team
 
 User = get_user_model()
 
@@ -314,6 +314,7 @@ class CurrentSessionSerializer(serializers.Serializer):
     id = serializers.IntegerField()
     slug = serializers.CharField()
     name = serializers.CharField()
+    state = serializers.CharField()
     is_active = serializers.BooleanField()
     start_time = serializers.DateTimeField()
     end_time = serializers.DateTimeField()
@@ -332,7 +333,6 @@ class MySessionsView(APIView):
     permission_classes = [IsAuthenticated]
 
     def get(self, request):
-        from organize.models import Session
         session_ids = (
             request.user.profile.memberships
             .values_list('team__session_id', flat=True)
@@ -477,17 +477,23 @@ class CurrentSessionView(APIView):
     permission_classes = [IsAuthenticated]
 
     def _candidate_sessions(self, user):
-        """Distinct sessions this user is an active member of."""
-        from organize.models import Session
+        """Distinct active sessions this user is an active member of.
+
+        "Active" is the derived lifecycle notion: state in
+        OPEN_FOR_PARTICIPANTS / RUNNING / PAUSED.
+        """
         session_ids = (
             user.profile.memberships
-            .filter(is_active=True, team__session__is_active=True)
+            .filter(
+                is_active=True,
+                team__session__state__in=Session.ACTIVE_STATES,
+            )
             .values_list('team__session_id', flat=True)
             .distinct()
         )
         return list(
             Session.objects
-            .filter(id__in=session_ids, is_active=True)
+            .filter(id__in=session_ids, state__in=Session.ACTIVE_STATES)
             .select_related('game')
             .order_by('game__name', 'name')
         )
@@ -502,10 +508,9 @@ class CurrentSessionView(APIView):
         ).exists()
 
     def _staff_fallback(self):
-        from organize.models import Session
         return (
             Session.objects
-            .filter(is_active=True)
+            .filter(state__in=Session.ACTIVE_STATES)
             .select_related('game')
             .order_by('-start_time')
             .first()
@@ -552,7 +557,6 @@ class CurrentSessionView(APIView):
         )
 
     def post(self, request):
-        from organize.models import Session
         session_id = request.data.get('session_id')
         if not session_id:
             return Response(
@@ -742,6 +746,21 @@ def invite_accept(request, token):
         return Response({'detail': 'Invite not found.'}, status=status.HTTP_404_NOT_FOUND)
     if not invite.is_usable():
         return Response({'detail': 'Invite is no longer usable.'}, status=status.HTTP_410_GONE)
+
+    # Session lifecycle roster gating: joining is closed while the
+    # session is DRAFT or FINISHED (rosters form once participation
+    # opens; see the session-lifecycle capability).
+    invite_session = invite.team.session
+    if not invite_session.accepts_roster_changes():
+        return Response(
+            {
+                'detail': (
+                    'This session is not accepting participants right now '
+                    f'(state: {invite_session.state}).'
+                ),
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     if request.user.is_authenticated:
         user = request.user

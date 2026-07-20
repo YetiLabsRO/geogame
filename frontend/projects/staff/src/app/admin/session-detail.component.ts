@@ -4,6 +4,8 @@ import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 import { forkJoin } from 'rxjs';
 
+import { HttpErrorResponse } from '@angular/common/http';
+
 import {
   AdminSession,
   AdminSessionPayload,
@@ -13,7 +15,9 @@ import {
   PauseHistory,
   Phase10Overrides,
   SessionScoreboard,
+  SessionState,
   SessionTimeline,
+  SessionTransitionAction,
   StaffApiService,
 } from 'shared';
 
@@ -45,55 +49,82 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
     } @else if (scoreboard(); as sb) {
       <h1 class="h3 mt-2 mb-1">
         {{ sb.session.name }}
-        @if (session()?.is_paused) {
-          <span class="badge text-bg-warning ms-2">Paused</span>
+        @if (session(); as s) {
+          <span class="badge ms-2" [class]="stateBadgeClass(s.state)">
+            {{ stateLabel(s.state) }}
+          </span>
         }
       </h1>
       <div class="text-body-secondary small mb-3">
         {{ sb.session.game.name }} · <code>{{ sb.session.slug }}</code>
-        @if (!sb.session.is_active) {
-          <span class="badge text-bg-secondary ms-2">Past</span>
-        } @else {
-          <span class="badge text-bg-success ms-2">Active</span>
+        @if (session()?.scheduled_start; as scheduled) {
+          · <i class="bi bi-clock"></i>
+          scheduled start {{ scheduled | date: 'medium' }}
         }
       </div>
+
+      <!-- Lifecycle -------------------------------------------------------- -->
+      @if (session(); as s) {
+        <div class="card mb-4">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <h2 class="h6 mb-0">
+                Lifecycle
+                <span class="badge ms-2" [class]="stateBadgeClass(s.state)">
+                  {{ stateLabel(s.state) }}
+                </span>
+              </h2>
+              <div class="d-flex gap-2 flex-wrap">
+                @for (a of s.allowed_transitions; track a) {
+                  <button
+                    type="button"
+                    class="btn btn-sm"
+                    [class]="actionButtonClass(a)"
+                    [disabled]="lifecycleBusy()"
+                    (click)="transition(a)"
+                  >
+                    @if (lifecycleBusy()) {
+                      <span class="spinner-border spinner-border-sm me-1"></span>
+                    }
+                    {{ actionLabel(a) }}
+                  </button>
+                }
+                @if (s.state === 'DRAFT') {
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-success"
+                    [disabled]="lifecycleBusy()"
+                    (click)="openAndStart()"
+                  >
+                    @if (lifecycleBusy()) {
+                      <span class="spinner-border spinner-border-sm me-1"></span>
+                    }
+                    Open &amp; start
+                  </button>
+                }
+                @if (s.state === 'FINISHED') {
+                  <span class="text-body-secondary small align-self-center">
+                    Finished sessions are terminal.
+                  </span>
+                }
+              </div>
+            </div>
+            <p class="text-body-secondary small mb-0 mt-2">
+              DRAFT → OPEN_FOR_PARTICIPANTS → RUNNING ⇄ PAUSED → FINISHED.
+              Rosters form while participation is open; finishing closes all
+              ownerships and keeps history.
+            </p>
+            @if (lifecycleError(); as msg) {
+              <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
+            }
+          </div>
+        </div>
+      }
 
       <!-- Day pausing ------------------------------------------------------ -->
       <div class="card mb-4">
         <div class="card-body">
-          <div class="d-flex justify-content-between align-items-center">
-            <h2 class="h6 mb-0">Day pausing</h2>
-            @if (session(); as s) {
-              @if (s.is_paused) {
-                <button
-                  type="button"
-                  class="btn btn-sm btn-success"
-                  [disabled]="pauseBusy()"
-                  (click)="resume()"
-                >
-                  @if (pauseBusy()) {
-                    <span class="spinner-border spinner-border-sm me-1"></span>
-                  }
-                  Resume
-                </button>
-              } @else {
-                <button
-                  type="button"
-                  class="btn btn-sm btn-warning"
-                  [disabled]="pauseBusy() || !s.is_active"
-                  (click)="pause()"
-                >
-                  @if (pauseBusy()) {
-                    <span class="spinner-border spinner-border-sm me-1"></span>
-                  }
-                  Pause
-                </button>
-              }
-            }
-          </div>
-          @if (pauseError(); as msg) {
-            <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
-          }
+          <h2 class="h6 mb-0">Pause history</h2>
           @if (pauseHistory(); as ph) {
             @if (ph.windows.length === 0) {
               <p class="text-body-secondary small mb-0 mt-2">No pauses yet.</p>
@@ -339,8 +370,8 @@ export class StaffSessionDetailComponent {
   protected readonly failCounters = signal<FailCounterInfo[]>([]);
   protected readonly loadError = signal<string | null>(null);
 
-  protected readonly pauseBusy = signal(false);
-  protected readonly pauseError = signal<string | null>(null);
+  protected readonly lifecycleBusy = signal(false);
+  protected readonly lifecycleError = signal<string | null>(null);
 
   protected readonly override = signal<Phase10Overrides>(blankOverrides());
   protected readonly overrideDirty = signal(false);
@@ -397,26 +428,93 @@ export class StaffSessionDetailComponent {
     this.overrideDirty.set(false);
   }
 
-  protected pause(): void {
-    this.runPause(this.staff.pauseSession(this.sessionId));
+  // ---- Lifecycle controls (session-lifecycle) -----------------------------
+
+  protected stateLabel(state: SessionState): string {
+    return STATE_LABELS[state] ?? state;
   }
 
-  protected resume(): void {
-    this.runPause(this.staff.resumeSession(this.sessionId));
+  protected stateBadgeClass(state: SessionState): string {
+    return STATE_BADGES[state] ?? 'text-bg-secondary';
   }
 
-  private runPause(call: ReturnType<StaffApiService['pauseSession']>): void {
-    this.pauseBusy.set(true);
-    this.pauseError.set(null);
-    call.subscribe({
+  protected actionLabel(action: SessionTransitionAction): string {
+    return ACTION_LABELS[action] ?? action;
+  }
+
+  protected actionButtonClass(action: SessionTransitionAction): string {
+    return ACTION_BUTTONS[action] ?? 'btn-outline-secondary';
+  }
+
+  protected transition(action: SessionTransitionAction, override = false): void {
+    if (this.lifecycleBusy()) return;
+    if (action === 'finish' && !override) {
+      const ok = window.confirm(
+        'Finish this session? All open tower/zone ownerships will be closed ' +
+          'and the session becomes terminal (history is kept).',
+      );
+      if (!ok) return;
+    }
+    this.lifecycleBusy.set(true);
+    this.lifecycleError.set(null);
+    this.staff.transitionSession(this.sessionId, action, override).subscribe({
       next: (s) => {
         this.setSession(s);
         this.reloadState();
       },
       error: (err) => {
-        this.pauseBusy.set(false);
-        this.pauseError.set(extractErrorMessage(err));
+        this.lifecycleBusy.set(false);
+        // Out-of-window open_participation: offer the staff override.
+        if (
+          action === 'open_participation' &&
+          !override &&
+          err instanceof HttpErrorResponse &&
+          err.status === 409 &&
+          err.error?.requires_override
+        ) {
+          const ok = window.confirm(
+            'The participation window is outside the allowed range ' +
+              '(7 days to 1 hour before the scheduled start). Open anyway?',
+          );
+          if (ok) {
+            this.transition(action, true);
+            return;
+          }
+        }
+        this.lifecycleError.set(extractErrorMessage(err));
       },
+    });
+  }
+
+  /** DRAFT fast path: chain open_participation then start. */
+  protected openAndStart(): void {
+    if (this.lifecycleBusy()) return;
+    this.lifecycleBusy.set(true);
+    this.lifecycleError.set(null);
+    this.staff.transitionSession(this.sessionId, 'open_participation').subscribe({
+      next: () => {
+        this.staff.transitionSession(this.sessionId, 'start').subscribe({
+          next: (s) => {
+            this.setSession(s);
+            this.reloadState();
+          },
+          error: (err) => {
+            this.lifecycleBusy.set(false);
+            this.lifecycleError.set(extractErrorMessage(err));
+            this.refreshSession();
+          },
+        });
+      },
+      error: (err) => {
+        this.lifecycleBusy.set(false);
+        this.lifecycleError.set(extractErrorMessage(err));
+      },
+    });
+  }
+
+  private refreshSession(): void {
+    this.staff.getSession(this.sessionId).subscribe({
+      next: (s) => this.setSession(s),
     });
   }
 
@@ -432,11 +530,11 @@ export class StaffSessionDetailComponent {
         this.timeline.set(r.timeline);
         this.pauseHistory.set(r.pauseHistory);
         this.failCounters.set(r.failCounters);
-        this.pauseBusy.set(false);
+        this.lifecycleBusy.set(false);
       },
       error: (err) => {
-        this.pauseBusy.set(false);
-        this.pauseError.set(extractErrorMessage(err));
+        this.lifecycleBusy.set(false);
+        this.lifecycleError.set(extractErrorMessage(err));
       },
     });
   }
@@ -466,6 +564,40 @@ export class StaffSessionDetailComponent {
     });
   }
 }
+
+const STATE_LABELS: Record<SessionState, string> = {
+  DRAFT: 'Draft',
+  OPEN_FOR_PARTICIPANTS: 'Open for participants',
+  RUNNING: 'Running',
+  PAUSED: 'Paused',
+  FINISHED: 'Finished',
+};
+
+const STATE_BADGES: Record<SessionState, string> = {
+  DRAFT: 'text-bg-secondary',
+  OPEN_FOR_PARTICIPANTS: 'text-bg-info',
+  RUNNING: 'text-bg-success',
+  PAUSED: 'text-bg-warning',
+  FINISHED: 'text-bg-dark',
+};
+
+const ACTION_LABELS: Record<SessionTransitionAction, string> = {
+  open_participation: 'Open participation',
+  close_participation: 'Close participation',
+  start: 'Start',
+  pause: 'Pause',
+  resume: 'Resume',
+  finish: 'Finish',
+};
+
+const ACTION_BUTTONS: Record<SessionTransitionAction, string> = {
+  open_participation: 'btn-outline-primary',
+  close_participation: 'btn-outline-secondary',
+  start: 'btn-success',
+  pause: 'btn-warning',
+  resume: 'btn-success',
+  finish: 'btn-outline-danger',
+};
 
 function blankOverrides(): Phase10Overrides {
   return {

@@ -49,6 +49,7 @@ from game.models import (
 from organize.models import (
     Game,
     GameRole,
+    Invite,
     Session,
     Team,
     TeamGroup,
@@ -131,7 +132,11 @@ def _make_tower(game, name="T", zone=None, lng=23.5, lat=46.5, is_active=True,
 
 
 def _default_session(game):
-    """Helper: return (creating if missing) the default Session for a Game."""
+    """Helper: return (creating if missing) the default Session for a Game.
+
+    Created RUNNING so gameplay flows (captures, submissions, joins)
+    work without each test driving the lifecycle first.
+    """
     from organize.models import Session
     session = Session.objects.filter(game=game, slug='default').first()
     if session is None:
@@ -142,7 +147,7 @@ def _default_session(game):
             name='Default session',
             start_time=now,
             end_time=now + timedelta(hours=1),
-            is_active=game.is_active,
+            state=Session.RUNNING,
         )
     return session
 
@@ -1013,11 +1018,7 @@ class AdminSessionsEndpointTest(TestCase):
         self.zone = _make_zone(self.game)
         self.tower = _make_tower(self.game, zone=self.zone)
         self.team = _make_team(self.game, self.group)
-        self.session = self.team.session  # auto-created default session
-        # Default sessions inherit game.is_active (False) — bump it so
-        # the deactivation tests have something to deactivate.
-        self.session.is_active = True
-        self.session.save()
+        self.session = self.team.session  # auto-created default session (RUNNING)
         self.staff_client, self.staff = _staff_client(
             session=self.session, username='s-admin',
         )
@@ -1027,7 +1028,7 @@ class AdminSessionsEndpointTest(TestCase):
         Session.objects.create(
             game=self.other_game, slug='default', name='Other default',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
 
     def test_list_returns_all_sessions_across_games(self):
@@ -1052,14 +1053,18 @@ class AdminSessionsEndpointTest(TestCase):
                 'name': 'Afternoon',
                 'start_time': timezone.now().isoformat(),
                 'end_time': (timezone.now() + timedelta(hours=2)).isoformat(),
-                'is_active': True,
             },
             format='json',
         )
         self.assertEqual(resp.status_code, 201, resp.content)
-        self.assertEqual(resp.json()['slug'], 'afternoon')
+        body = resp.json()
+        self.assertEqual(body['slug'], 'afternoon')
+        # New Sessions start their lifecycle in DRAFT.
+        self.assertEqual(body['state'], 'DRAFT')
+        self.assertFalse(body['is_active'])
+        self.assertEqual(body['allowed_transitions'], ['open_participation'])
 
-    def test_deactivating_session_closes_ownerships_and_locks_scores(self):
+    def test_finishing_session_closes_ownerships_and_locks_scores(self):
         # Assign tower to team so there's open ownership to close.
         self.tower.assign_to_team(self.team)
         # Wait a tick so get_score has something positive.
@@ -1072,10 +1077,8 @@ class AdminSessionsEndpointTest(TestCase):
                 team=self.team, timestamp_end__isnull=True,
             ).exists(),
         )
-        resp = self.staff_client.patch(
-            f'/api/staff/sessions/{self.session.id}/',
-            {'is_active': False},
-            format='json',
+        resp = self.staff_client.post(
+            f'/api/staff/sessions/{self.session.id}/finish/',
         )
         self.assertEqual(resp.status_code, 200, resp.content)
         self.assertFalse(
@@ -1090,49 +1093,378 @@ class AdminSessionsEndpointTest(TestCase):
             ).exists(),
         )
 
-    def test_deactivating_session_does_not_touch_other_session_ownerships(self):
+    def test_finishing_session_does_not_touch_other_session_ownerships(self):
         from organize.models import Session
         # Second session on the SAME game with its own team + ownership.
         now = timezone.now()
         other_session = Session.objects.create(
             game=self.game, slug='parallel', name='Parallel',
             start_time=now, end_time=now + timedelta(hours=1),
-            is_active=True,
+            state=Session.RUNNING,
         )
         other_team = Team.objects.create(
             name='other', session=other_session, color='#f00',
         )
         # Give both teams an active tower ownership.
         self.tower.assign_to_team(self.team)
-        # Closing our session must not touch other_session's state —
-        # we assert by patching and then verifying other_team still has
+        # Finishing our session must not touch other_session's state —
+        # we assert by finishing and then verifying other_team still has
         # any membership/config intact.
-        resp = self.staff_client.patch(
-            f'/api/staff/sessions/{self.session.id}/',
-            {'is_active': False},
-            format='json',
+        resp = self.staff_client.post(
+            f'/api/staff/sessions/{self.session.id}/finish/',
         )
         self.assertEqual(resp.status_code, 200)
         other_session.refresh_from_db()
         self.assertTrue(other_session.is_active)
+        self.assertEqual(other_session.state, Session.RUNNING)
         # other_team is untouched (no ownerships were opened or closed).
         self.assertEqual(other_team.teamtowerownership_set.count(), 0)
 
-    def test_patch_noop_when_already_inactive(self):
-        self.session.is_active = False
-        self.session.save()
+    def test_patch_cannot_write_state_or_close_ownerships(self):
+        """PATCH never drives the lifecycle: state and is_active are read-only."""
         self.tower.assign_to_team(self.team)
         from game.models import TeamTowerOwnership
         resp = self.staff_client.patch(
             f'/api/staff/sessions/{self.session.id}/',
-            {'name': 'Renamed'},
+            {'name': 'Renamed', 'state': 'FINISHED', 'is_active': False},
             format='json',
         )
         self.assertEqual(resp.status_code, 200)
-        # Ownership unchanged — patch didn't flip is_active.
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.name, 'Renamed')
+        # Lifecycle untouched — writes go through the transition actions.
+        self.assertEqual(self.session.state, Session.RUNNING)
         self.assertTrue(
             TeamTowerOwnership.objects.filter(
                 team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# game-lifecycle-states — Session state machine (tasks 7.1, 7.3, 7.4, 7.5)
+# ---------------------------------------------------------------------------
+
+
+class SessionLifecycleTest(TestCase):
+    """Transition table, PAUSED invariant, finish semantics, roster gating."""
+
+    ACTIONS = (
+        'open_participation', 'close_participation', 'start',
+        'pause', 'resume', 'finish',
+    )
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session  # default session, RUNNING
+        self.staff_client, self.staff = _staff_client(
+            session=self.session, username='lifecycle-staff',
+        )
+
+    def _set_state(self, state):
+        """Force a lifecycle state while keeping the PAUSED invariant."""
+        PauseWindow.objects.filter(session=self.session).delete()
+        Session.objects.filter(pk=self.session.pk).update(state=state)
+        if state == Session.PAUSED:
+            PauseWindow.objects.create(
+                session=self.session, started_at=timezone.now(),
+            )
+        self.session.refresh_from_db()
+
+    def _post(self, action, session=None, data=None):
+        session = session or self.session
+        return self.staff_client.post(
+            f'/api/staff/sessions/{session.id}/{action}/',
+            data or {}, format='json',
+        )
+
+    # ---- 7.1 transition table ---------------------------------------------
+
+    def test_transition_table_edges_are_exact(self):
+        """All 25 (from, to) pairs: exactly the 7 table edges are legal."""
+        expected_edges = {
+            (Session.DRAFT, Session.OPEN_FOR_PARTICIPANTS),
+            (Session.OPEN_FOR_PARTICIPANTS, Session.DRAFT),
+            (Session.OPEN_FOR_PARTICIPANTS, Session.RUNNING),
+            (Session.RUNNING, Session.PAUSED),
+            (Session.PAUSED, Session.RUNNING),
+            (Session.RUNNING, Session.FINISHED),
+            (Session.PAUSED, Session.FINISHED),
+        }
+        edges = {
+            (from_state, to_state)
+            for _action, from_state, to_state in Session.TRANSITIONS
+        }
+        self.assertEqual(edges, expected_edges)
+        states = [value for value, _label in Session.STATE_CHOICES]
+        self.assertEqual(len(states), 5)
+        for from_state in states:
+            for to_state in states:
+                self.assertEqual(
+                    (from_state, to_state) in edges,
+                    (from_state, to_state) in expected_edges,
+                )
+        # FINISHED is terminal: no outbound edge.
+        self.assertFalse(any(f == Session.FINISHED for f, _ in edges))
+
+    def test_every_action_from_every_state_matches_table(self):
+        """Legal (action, state) pairs succeed; every other pair is a 409."""
+        legal = {
+            (action, from_state)
+            for action, from_state, _to in Session.TRANSITIONS
+        }
+        states = [value for value, _label in Session.STATE_CHOICES]
+        for state in states:
+            for action in self.ACTIONS:
+                with self.subTest(state=state, action=action):
+                    self._set_state(state)
+                    resp = self._post(action)
+                    if (action, state) in legal:
+                        self.assertEqual(resp.status_code, 200, resp.content)
+                    else:
+                        self.assertEqual(resp.status_code, 409, resp.content)
+                        self.session.refresh_from_db()
+                        # A rejected transition leaves the state unchanged.
+                        self.assertEqual(self.session.state, state)
+
+    def test_new_session_defaults_to_draft(self):
+        now = timezone.now()
+        session = Session.objects.create(
+            game=self.game, slug='fresh', name='Fresh',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        self.assertEqual(session.state, Session.DRAFT)
+        self.assertFalse(session.is_active)
+        self.assertEqual(session.allowed_transitions, ['open_participation'])
+
+    def test_is_active_derives_from_state(self):
+        expectations = {
+            Session.DRAFT: False,
+            Session.OPEN_FOR_PARTICIPANTS: True,
+            Session.RUNNING: True,
+            Session.PAUSED: True,
+            Session.FINISHED: False,
+        }
+        for state, expected in expectations.items():
+            self._set_state(state)
+            self.assertEqual(self.session.is_active, expected)
+
+    def test_full_lifecycle_walk(self):
+        """DRAFT → open ⇄ close → start → pause ⇄ resume → finish."""
+        self._set_state(Session.DRAFT)
+        self.assertEqual(self._post('open_participation').status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.OPEN_FOR_PARTICIPANTS)
+        self.assertEqual(self._post('close_participation').status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.DRAFT)
+        # Teams created before the close are retained.
+        self.assertTrue(self.session.teams.filter(pk=self.team.pk).exists())
+        self._post('open_participation')
+        resp = self._post('start')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['state'], 'RUNNING')
+        self.assertCountEqual(
+            resp.json()['allowed_transitions'], ['pause', 'finish'],
+        )
+        self._post('pause')
+        self._post('resume')
+        resp = self._post('finish')
+        self.assertEqual(resp.status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.FINISHED)
+        self.assertEqual(self.session.allowed_transitions, [])
+
+    # ---- 7.3 PAUSED ⟺ open PauseWindow invariant ---------------------------
+
+    def _has_open_window(self, session=None):
+        return PauseWindow.objects.filter(
+            session=session or self.session, ended_at__isnull=True,
+        ).exists()
+
+    def test_pause_resume_keep_state_and_window_in_lockstep(self):
+        self.assertFalse(self._has_open_window())
+        resp = self._post('pause')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['state'], 'PAUSED')
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.PAUSED)
+        self.assertTrue(self.session.is_paused())
+        self.assertTrue(self._has_open_window())
+        resp = self._post('resume')
+        self.assertEqual(resp.status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.RUNNING)
+        self.assertFalse(self.session.is_paused())
+        self.assertFalse(self._has_open_window())
+
+    def test_model_level_pause_helpers_also_move_the_state(self):
+        """Legacy PauseWindow.pause_session callers keep the invariant."""
+        PauseWindow.pause_session(self.session)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.PAUSED)
+        PauseWindow.resume_session(self.session)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.RUNNING)
+
+    def test_pause_all_lands_every_running_session_in_paused(self):
+        now = timezone.now()
+        running = Session.objects.create(
+            game=self.game, slug='second', name='Second',
+            start_time=now, end_time=now + timedelta(hours=1),
+            state=Session.RUNNING,
+        )
+        draft = Session.objects.create(
+            game=self.game, slug='drafted', name='Drafted',
+            start_time=now, end_time=now + timedelta(hours=1),
+        )
+        resp = self.staff_client.post(
+            f'/api/staff/games/{self.game.id}/pause_all/',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertCountEqual(
+            resp.json()['paused_sessions'], [self.session.id, running.id],
+        )
+        for session in (self.session, running):
+            session.refresh_from_db()
+            self.assertEqual(session.state, Session.PAUSED)
+            self.assertTrue(self._has_open_window(session))
+        draft.refresh_from_db()
+        self.assertEqual(draft.state, Session.DRAFT)
+        self.assertFalse(self._has_open_window(draft))
+
+    # ---- 7.4 finish ---------------------------------------------------------
+
+    def test_finish_from_running_closes_ownerships_and_is_terminal(self):
+        self.tower.assign_to_team(self.team)
+        self.assertTrue(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        resp = self._post('finish')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.FINISHED)
+        self.assertFalse(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        self.assertFalse(
+            TeamZoneOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        # History preserved: closed records still exist.
+        self.assertEqual(
+            TeamTowerOwnership.objects.filter(team=self.team).count(), 1,
+        )
+        # Terminal: every further action is a 409.
+        for action in self.ACTIONS:
+            self.assertEqual(self._post(action).status_code, 409)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.FINISHED)
+
+    def test_finish_from_paused_closes_window_without_reopening(self):
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(self._post('pause').status_code, 200)
+        window = PauseWindow.objects.get(session=self.session)
+        self.assertIsNone(window.ended_at)
+        # Ownerships were closed at pause time and snapshotted for restore.
+        self.assertTrue(window.restore_on_resume)
+        resp = self._post('finish')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.state, Session.FINISHED)
+        window.refresh_from_db()
+        self.assertIsNotNone(window.ended_at)
+        # Finishing did NOT reopen the snapshotted ownerships.
+        self.assertFalse(
+            TeamTowerOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+        self.assertFalse(
+            TeamZoneOwnership.objects.filter(
+                team=self.team, timestamp_end__isnull=True,
+            ).exists(),
+        )
+
+    # ---- 7.5 participation window + roster gating --------------------------
+
+    def test_open_participation_honours_scheduled_start_bound(self):
+        self._set_state(Session.DRAFT)
+        # No scheduled_start: openable at any time.
+        self.assertEqual(self._post('open_participation').status_code, 200)
+        self._set_state(Session.DRAFT)
+        # Too early (more than 7 days before the planned start).
+        self.session.scheduled_start = timezone.now() + timedelta(days=8)
+        self.session.save(update_fields=['scheduled_start'])
+        resp = self._post('open_participation')
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertTrue(resp.json().get('requires_override'))
+        # Staff override opens anyway.
+        resp = self._post('open_participation', data={'override': True})
+        self.assertEqual(resp.status_code, 200, resp.content)
+        # Too late (less than 1 hour before the planned start).
+        self._set_state(Session.DRAFT)
+        self.session.scheduled_start = timezone.now() + timedelta(minutes=30)
+        self.session.save(update_fields=['scheduled_start'])
+        self.assertEqual(self._post('open_participation').status_code, 409)
+        # Within the 7-days-to-1-hour window: allowed without override.
+        self.session.scheduled_start = timezone.now() + timedelta(days=2)
+        self.session.save(update_fields=['scheduled_start'])
+        self.assertEqual(self._post('open_participation').status_code, 200)
+
+    def test_team_creation_follows_roster_window(self):
+        cases = (
+            (Session.DRAFT, 409),
+            (Session.OPEN_FOR_PARTICIPANTS, 201),
+            (Session.FINISHED, 409),
+        )
+        for index, (state, expected) in enumerate(cases):
+            with self.subTest(state=state):
+                self._set_state(state)
+                resp = self.staff_client.post(
+                    '/api/staff/teams/',
+                    {
+                        'name': f'rooster-{index}',
+                        'session': self.session.id,
+                        'color': '#123456',
+                    },
+                    format='json',
+                )
+                self.assertEqual(resp.status_code, expected, resp.content)
+
+    def test_invite_join_follows_roster_window(self):
+        invite = Invite.objects.create(
+            team=self.team, email='', created_by=self.staff,
+        )
+        joiner = User.objects.create_user(
+            username='joiner', email='joiner@example.com',
+            password='password123',
+        )
+        client = APIClient()
+        client.credentials(
+            HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=joiner).key}',
+        )
+        url = reverse('api-invite-accept', args=[invite.token])
+        for state in (Session.DRAFT, Session.FINISHED):
+            with self.subTest(state=state):
+                self._set_state(state)
+                resp = client.post(url)
+                self.assertEqual(resp.status_code, 409, resp.content)
+        self._set_state(Session.OPEN_FOR_PARTICIPANTS)
+        resp = client.post(url)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=self.team, user=joiner.profile, is_active=True,
             ).exists(),
         )
 
@@ -1324,13 +1656,13 @@ class ScopingTwoSessionsOneGameTest(TestCase):
         self.session_a = Session.objects.create(
             game=self.game, slug='morning', name='Morning',
             start_time=now, end_time=now + timedelta(hours=2),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.session_b = Session.objects.create(
             game=self.game, slug='afternoon', name='Afternoon',
             start_time=now + timedelta(hours=3),
             end_time=now + timedelta(hours=5),
-            is_active=True,
+            state=Session.RUNNING,
         )
         self.team_a = Team.objects.create(
             name='team-a', session=self.session_a, color='#111', group=self.group,
@@ -1805,9 +2137,7 @@ class DayPausingTest(TestCase):
         self.zone = _make_zone(self.game)  # LINEAR scoring
         self.tower = _make_tower(self.game, zone=self.zone)
         self.team = _make_team(self.game, self.group)
-        self.session = self.team.session
-        self.session.is_active = True
-        self.session.save()
+        self.session = self.team.session  # default session, RUNNING
 
     def _open_tower_ownership(self, team=None, tower=None):
         return TeamTowerOwnership.objects.create(
@@ -1900,7 +2230,8 @@ class DayPausingTest(TestCase):
         now = timezone.now()
         s2 = Session.objects.create(
             game=self.game, slug='s2', name='S2',
-            start_time=now, end_time=now + timedelta(hours=1), is_active=True,
+            start_time=now, end_time=now + timedelta(hours=1),
+            state=Session.RUNNING,
         )
         Team.objects.create(name='t-s2', color='#111111', session=s2, group=self.group)
         client, _ = _staff_client(session=self.session)
@@ -1972,9 +2303,7 @@ class FailureConsequencesTest(TestCase):
         self.tower = _make_tower(self.game, zone=self.zone, name='A')
         self.tower_b = _make_tower(self.game, zone=self.zone, name='B')
         self.team = _make_team(self.game, self.group)
-        self.session = self.team.session
-        self.session.is_active = True
-        self.session.save()
+        self.session = self.team.session  # default session, RUNNING
         self.challenge = Challenge.objects.create(
             text='c', tower=self.tower, difficulty=1, game=self.game,
         )

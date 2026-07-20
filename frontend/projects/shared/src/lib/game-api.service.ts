@@ -61,6 +61,8 @@ export interface CurrentSession {
   id: number;
   slug: string;
   name: string;
+  /** Lifecycle state (session-lifecycle capability). */
+  state: string;
   is_active: boolean;
   start_time: string;
   end_time: string;

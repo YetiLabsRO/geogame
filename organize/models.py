@@ -1,4 +1,5 @@
 import uuid
+from datetime import timedelta
 
 from colorfield.fields import ColorField
 from django.conf import settings
@@ -221,6 +222,19 @@ class TeamGroup(models.Model):
         unique_together = (('game', 'slug'),)
 
 
+class IllegalTransition(Exception):
+    """A lifecycle action that is not a legal edge from the current state.
+
+    API layers translate this into HTTP 409. `requires_override` marks
+    rejections that a staff `override` flag would allow (currently only
+    the out-of-window `open_participation` timing bound).
+    """
+
+    def __init__(self, message, *, requires_override=False):
+        super().__init__(message)
+        self.requires_override = requires_override
+
+
 class Session(models.Model):
     """A single run of a Game with its own roster and scoreboard.
 
@@ -230,6 +244,41 @@ class Session(models.Model):
     SessionGroups are a future phase.
     """
 
+    # --- Lifecycle states (session-lifecycle capability). ---
+    DRAFT = 'DRAFT'
+    OPEN_FOR_PARTICIPANTS = 'OPEN_FOR_PARTICIPANTS'
+    RUNNING = 'RUNNING'
+    PAUSED = 'PAUSED'
+    FINISHED = 'FINISHED'
+    STATE_CHOICES = [
+        (DRAFT, 'Draft'),
+        (OPEN_FOR_PARTICIPANTS, 'Open for participants'),
+        (RUNNING, 'Running'),
+        (PAUSED, 'Paused'),
+        (FINISHED, 'Finished'),
+    ]
+    # States in which the derived `is_active` reads True (visible in
+    # player / scoreboard views, selectable as current session).
+    ACTIVE_STATES = (OPEN_FOR_PARTICIPANTS, RUNNING, PAUSED)
+
+    # Canonical allowed-transition table — the single source of truth
+    # used by the transition engine, serializers, and the runner UI.
+    # Rows are (action, from_state, to_state); anything else is a 409.
+    TRANSITIONS = (
+        ('open_participation', DRAFT, OPEN_FOR_PARTICIPANTS),
+        ('close_participation', OPEN_FOR_PARTICIPANTS, DRAFT),
+        ('start', OPEN_FOR_PARTICIPANTS, RUNNING),
+        ('pause', RUNNING, PAUSED),
+        ('resume', PAUSED, RUNNING),
+        ('finish', RUNNING, FINISHED),
+        ('finish', PAUSED, FINISHED),
+    )
+
+    # `open_participation` timing bound relative to `scheduled_start`:
+    # openable from 7 days before down to 1 hour before the planned start.
+    PARTICIPATION_OPEN_MAX_BEFORE = timedelta(days=7)
+    PARTICIPATION_OPEN_MIN_BEFORE = timedelta(hours=1)
+
     game = models.ForeignKey(
         Game, on_delete=models.CASCADE, related_name='sessions',
     )
@@ -237,7 +286,11 @@ class Session(models.Model):
     name = models.CharField(max_length=255)
     start_time = models.DateTimeField()
     end_time = models.DateTimeField()
-    is_active = models.BooleanField(default=False)
+    state = models.CharField(
+        max_length=32, choices=STATE_CHOICES, default=DRAFT,
+    )
+    # Optional planned RUNNING time; bounds when participation may open.
+    scheduled_start = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
@@ -274,6 +327,145 @@ class Session(models.Model):
         if value is None:
             return getattr(self.game, field)
         return value
+
+    # ------------------------------------------------------------------
+    # Lifecycle state machine (session-lifecycle capability)
+    # ------------------------------------------------------------------
+
+    @property
+    def is_active(self):
+        """Derived, read-only successor of the old boolean column.
+
+        True while the Session is visible in player / scoreboard views
+        and selectable as a current session. Query with
+        `state__in=Session.ACTIVE_STATES` at the ORM level.
+        """
+        return self.state in self.ACTIVE_STATES
+
+    def is_running(self):
+        return self.state == self.RUNNING
+
+    def is_paused(self):
+        return self.state == self.PAUSED
+
+    def is_finished(self):
+        return self.state == self.FINISHED
+
+    @property
+    def allowed_transitions(self):
+        """Actions legal from the current state, in table order."""
+        return [
+            action for action, source, _target in self.TRANSITIONS
+            if source == self.state
+        ]
+
+    def transition(self, action, *, actor=None, override=False):
+        """Apply a lifecycle action atomically.
+
+        Validates the current state against the canonical TRANSITIONS
+        table, applies the action's side effects and the state change in
+        one transaction, and raises IllegalTransition (mapped to HTTP
+        409 by the API layer) for anything not in the table.
+        """
+        target = next(
+            (
+                to_state for act, from_state, to_state in self.TRANSITIONS
+                if act == action and from_state == self.state
+            ),
+            None,
+        )
+        if target is None:
+            raise IllegalTransition(
+                f'Cannot {action} a session in state {self.state}.',
+            )
+        with transaction.atomic():
+            getattr(self, f'_apply_{action}')(override=override)
+            self.state = target
+            self.save(update_fields=['state'])
+        return self
+
+    def _apply_open_participation(self, override=False):
+        """Enforce the scheduled_start timing bound (7 days–1 hour before)."""
+        if self.scheduled_start is None or override:
+            return
+        now = timezone.now()
+        earliest = self.scheduled_start - self.PARTICIPATION_OPEN_MAX_BEFORE
+        latest = self.scheduled_start - self.PARTICIPATION_OPEN_MIN_BEFORE
+        if not (earliest <= now <= latest):
+            raise IllegalTransition(
+                'Participation may only open between 7 days and 1 hour '
+                'before the scheduled start; use override to open anyway.',
+                requires_override=True,
+            )
+
+    def _apply_close_participation(self, override=False):
+        """Re-close the roster window; existing Teams are retained."""
+
+    def _apply_start(self, override=False):
+        # Seam for the game-config-team-rules change: when it lands, it
+        # provides Session.can_start() / start_blockers() gating helpers
+        # that this hook picks up without further wiring here.
+        gate = getattr(self, 'can_start', None)
+        if callable(gate) and not gate():
+            blockers_fn = getattr(self, 'start_blockers', None)
+            blockers = blockers_fn() if callable(blockers_fn) else []
+            detail = '; '.join(str(b) for b in blockers) or 'start conditions not met'
+            raise IllegalTransition(f'Session cannot start: {detail}.')
+
+    def _apply_pause(self, override=False):
+        from game.models import PauseWindow
+        if PauseWindow.pause_session(self) is None:
+            raise IllegalTransition('Session already has an open pause window.')
+
+    def _apply_resume(self, override=False):
+        from game.models import PauseWindow
+        if PauseWindow.resume_session(self) is None:
+            raise IllegalTransition('Session has no open pause window.')
+
+    def _apply_finish(self, override=False):
+        # Close any open pause window WITHOUT reopening ownerships, then
+        # close every remaining open ownership (unassign_all semantics).
+        from game.models import PauseWindow
+        window = PauseWindow.open_for(self)
+        if window is not None:
+            window.ended_at = timezone.now()
+            window.save(update_fields=['ended_at'])
+        self.close_ownerships()
+
+    def close_ownerships(self):
+        """Close every open ownership for this Session's teams.
+
+        Same semantics as `unassign_all` / the legacy deactivation path:
+        tower ownerships close outright; zone ownerships lock their
+        floating score into the team's cumulative score first. All
+        records are preserved for session history.
+        """
+        from game.models import TeamTowerOwnership, TeamZoneOwnership
+        now = timezone.now()
+        team_ids = list(self.teams.values_list('id', flat=True))
+
+        TeamTowerOwnership.objects.filter(
+            team_id__in=team_ids, timestamp_end__isnull=True,
+        ).update(timestamp_end=now)
+
+        zone_ownerships = list(
+            TeamZoneOwnership.objects
+            .filter(team_id__in=team_ids, timestamp_end__isnull=True)
+            .select_related('team', 'zone')
+        )
+        for zone_ownership in zone_ownerships:
+            zone_ownership.timestamp_end = now
+            zone_ownership.save()
+            zone_ownership.team.update_score(zone_ownership.get_score())
+
+    def accepts_roster_changes(self):
+        """Whether Teams may be created / joined right now.
+
+        Rosters form in OPEN_FOR_PARTICIPANTS; DRAFT and FINISHED are
+        closed. RUNNING/PAUSED joins stay permitted for now — gating
+        them is owned by the game-config-team-rules change.
+        """
+        return self.state not in (self.DRAFT, self.FINISHED)
 
 
 class Team(models.Model):
