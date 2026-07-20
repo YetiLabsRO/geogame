@@ -58,6 +58,7 @@ interface Row {
               <th>Category</th>
               <th>Initial bonus</th>
               <th>RFID code</th>
+              <th>Used by</th>
               <th>Active</th>
               <th></th>
             </tr>
@@ -110,6 +111,19 @@ interface Row {
                     [ngModel]="row.draft.rfid_code"
                     (ngModelChange)="update(row, 'rfid_code', $event)"
                   />
+                </td>
+                <td>
+                  <!-- Usage guard: which collections + games share this
+                       repository tower — edit with awareness. -->
+                  @for (c of row.tower.collections; track c.id) {
+                    <span class="badge text-bg-light border me-1">{{ c.name }}</span>
+                  }
+                  @for (g of row.tower.games; track g.id) {
+                    <span class="badge text-bg-secondary me-1">{{ g.name }}</span>
+                  }
+                  @if (row.tower.collections.length === 0) {
+                    <span class="text-body-secondary small">orphan</span>
+                  }
                 </td>
                 <td class="text-center">
                   <div class="form-check form-switch d-inline-block">

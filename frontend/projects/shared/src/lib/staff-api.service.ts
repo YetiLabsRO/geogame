@@ -24,23 +24,50 @@ export interface StaffSubmission {
   response_text: string;
 }
 
+/** A Collection or Game referencing a repository asset (usage reporting). */
+export interface UsageRef {
+  id: number;
+  name: string;
+}
+
 export interface AdminTower {
   id: number;
   name: string;
-  game: number;
   zone: number | null;
   category: number;
   is_active: boolean;
   initial_bonus: number;
   rfid_code: string | null;
+  collections: UsageRef[];
+  games: UsageRef[];
 }
 
 export interface AdminZone {
   id: number;
   name: string;
-  game: number;
   color: string;
   scoring_type: number;
+  collections: UsageRef[];
+  games: UsageRef[];
+}
+
+export interface AdminCollection {
+  id: number;
+  name: string;
+  slug: string;
+  description: string;
+  created_by: number | null;
+  created_by_username: string | null;
+  created_at: string;
+  towers: number[];
+  zones: number[];
+  games: UsageRef[];
+}
+
+export interface AdminCollectionPayload {
+  name?: string;
+  slug?: string;
+  description?: string;
 }
 
 export interface AdminTeam {
@@ -94,11 +121,18 @@ export interface AdminGame extends Phase10Config {
   proximity_meters: number;
   cooloff_minutes: number;
   initial_bonus_default: number;
+  collections: number[];
+  created_by: number | null;
+  created_by_username: string | null;
+  cloned_from: number | null;
   created_at: string | null;
 }
 
 export type AdminGamePayload = Partial<
-  Omit<AdminGame, 'id' | 'base_point' | 'created_at'>
+  Omit<
+    AdminGame,
+    'id' | 'base_point' | 'created_by' | 'created_by_username' | 'cloned_from' | 'created_at'
+  >
 > & {
   base_lat?: number | null;
   base_lng?: number | null;
@@ -174,8 +208,9 @@ export class StaffApiService {
 
   // ---- Admin CRUD ---------------------------------------------------------
 
-  listTowers(): Observable<AdminTower[]> {
-    return this.http.get<AdminTower[]>('/api/staff/towers/');
+  listTowers(collectionId?: number): Observable<AdminTower[]> {
+    const query = collectionId ? `?collection=${collectionId}` : '';
+    return this.http.get<AdminTower[]>(`/api/staff/towers/${query}`);
   }
 
   updateTower(id: number, patch: Partial<AdminTower>): Observable<AdminTower> {
@@ -193,8 +228,9 @@ export class StaffApiService {
     );
   }
 
-  listZones(): Observable<AdminZone[]> {
-    return this.http.get<AdminZone[]>('/api/staff/zones/');
+  listZones(collectionId?: number): Observable<AdminZone[]> {
+    const query = collectionId ? `?collection=${collectionId}` : '';
+    return this.http.get<AdminZone[]>(`/api/staff/zones/${query}`);
   }
 
   updateZone(id: number, patch: Partial<AdminZone>): Observable<AdminZone> {
@@ -236,10 +272,66 @@ export class StaffApiService {
     );
   }
 
+  // ---- Collections (points repository) -------------------------------------
+
+  listCollections(): Observable<AdminCollection[]> {
+    return this.http.get<AdminCollection[]>('/api/staff/collections/');
+  }
+
+  createCollection(payload: AdminCollectionPayload): Observable<AdminCollection> {
+    return this.http.post<AdminCollection>('/api/staff/collections/', payload);
+  }
+
+  updateCollection(
+    id: number,
+    payload: AdminCollectionPayload,
+  ): Observable<AdminCollection> {
+    return this.http.patch<AdminCollection>(`/api/staff/collections/${id}/`, payload);
+  }
+
+  deleteCollection(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/collections/${id}/`);
+  }
+
+  addCollectionTowers(id: number, towerIds: number[]): Observable<AdminCollection> {
+    return this.http.post<AdminCollection>(
+      `/api/staff/collections/${id}/add-towers/`,
+      { tower_ids: towerIds },
+    );
+  }
+
+  removeCollectionTowers(id: number, towerIds: number[]): Observable<AdminCollection> {
+    return this.http.post<AdminCollection>(
+      `/api/staff/collections/${id}/remove-towers/`,
+      { tower_ids: towerIds },
+    );
+  }
+
+  addCollectionZones(id: number, zoneIds: number[]): Observable<AdminCollection> {
+    return this.http.post<AdminCollection>(
+      `/api/staff/collections/${id}/add-zones/`,
+      { zone_ids: zoneIds },
+    );
+  }
+
+  removeCollectionZones(id: number, zoneIds: number[]): Observable<AdminCollection> {
+    return this.http.post<AdminCollection>(
+      `/api/staff/collections/${id}/remove-zones/`,
+      { zone_ids: zoneIds },
+    );
+  }
+
   // ---- Games ---------------------------------------------------------------
 
   listGames(): Observable<AdminGame[]> {
     return this.http.get<AdminGame[]>('/api/staff/games/');
+  }
+
+  cloneGame(
+    id: number,
+    payload: { name?: string; slug?: string } = {},
+  ): Observable<AdminGame> {
+    return this.http.post<AdminGame>(`/api/staff/games/${id}/clone/`, payload);
   }
 
   createGame(payload: AdminGamePayload): Observable<AdminGame> {
