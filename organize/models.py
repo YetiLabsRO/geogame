@@ -40,6 +40,10 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'fail_tower_lockout_minutes',
     'fail_difficulty_rollback',
     'fail_counter_reset',
+    'min_teams',
+    'max_teams',
+    'min_members_per_team',
+    'max_members_per_team',
 )
 
 
@@ -81,6 +85,14 @@ class Game(models.Model):
         choices=FAIL_RESET_CHOICES,
         default=FAIL_RESET_TOWER_SUCCESS_ONLY,
     )
+
+    # --- Team-composition rules. Minima default to 1, maxima use 0 to
+    # mean "no cap", so defaults keep a single one-member team startable.
+    # Overridable per Session (see Session.effective). ---
+    min_teams = models.PositiveSmallIntegerField(default=1)
+    max_teams = models.PositiveSmallIntegerField(default=0)
+    min_members_per_team = models.PositiveSmallIntegerField(default=1)
+    max_members_per_team = models.PositiveSmallIntegerField(default=0)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -230,9 +242,12 @@ class IllegalTransition(Exception):
     the out-of-window `open_participation` timing bound).
     """
 
-    def __init__(self, message, *, requires_override=False):
+    def __init__(self, message, *, requires_override=False, blockers=None):
         super().__init__(message)
         self.requires_override = requires_override
+        # Machine-readable start blockers (game-config-team-rules), when
+        # the rejection is the start-gate; None otherwise.
+        self.blockers = blockers
 
 
 class Session(models.Model):
@@ -312,6 +327,13 @@ class Session(models.Model):
     fail_counter_reset = models.CharField(
         max_length=32, choices=FAIL_RESET_CHOICES, null=True, blank=True,
     )
+
+    # --- Team-composition overrides. NULL means "inherit the Game
+    # default"; a 0 maximum means "explicitly no cap". ---
+    min_teams = models.PositiveSmallIntegerField(null=True, blank=True)
+    max_teams = models.PositiveSmallIntegerField(null=True, blank=True)
+    min_members_per_team = models.PositiveSmallIntegerField(null=True, blank=True)
+    max_members_per_team = models.PositiveSmallIntegerField(null=True, blank=True)
 
     class Meta:
         unique_together = (('game', 'slug'),)
@@ -402,15 +424,17 @@ class Session(models.Model):
         """Re-close the roster window; existing Teams are retained."""
 
     def _apply_start(self, override=False):
-        # Seam for the game-config-team-rules change: when it lands, it
-        # provides Session.can_start() / start_blockers() gating helpers
-        # that this hook picks up without further wiring here.
-        gate = getattr(self, 'can_start', None)
-        if callable(gate) and not gate():
-            blockers_fn = getattr(self, 'start_blockers', None)
-            blockers = blockers_fn() if callable(blockers_fn) else []
-            detail = '; '.join(str(b) for b in blockers) or 'start conditions not met'
-            raise IllegalTransition(f'Session cannot start: {detail}.')
+        # Start-gate: the team-composition thresholds from the
+        # game-config-team-rules change. Blockers are dicts with a
+        # machine-readable code and a human message (see start_blockers).
+        if not self.can_start():
+            blockers = self.start_blockers()
+            detail = '; '.join(
+                b.get('message', str(b)) for b in blockers
+            ) or 'start conditions not met'
+            raise IllegalTransition(
+                f'Session cannot start: {detail}', blockers=blockers,
+            )
 
     def _apply_pause(self, override=False):
         from game.models import PauseWindow
@@ -466,6 +490,94 @@ class Session(models.Model):
         them is owned by the game-config-team-rules change.
         """
         return self.state not in (self.DRAFT, self.FINISHED)
+    def ready_team_count(self):
+        """Number of this Session's teams that satisfy the member rules."""
+        return sum(1 for team in self.teams.all() if team.is_ready())
+
+    def start_blockers(self):
+        """Why this Session may not move into active play, as an ordered list.
+
+        Each blocker is a dict with a machine-readable `code`, a
+        human-readable `message`, and the relevant numbers (plus
+        `team_id` / `team_name` for per-team blockers). Empty list ⇒
+        the team-composition thresholds are met and the run may start.
+
+        Only *ready* teams (see Team.is_ready) count toward `min_teams`,
+        so padding with an empty team cannot unlock a competitive
+        minimum. The non-zero `max_teams` cap counts every team.
+
+        This is the single reusable start-gate: the staff activation
+        path calls it, and any future lifecycle transition (see the
+        game-lifecycle-states change) should call it too.
+        """
+        blockers = []
+        min_teams = self.effective('min_teams')
+        max_teams = self.effective('max_teams')
+        min_members = self.effective('min_members_per_team')
+        max_members = self.effective('max_members_per_team')
+
+        teams = list(self.teams.order_by('name', 'id'))
+        ready_count = sum(1 for team in teams if team.is_ready())
+
+        if ready_count < min_teams:
+            blockers.append({
+                'code': 'too_few_teams',
+                'required': min_teams,
+                'current': ready_count,
+                'message': (
+                    f'Needs at least {min_teams} ready team(s); '
+                    f'currently {ready_count}.'
+                ),
+            })
+            for team in teams:
+                count = team.active_member_count()
+                if count < min_members:
+                    shortfall = min_members - count
+                    blockers.append({
+                        'code': 'team_below_minimum',
+                        'team_id': team.id,
+                        'team_name': team.name,
+                        'required': min_members,
+                        'current': count,
+                        'shortfall': shortfall,
+                        'message': (
+                            f'Team "{team.name}" has {count} of the required '
+                            f'{min_members} member(s) ({shortfall} more needed).'
+                        ),
+                    })
+
+        if max_teams and len(teams) > max_teams:
+            blockers.append({
+                'code': 'too_many_teams',
+                'allowed': max_teams,
+                'current': len(teams),
+                'message': (
+                    f'Allows at most {max_teams} team(s); '
+                    f'currently {len(teams)}.'
+                ),
+            })
+
+        if max_members:
+            for team in teams:
+                count = team.active_member_count()
+                if count > max_members:
+                    blockers.append({
+                        'code': 'team_above_maximum',
+                        'team_id': team.id,
+                        'team_name': team.name,
+                        'allowed': max_members,
+                        'current': count,
+                        'message': (
+                            f'Team "{team.name}" has {count} members, over '
+                            f'the maximum of {max_members}.'
+                        ),
+                    })
+
+        return blockers
+
+    def can_start(self):
+        """True when no team-composition blocker prevents starting."""
+        return not self.start_blockers()
 
 
 class Team(models.Model):
@@ -497,6 +609,40 @@ class Team(models.Model):
 
     def __str__(self):
         return self.name
+
+    def active_member_count(self, when=None):
+        """Count of live members: TeamMembership rows with is_active=True.
+
+        With `when`, counts the members who were on the roster at that
+        moment instead (joined before it and not yet departed).
+        """
+        if when is None:
+            return self.memberships.filter(is_active=True).count()
+        return self.memberships.filter(
+            models.Q(joined_at__lte=when)
+            & (models.Q(left_at__isnull=True) | models.Q(left_at__gt=when)),
+        ).count()
+
+    def members_needed(self, when=None):
+        """How many more members this team needs to reach the effective minimum."""
+        minimum = self.session.effective('min_members_per_team')
+        return max(0, minimum - self.active_member_count(when=when))
+
+    def is_ready(self, when=None):
+        """Whether the active-member count satisfies the effective member rules.
+
+        Ready ⇔ count ≥ effective min_members_per_team and, when the
+        effective max_members_per_team is non-zero, count ≤ that cap
+        (0 means "no cap").
+        """
+        count = self.active_member_count(when=when)
+        minimum = self.session.effective('min_members_per_team')
+        maximum = self.session.effective('max_members_per_team')
+        if count < minimum:
+            return False
+        if maximum and count > maximum:
+            return False
+        return True
 
     def update_score(self, score):
         self.score += score
@@ -554,6 +700,28 @@ class TeamMembership(models.Model):
 
     def __str__(self):
         return f'{self.user} in {self.team}'
+
+    def clean(self):
+        """Refuse to grow a team past the effective max_members_per_team.
+
+        Runs on the Django-admin add/edit form (full_clean); the API
+        join paths (invite-accept) make the same check explicitly so
+        they can return a friendly 409.
+        """
+        super().clean()
+        if not self.is_active or self.team_id is None:
+            return
+        maximum = self.team.session.effective('max_members_per_team')
+        if not maximum:
+            return
+        others = self.team.memberships.filter(is_active=True)
+        if self.pk:
+            others = others.exclude(pk=self.pk)
+        if others.count() >= maximum:
+            raise ValidationError(
+                f'Team "{self.team.name}" is already at its maximum of '
+                f'{maximum} member(s).',
+            )
 
     def save(self, *args, **kwargs):
         # Keep the denormalized game FK in sync with the team's session.

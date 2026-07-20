@@ -17,6 +17,12 @@ type PauseKnob =
   | 'pause_restores_ownerships_on_resume'
   | 'pause_rejects_submissions';
 
+type TeamRuleKnob =
+  | 'min_teams'
+  | 'max_teams'
+  | 'min_members_per_team'
+  | 'max_members_per_team';
+
 interface Row {
   game: AdminGame;
   draft: AdminGame;
@@ -306,6 +312,27 @@ interface Row {
                           </div>
                         </div>
                       </div>
+                      <div class="col-12">
+                        <div class="fw-semibold small mb-2">Team rules</div>
+                        <div class="row g-2">
+                          @for (t of teamRuleKnobs; track t.field) {
+                            <div class="col-6 col-lg-3">
+                              <label class="form-label small mb-0">{{ t.label }}</label>
+                              <input
+                                class="form-control form-control-sm"
+                                type="number"
+                                [min]="t.min"
+                                [ngModel]="row.draft[t.field]"
+                                (ngModelChange)="update(row, t.field, $event)"
+                              />
+                            </div>
+                          }
+                          <div class="col-12 text-body-secondary small">
+                            Maxima use 0 for &laquo;no cap&raquo;. A Session may only start
+                            once enough teams meet the member minimum.
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </td>
                 </tr>
@@ -340,6 +367,13 @@ export class GamesComponent {
     { value: 'TOWER_SUCCESS_ONLY', label: 'Reset only on success at the same tower' },
     { value: 'ANY_SUCCESS_ELSEWHERE', label: 'Reset on any confirmed submission' },
     { value: 'ANY_ATTEMPT_ELSEWHERE', label: 'Reset on any submission anywhere' },
+  ];
+
+  protected readonly teamRuleKnobs: { field: TeamRuleKnob; label: string; min: number }[] = [
+    { field: 'min_teams', label: 'Min teams (≥1)', min: 1 },
+    { field: 'max_teams', label: 'Max teams (0 = no cap)', min: 0 },
+    { field: 'min_members_per_team', label: 'Min members/team (≥1)', min: 1 },
+    { field: 'max_members_per_team', label: 'Max members/team (0 = no cap)', min: 0 },
   ];
 
   protected readonly createForm = this.fb.group({
@@ -470,6 +504,10 @@ export class GamesComponent {
         fail_tower_lockout_minutes: row.draft.fail_tower_lockout_minutes,
         fail_difficulty_rollback: row.draft.fail_difficulty_rollback,
         fail_counter_reset: row.draft.fail_counter_reset,
+        min_teams: row.draft.min_teams,
+        max_teams: row.draft.max_teams,
+        min_members_per_team: row.draft.min_members_per_team,
+        max_members_per_team: row.draft.max_members_per_team,
       })
       .subscribe({
         next: (updated) => {

@@ -285,6 +285,18 @@ class MyTeamEndpointTest(TestCase):
         resp = self.client.get(self.url)
         self.assertEqual(resp.status_code, 404)
 
+    def test_exposes_readiness_fields(self):
+        session = self.team.session
+        session.min_members_per_team = 3
+        session.save()
+        TeamMembership.objects.create(team=self.team, user=self.user.profile, is_active=True)
+        resp = self.client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data['active_member_count'], 1)
+        self.assertFalse(data['is_ready'])
+        self.assertEqual(data['members_needed'], 2)
+
 
 class TeamMembershipUniquenessTest(TestCase):
     """P3.4 — one active membership per (user, game), across sessions."""
@@ -1003,6 +1015,7 @@ class InviteModelTest(TestCase):
 
 # ---------------------------------------------------------------------------
 # team-roles-as-mechanics — role models, INVITER power, cloning, API surface
+# game-config-team-rules — team-composition knobs, readiness, start-gate
 # ---------------------------------------------------------------------------
 
 
@@ -1246,6 +1259,10 @@ class SessionStateMigrationTest(TransactionTestCase):
 
     migrate_from = [
         ('organize', '0011_session_state'),
+        # Sibling branch head (game-config-team-rules): its NOT NULL
+        # columns exist in the test DB, so the historical project state
+        # must include it for inserts through the old model to succeed.
+        ('organize', '0011_game_team_rules'),
         ('game', '0021_pausewindow_teamtowerfailcounter'),
     ]
     migrate_to = [('organize', '0012_backfill_session_state')]
@@ -1298,3 +1315,289 @@ class SessionStateMigrationTest(TransactionTestCase):
             if state in Session.ACTIVE_STATES
         }
         self.assertEqual(derived_active, active_before)
+
+
+# ---------------------------------------------------------------------------
+# game-config-team-rules — team-composition knobs, readiness, start-gate
+# ---------------------------------------------------------------------------
+
+
+def _member_user(team, username):
+    """Create a user and an active membership on `team`."""
+    user = User.objects.create_user(
+        username=username, email=f'{username}@example.com', password='password123',
+    )
+    TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+    return user
+
+
+class TeamRulesEffectiveConfigTest(TestCase):
+    """5.1 — Session.effective() resolves the four new team-rule fields."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+
+    def test_defaults_resolve_from_game(self):
+        self.assertEqual(self.session.effective('min_teams'), 1)
+        self.assertEqual(self.session.effective('max_teams'), 0)
+        self.assertEqual(self.session.effective('min_members_per_team'), 1)
+        self.assertEqual(self.session.effective('max_members_per_team'), 0)
+
+    def test_game_default_wins_when_override_null(self):
+        self.game.min_teams = 3
+        self.game.max_teams = 5
+        self.game.min_members_per_team = 2
+        self.game.max_members_per_team = 6
+        self.game.save()
+        self.assertEqual(self.session.effective('min_teams'), 3)
+        self.assertEqual(self.session.effective('max_teams'), 5)
+        self.assertEqual(self.session.effective('min_members_per_team'), 2)
+        self.assertEqual(self.session.effective('max_members_per_team'), 6)
+
+    def test_session_override_wins(self):
+        self.game.min_teams = 3
+        self.game.max_members_per_team = 6
+        self.game.save()
+        self.session.min_teams = 2
+        self.session.max_teams = 4
+        self.session.min_members_per_team = 5
+        self.session.max_members_per_team = 0  # explicitly uncapped
+        self.session.save()
+        self.assertEqual(self.session.effective('min_teams'), 2)
+        self.assertEqual(self.session.effective('max_teams'), 4)
+        self.assertEqual(self.session.effective('min_members_per_team'), 5)
+        self.assertEqual(self.session.effective('max_members_per_team'), 0)
+
+    def test_unknown_field_still_raises(self):
+        with self.assertRaises(ValueError):
+            self.session.effective('not_a_config_field')
+
+
+class TeamReadinessTest(TestCase):
+    """5.2 — Team.active_member_count() / is_ready() against member rules."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.team = _make_team(self.game)
+
+    def test_counts_only_active_memberships(self):
+        _member_user(self.team, 'active1')
+        leaver = User.objects.create_user(
+            username='leaver', email='leaver@example.com', password='password123',
+        )
+        TeamMembership.objects.create(
+            team=self.team, user=leaver.profile,
+            is_active=False, left_at=timezone.now(),
+        )
+        self.assertEqual(self.team.active_member_count(), 1)
+
+    def test_below_minimum_is_not_ready_with_shortfall(self):
+        self.game.min_members_per_team = 3
+        self.game.save()
+        _member_user(self.team, 'solo')
+        self.assertFalse(self.team.is_ready())
+        self.assertEqual(self.team.members_needed(), 2)
+
+    def test_within_range_is_ready(self):
+        self.game.min_members_per_team = 1
+        self.game.max_members_per_team = 3
+        self.game.save()
+        _member_user(self.team, 'one')
+        _member_user(self.team, 'two')
+        self.assertTrue(self.team.is_ready())
+        self.assertEqual(self.team.members_needed(), 0)
+
+    def test_zero_maximum_means_uncapped(self):
+        for i in range(5):
+            _member_user(self.team, f'many{i}')
+        self.assertTrue(self.team.is_ready())
+
+    def test_over_nonzero_maximum_is_not_ready(self):
+        self.game.max_members_per_team = 2
+        self.game.save()
+        for i in range(3):
+            _member_user(self.team, f'crowd{i}')
+        self.assertFalse(self.team.is_ready())
+
+    def test_session_override_applies_to_readiness(self):
+        session = self.team.session
+        session.min_members_per_team = 2
+        session.save()
+        _member_user(self.team, 'lonely')
+        self.assertFalse(self.team.is_ready())
+        self.assertEqual(self.team.members_needed(), 1)
+
+
+class StartGateTest(TestCase):
+    """5.3 / 5.5 — Session.start_blockers() / can_start()."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+
+    def test_defaults_zero_teams_blocked(self):
+        blockers = self.session.start_blockers()
+        self.assertFalse(self.session.can_start())
+        self.assertEqual(blockers[0]['code'], 'too_few_teams')
+        self.assertEqual(blockers[0]['required'], 1)
+        self.assertEqual(blockers[0]['current'], 0)
+
+    def test_defaults_single_one_member_team_starts(self):
+        """5.5 — backward compatibility: defaults keep today's behaviour."""
+        team = _make_team(self.game)
+        _member_user(team, 'solo')
+        self.assertTrue(self.session.can_start())
+        self.assertEqual(self.session.start_blockers(), [])
+        self.assertEqual(self.session.ready_team_count(), 1)
+
+    def test_below_min_teams_blocked_with_counts(self):
+        self.game.min_teams = 2
+        self.game.save()
+        team = _make_team(self.game)
+        _member_user(team, 'a')
+        blockers = self.session.start_blockers()
+        self.assertFalse(self.session.can_start())
+        self.assertEqual(blockers[0]['code'], 'too_few_teams')
+        self.assertEqual(blockers[0]['required'], 2)
+        self.assertEqual(blockers[0]['current'], 1)
+
+    def test_padding_empty_team_does_not_satisfy_min_teams(self):
+        self.game.min_teams = 2
+        self.game.save()
+        full_team = _make_team(self.game, name='Full')
+        _member_user(full_team, 'full1')
+        empty_team = _make_team(self.game, name='Empty')
+        blockers = self.session.start_blockers()
+        self.assertFalse(self.session.can_start())
+        codes = [b['code'] for b in blockers]
+        self.assertIn('too_few_teams', codes)
+        underfilled = [b for b in blockers if b['code'] == 'team_below_minimum']
+        self.assertEqual(len(underfilled), 1)
+        self.assertEqual(underfilled[0]['team_id'], empty_team.id)
+        self.assertEqual(underfilled[0]['team_name'], 'Empty')
+        self.assertEqual(underfilled[0]['shortfall'], 1)
+
+    def test_two_ready_teams_satisfy_min_teams(self):
+        self.game.min_teams = 2
+        self.game.save()
+        for name in ('Lynx', 'Wolf'):
+            team = _make_team(self.game, name=name)
+            _member_user(team, f'member-{name}')
+        self.assertTrue(self.session.can_start())
+
+    def test_over_max_teams_blocked(self):
+        self.game.max_teams = 1
+        self.game.save()
+        for name in ('Lynx', 'Wolf'):
+            team = _make_team(self.game, name=name)
+            _member_user(team, f'member-{name}')
+        blockers = self.session.start_blockers()
+        self.assertFalse(self.session.can_start())
+        self.assertEqual(blockers[0]['code'], 'too_many_teams')
+        self.assertEqual(blockers[0]['allowed'], 1)
+        self.assertEqual(blockers[0]['current'], 2)
+
+    def test_over_member_cap_blocks_start(self):
+        self.game.max_members_per_team = 1
+        self.game.save()
+        team = _make_team(self.game)
+        _member_user(team, 'one')
+        # Bypass join-time enforcement to simulate an over-cap roster.
+        TeamMembership.objects.create(
+            team=team,
+            user=User.objects.create_user(
+                username='two', email='two@example.com', password='password123',
+            ).profile,
+            is_active=True,
+        )
+        blockers = self.session.start_blockers()
+        self.assertFalse(self.session.can_start())
+        codes = [b['code'] for b in blockers]
+        self.assertIn('team_above_maximum', codes)
+
+    def test_session_override_gates_instead_of_game_default(self):
+        self.session.min_teams = 2
+        self.session.save()
+        team = _make_team(self.game)
+        _member_user(team, 'only')
+        self.assertFalse(self.session.can_start())
+
+
+class JoinCapTest(TestCase):
+    """5.4 — max_members_per_team enforced at join time."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.max_members_per_team = 2
+        self.game.save()
+        self.team = _make_team(self.game)
+        self.staff = User.objects.create_user(
+            username='cap-admin', email='cap@x.com', password='password123',
+            is_staff=True,
+        )
+
+    def _accept(self, username):
+        invite = Invite.objects.create(
+            team=self.team, email='', created_by=self.staff,
+        )
+        return self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {
+                'username': username,
+                'email': f'{username}@example.com',
+                'password': 'password12345',
+            },
+            content_type='application/json',
+        )
+
+    def test_join_with_room_succeeds(self):
+        resp = self._accept('joiner1')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.team.active_member_count(), 1)
+
+    def test_join_full_team_rejected(self):
+        _member_user(self.team, 'seat1')
+        _member_user(self.team, 'seat2')
+        resp = self._accept('overflow')
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn('maximum', resp.json()['detail'])
+        self.assertEqual(self.team.active_member_count(), 2)
+        self.assertFalse(User.objects.filter(username='overflow').exists())
+
+    def test_join_cap_uses_session_override(self):
+        self.team.session.max_members_per_team = 1
+        self.team.session.save()
+        _member_user(self.team, 'seat1')
+        resp = self._accept('overflow')
+        self.assertEqual(resp.status_code, 409)
+
+    def test_zero_cap_means_unlimited_joins(self):
+        self.game.max_members_per_team = 0
+        self.game.save()
+        _member_user(self.team, 'seat1')
+        _member_user(self.team, 'seat2')
+        _member_user(self.team, 'seat3')
+        resp = self._accept('joiner4')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_admin_add_over_cap_fails_validation(self):
+        from django.core.exceptions import ValidationError
+        _member_user(self.team, 'seat1')
+        _member_user(self.team, 'seat2')
+        extra = User.objects.create_user(
+            username='extra', email='extra@x.com', password='password123',
+        )
+        membership = TeamMembership(
+            team=self.team, user=extra.profile,
+            game=self.team.session.game, is_active=True,
+        )
+        with self.assertRaises(ValidationError):
+            membership.full_clean()
+
+    def test_admin_edit_of_existing_member_passes_validation(self):
+        _member_user(self.team, 'seat1')
+        _member_user(self.team, 'seat2')
+        membership = self.team.memberships.filter(is_active=True).first()
+        membership.full_clean()  # editing an existing row must not trip the cap

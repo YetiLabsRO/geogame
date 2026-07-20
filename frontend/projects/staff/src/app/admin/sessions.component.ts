@@ -14,12 +14,15 @@ import {
 } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 
+import { HttpErrorResponse } from '@angular/common/http';
+
 import {
   AdminGame,
   AdminSession,
   AdminSessionPayload,
   SessionState,
   StaffApiService,
+  StartBlocker,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -30,6 +33,8 @@ interface Row {
   dirty: boolean;
   saving: boolean;
   error: string | null;
+  /** Start-gate blockers returned when activating was refused (409). */
+  blockers: string[];
 }
 
 interface GameGroup {
@@ -208,6 +213,13 @@ interface GameGroup {
                         @if (row.error; as msg) {
                           <div class="small text-danger mt-1">{{ msg }}</div>
                         }
+                        @if (row.blockers.length > 0) {
+                          <ul class="small text-danger text-start mt-1 mb-0">
+                            @for (b of row.blockers; track $index) {
+                              <li>{{ b }}</li>
+                            }
+                          </ul>
+                        }
                       </td>
                     </tr>
                   }
@@ -298,6 +310,7 @@ export class SessionsComponent {
             dirty: false,
             saving: false,
             error: null,
+            blockers: [],
           })),
         );
         this.loading.set(false);
@@ -358,7 +371,7 @@ export class SessionsComponent {
 
   protected save(row: Row): void {
     if (!row.dirty || row.saving) return;
-    this.patch(row, { saving: true, error: null });
+    this.patch(row, { saving: true, error: null, blockers: [] });
     this.api
       .updateSession(row.session.id, {
         name: row.draft.name,
@@ -374,13 +387,18 @@ export class SessionsComponent {
                     dirty: false,
                     saving: false,
                     error: null,
+                    blockers: [],
                   }
                 : r,
             ),
           );
         },
         error: (err) => {
-          this.patch(row, { saving: false, error: extractErrorMessage(err) });
+          this.patch(row, {
+            saving: false,
+            error: extractErrorMessage(err),
+            blockers: extractBlockerMessages(err),
+          });
         },
       });
   }
@@ -402,4 +420,14 @@ const STATE_BADGES: Record<SessionState, string> = {
 
 function isDirty<T extends object>(a: T, b: T): boolean {
   return (Object.keys(a) as (keyof T)[]).some((k) => a[k] !== b[k]);
+}
+
+/** Pull the start-gate `blockers` messages out of a 409 error body, if any. */
+function extractBlockerMessages(err: unknown): string[] {
+  if (!(err instanceof HttpErrorResponse)) return [];
+  const blockers = (err.error as { blockers?: StartBlocker[] } | null)?.blockers;
+  if (!Array.isArray(blockers)) return [];
+  return blockers
+    .map((b) => b.message)
+    .filter((m): m is string => typeof m === 'string');
 }

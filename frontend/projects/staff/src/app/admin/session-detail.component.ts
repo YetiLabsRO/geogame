@@ -19,6 +19,7 @@ import {
   SessionTimeline,
   SessionTransitionAction,
   StaffApiService,
+  StartReadiness,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -116,6 +117,73 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
             </p>
             @if (lifecycleError(); as msg) {
               <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
+            }
+          </div>
+        </div>
+      }
+
+      <!-- Start readiness (team rules; read-only — starting goes through the
+           lifecycle transitions above, which enforce these blockers) -------- -->
+      @if (readiness(); as r) {
+        <div class="card mb-4">
+          <div class="card-body">
+            <h2 class="h6 mb-0">
+              Start readiness
+              @if (r.can_start) {
+                <span class="badge text-bg-success ms-2">Ready to start</span>
+              } @else {
+                <span class="badge text-bg-warning ms-2">Blocked</span>
+              }
+            </h2>
+            @if (r.blockers.length > 0) {
+              <ul class="small text-danger mt-2 mb-2">
+                @for (b of r.blockers; track $index) {
+                  <li>{{ b.message }}</li>
+                }
+              </ul>
+            }
+            @if (r.teams.length === 0) {
+              <p class="text-body-secondary small mb-0 mt-2">No teams yet.</p>
+            } @else {
+              <div class="table-responsive mt-2">
+                <table class="table table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th>Team</th>
+                      <th class="text-end">Members</th>
+                      <th class="text-end">Required</th>
+                      <th>Readiness</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (t of r.teams; track t.id) {
+                      <tr>
+                        <td>
+                          <span
+                            class="d-inline-block me-2"
+                            style="width: 0.8rem; height: 0.8rem; border-radius: 50%; vertical-align: middle"
+                            [style.background-color]="t.color"
+                          ></span>
+                          {{ t.name }}
+                        </td>
+                        <td class="text-end">{{ t.active_member_count }}</td>
+                        <td class="text-end">{{ r.min_members_per_team }}</td>
+                        <td>
+                          @if (t.is_ready) {
+                            <span class="badge text-bg-success">ready</span>
+                          } @else if (t.members_needed > 0) {
+                            <span class="badge text-bg-warning">
+                              needs {{ t.members_needed }} more
+                            </span>
+                          } @else {
+                            <span class="badge text-bg-danger">over the cap</span>
+                          }
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
             }
           </div>
         </div>
@@ -373,6 +441,10 @@ export class StaffSessionDetailComponent {
   protected readonly lifecycleBusy = signal(false);
   protected readonly lifecycleError = signal<string | null>(null);
 
+  // Start readiness (team rules) — read-only; the lifecycle `start`
+  // transition enforces these blockers server-side.
+  protected readonly readiness = signal<StartReadiness | null>(null);
+
   protected readonly override = signal<Phase10Overrides>(blankOverrides());
   protected readonly overrideDirty = signal(false);
   protected readonly overrideSaving = signal(false);
@@ -426,6 +498,14 @@ export class StaffSessionDetailComponent {
     this.session.set(s);
     this.override.set(pickOverrides(s));
     this.overrideDirty.set(false);
+    this.refreshReadiness();
+  }
+
+  private refreshReadiness(): void {
+    this.staff.sessionStartBlockers(this.sessionId).subscribe({
+      next: (r) => this.readiness.set(r),
+      error: () => this.readiness.set(null),
+    });
   }
 
   // ---- Lifecycle controls (session-lifecycle) -----------------------------

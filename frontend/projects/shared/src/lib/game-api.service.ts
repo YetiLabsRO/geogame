@@ -180,6 +180,9 @@ export interface MyTeam {
   current_score: number;
   members: MyTeamMember[];
   can_invite: boolean;
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
 }
 
 export interface SessionScoreboardEntry {
@@ -229,4 +232,7 @@ export interface TeamSummary {
   current_score: number;
   color: string;
   members: TeamSummaryMember[];
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
 }

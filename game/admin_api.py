@@ -57,13 +57,26 @@ class AdminTeamSerializer(serializers.ModelSerializer):
     # Read-only `game` derived from session.game for convenience in the
     # staff UI. Writes always go through `session`.
     game = serializers.IntegerField(source='session.game_id', read_only=True)
+    active_member_count = serializers.SerializerMethodField()
+    is_ready = serializers.SerializerMethodField()
+    members_needed = serializers.SerializerMethodField()
 
     class Meta:
         model = Team
         fields = (
             'id', 'name', 'session', 'game',
             'group', 'color', 'description',
+            'active_member_count', 'is_ready', 'members_needed',
         )
+
+    def get_active_member_count(self, team):
+        return team.active_member_count()
+
+    def get_is_ready(self, team):
+        return team.is_ready()
+
+    def get_members_needed(self, team):
+        return team.members_needed()
 
 
 class AdminTeamGroupSerializer(serializers.ModelSerializer):
@@ -355,6 +368,38 @@ class ResetScoresView(APIView):
 # ---------------------------------------------------------------------------
 
 
+TEAM_RULE_FIELDS = (
+    'min_teams', 'max_teams', 'min_members_per_team', 'max_members_per_team',
+)
+
+
+def _validate_team_rules(resolved):
+    """Shared team-rule sanity checks for the Game and Session serializers.
+
+    `resolved(field)` returns the value a field would have after the
+    write (payload value, else instance value, else Game default).
+    Minima must be ≥ 1; a non-zero maximum (0 = no cap) may not be
+    smaller than its corresponding minimum.
+    """
+    errors = {}
+    for field in ('min_teams', 'min_members_per_team'):
+        value = resolved(field)
+        if value is not None and value < 1:
+            errors[field] = 'Must be at least 1.'
+    for min_field, max_field in (
+        ('min_teams', 'max_teams'),
+        ('min_members_per_team', 'max_members_per_team'),
+    ):
+        minimum = resolved(min_field)
+        maximum = resolved(max_field)
+        if minimum and maximum and maximum < minimum:
+            errors[max_field] = (
+                f'A non-zero maximum cannot be smaller than {min_field} ({minimum}).'
+            )
+    if errors:
+        raise serializers.ValidationError(errors)
+
+
 class AdminGameSerializer(serializers.ModelSerializer):
     """Staff-writable Game payload.
 
@@ -386,6 +431,9 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Team-composition rule defaults (maxima: 0 = no cap).
+            'min_teams', 'max_teams',
+            'min_members_per_team', 'max_members_per_team',
             'created_at',
         )
         read_only_fields = ('created_at',)
@@ -397,6 +445,17 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'type': 'Point',
             'coordinates': [game.base_point.x, game.base_point.y],
         }
+
+    def validate(self, attrs):
+        def resolved(field):
+            if field in attrs:
+                return attrs[field]
+            if self.instance is not None:
+                return getattr(self.instance, field)
+            return Game._meta.get_field(field).default
+
+        _validate_team_rules(resolved)
+        return attrs
 
     def _absorb_coords(self, validated):
         lat = validated.pop('base_lat', None)
@@ -443,6 +502,12 @@ class AdminGameViewSet(viewsets.ModelViewSet):
         return Response({'paused_sessions': paused}, status=status.HTTP_200_OK)
 
 
+class SessionStartBlocked(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'Session cannot start: team composition rules are not met.'
+    default_code = 'start_blocked'
+
+
 class AdminSessionSerializer(serializers.ModelSerializer):
     game_slug = serializers.CharField(source='game.slug', read_only=True)
     game_name = serializers.CharField(source='game.name', read_only=True)
@@ -466,6 +531,9 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Team-rule overrides (null = inherit; maxima: 0 = no cap).
+            'min_teams', 'max_teams',
+            'min_members_per_team', 'max_members_per_team',
             'created_at',
         )
         read_only_fields = (
@@ -478,6 +546,25 @@ class AdminSessionSerializer(serializers.ModelSerializer):
 
     def get_allowed_transitions(self, session):
         return session.allowed_transitions
+
+    def validate(self, attrs):
+        game = attrs.get('game') or (
+            self.instance.game if self.instance is not None else None
+        )
+
+        def resolved(field):
+            if field in attrs:
+                value = attrs[field]
+            elif self.instance is not None:
+                value = getattr(self.instance, field)
+            else:
+                value = None
+            if value is None and game is not None:
+                return getattr(game, field)
+            return value
+
+        _validate_team_rules(resolved)
+        return attrs
 
 
 class AdminSessionViewSet(viewsets.ModelViewSet):
@@ -530,6 +617,8 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
             payload = {'detail': str(exc)}
             if exc.requires_override:
                 payload['requires_override'] = True
+            if exc.blockers is not None:
+                payload['blockers'] = exc.blockers
             return Response(payload, status=status.HTTP_409_CONFLICT)
         return Response(self.get_serializer(session).data, status=status.HTTP_200_OK)
 
@@ -579,6 +668,34 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
         return Response({
             'is_paused': session.is_paused(),
             'windows': windows,
+        })
+
+    @action(detail=True, methods=['get'])
+    def start_blockers(self, request, pk=None):
+        """Read-only start-gate check for the staff UI start control.
+
+        Returns the same blockers the activation path enforces, plus a
+        per-team readiness summary, so the UI can disable/annotate the
+        start button without attempting the transition.
+        """
+        session = self.get_object()
+        blockers = session.start_blockers()
+        teams = [
+            {
+                'id': team.id,
+                'name': team.name,
+                'color': team.color,
+                'active_member_count': team.active_member_count(),
+                'is_ready': team.is_ready(),
+                'members_needed': team.members_needed(),
+            }
+            for team in session.teams.order_by('name', 'id')
+        ]
+        return Response({
+            'can_start': not blockers,
+            'blockers': blockers,
+            'min_members_per_team': session.effective('min_members_per_team'),
+            'teams': teams,
         })
 
     @action(detail=True, methods=['get'])
