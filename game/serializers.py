@@ -177,7 +177,7 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Dacă nu ești la turn, nu poți face provocarea!")
 
         point = Point(attrs['lng'], attrs['lat'])
-        proximity = tower.game.proximity_meters
+        proximity = attrs['_team'].session.game.proximity_meters
         if not Tower.objects.filter(
             pk=tower.id,
             location__distance_lte=(point, Distance(m=proximity)),

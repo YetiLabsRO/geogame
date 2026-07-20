@@ -6,7 +6,11 @@ from django.http import JsonResponse
 from rest_framework import permissions, viewsets
 
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
-from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
+from game.scoping import (
+    GameGeometryScopedViewSetMixin,
+    GameScopedViewSetMixin,
+    SessionScopedViewSetMixin,
+)
 from game.serializers import (
     ChallengeSerializer,
     TeamSerializer,
@@ -17,11 +21,11 @@ from game.serializers import (
 from organize.models import Team, TeamGroup
 
 
-class ZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
+class ZoneViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Zone.objects.all()
     serializer_class = ZoneSerializer
     permission_classes = [permissions.IsAuthenticated]
-    game_scope_field = 'game'
+    geometry_resolver = 'zones'
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -40,11 +44,11 @@ class ZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
         return context
 
 
-class TowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
+class TowerViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Tower.objects.exclude(is_active=False).exclude(category=Tower.CATEGORY_RFID)
     serializer_class = TowerSerializer
     permission_classes = [permissions.IsAuthenticated]
-    game_scope_field = 'game'
+    geometry_resolver = 'towers'
 
     def get_queryset(self):
         queryset = super().get_queryset()

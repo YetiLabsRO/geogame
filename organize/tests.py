@@ -730,12 +730,10 @@ class SessionHistoryTest(TestCase):
         zone = Zone.objects.create(
             name='Z', scoring_type=Zone.SCORE_LIN,
             shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
-            game=self.game,
         )
         tower = Tower.objects.create(
             name='T', zone=zone, location=Point(23.5, 46.5),
             is_active=True, category=Tower.CATEGORY_NORMAL,
-            game=self.game,
         )
         TeamTowerOwnership.objects.create(team=self.team, tower=tower)
         url = reverse(

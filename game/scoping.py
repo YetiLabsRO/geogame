@@ -1,10 +1,14 @@
 """Scoping mixins for viewsets.
 
-Two flavors:
+Three flavors:
 
 - `GameScopedViewSetMixin` filters the queryset by the authenticated
-  user's current Session's Game. Use on endpoints serving event config:
-  Zone, Tower, Challenge, TeamGroup.
+  user's current Session's Game. Use on endpoints serving event config
+  owned directly by the Game via a FK: Challenge, TeamGroup.
+- `GameGeometryScopedViewSetMixin` filters Tower/Zone querysets through
+  the current Session's Game **collections** (repository model): the
+  visible geometry is the distinct union across the Game's linked
+  Collections, resolved by `Game.towers()` / `Game.zones()`.
 - `SessionScopedViewSetMixin` filters by the current Session directly.
   Use on endpoints serving runtime state: Team, ownerships, submissions,
   Invites.
@@ -54,6 +58,30 @@ class GameScopedViewSetMixin:
         if session is None:
             return qs.none()
         return qs.filter(**{self.game_scope_field: session.game_id})
+
+
+class GameGeometryScopedViewSetMixin:
+    """Scope a Tower/Zone queryset through the current Session's Game collections.
+
+    `geometry_resolver` names the resolver on Game: 'towers' or 'zones'.
+    The filter is expressed as `pk__in` over the resolver's queryset so
+    base-queryset filters and annotations keep working without the row
+    duplication a joined M2M filter would introduce.
+    """
+
+    geometry_resolver = _SCOPE_UNSET
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if self.geometry_resolver is _SCOPE_UNSET:
+            raise ImproperlyConfigured(
+                f'{self.__class__.__name__} must set geometry_resolver.',
+            )
+        session = _current_session(self.request)
+        if session is None:
+            return qs.none()
+        resolver = getattr(session.game, self.geometry_resolver)
+        return qs.filter(pk__in=resolver().values('pk'))
 
 
 class SessionScopedViewSetMixin:

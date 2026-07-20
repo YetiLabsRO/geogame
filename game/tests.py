@@ -35,6 +35,7 @@ from rest_framework.test import APIClient
 from game.admin import unassign_all
 from game.models import (
     Challenge,
+    Collection,
     PauseWindow,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -43,7 +44,14 @@ from game.models import (
     Tower,
     Zone,
 )
-from organize.models import Game, Session, Team, TeamGroup, TeamMembership
+from organize.models import (
+    Game,
+    GameCollaborator,
+    Session,
+    Team,
+    TeamGroup,
+    TeamMembership,
+)
 
 User = get_user_model()
 
@@ -102,21 +110,38 @@ def _make_group(game, name="Explo", slug="explo"):
     return TeamGroup.objects.create(name=name, game=game, slug=slug)
 
 
+def _game_collection(game):
+    """Return (creating + linking if needed) the Game's default Collection.
+
+    Post points-repository, geometry reaches a Game only through
+    Collections, so the fixture helpers attach every Zone/Tower they
+    create to a per-game default collection.
+    """
+    collection = game.collections.order_by('pk').first()
+    if collection is None:
+        collection = Collection.objects.create(
+            name=f'{game.name} map', slug=f'{game.slug}-map',
+        )
+        game.collections.add(collection)
+    return collection
+
+
 def _make_zone(game, name="Zone A", scoring=Zone.SCORE_LIN, shape=None):
     if shape is None:
         shape = Polygon.from_bbox((23.0, 46.0, 24.0, 47.0))
-    return Zone.objects.create(
-        name=name, scoring_type=scoring, shape=shape, game=game,
-    )
+    zone = Zone.objects.create(name=name, scoring_type=scoring, shape=shape)
+    _game_collection(game).zones.add(zone)
+    return zone
 
 
 def _make_tower(game, name="T", zone=None, lng=23.5, lat=46.5, is_active=True,
                 initial_bonus=0, category=Tower.CATEGORY_NORMAL, rfid_code=None):
-    return Tower.objects.create(
+    tower = Tower.objects.create(
         name=name, zone=zone, location=Point(lng, lat), is_active=is_active,
         category=category, initial_bonus=initial_bonus, rfid_code=rfid_code,
-        game=game,
     )
+    _game_collection(game).towers.add(tower)
+    return tower
 
 
 def _default_session(game):

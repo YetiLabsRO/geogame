@@ -1,13 +1,29 @@
 from django.contrib import admin
 
-from organize.models import Game, Invite, Session, TeamMembership, UserProfile
+from organize.models import (
+    Game,
+    GameCollaborator,
+    Invite,
+    Session,
+    TeamMembership,
+    UserProfile,
+)
 
 
 @admin.register(Game)
 class GameAdmin(admin.ModelAdmin):
-    list_display = ('name', 'slug', 'is_active', 'proximity_meters', 'cooloff_minutes')
+    list_display = ('name', 'slug', 'is_active', 'created_by', 'cloned_from', 'proximity_meters', 'cooloff_minutes')
     list_filter = ('is_active',)
     search_fields = ('name', 'slug')
+    filter_horizontal = ('collections',)
+
+
+@admin.register(GameCollaborator)
+class GameCollaboratorAdmin(admin.ModelAdmin):
+    list_display = ('game', 'user', 'role', 'created_at')
+    list_filter = ('role', 'game')
+    search_fields = ('game__name', 'user__username')
+    readonly_fields = ('created_at',)
 
 
 @admin.register(Session)

@@ -1,14 +1,17 @@
 from django.contrib.gis.geos import Point
 from django.db import transaction
 from django.utils import timezone
+from django.utils.text import slugify
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.models import (
     Challenge,
+    Collection,
     PauseWindow,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -16,22 +19,51 @@ from game.models import (
     Tower,
     Zone,
 )
-from game.scoping import GameScopedViewSetMixin, SessionScopedViewSetMixin
+from game.scoping import (
+    GameScopedViewSetMixin,
+    SessionScopedViewSetMixin,
+    _current_session,
+)
 from organize.models import Game, Session, Team, TeamGroup
 
 
-class AdminZoneSerializer(serializers.ModelSerializer):
+class GeometryUsageMixin(serializers.Serializer):
+    """Usage reporting for repository assets (spec: usage visibility).
+
+    Shows which Collections contain the Tower/Zone and which Games
+    reference it through those collections, so edits/deletes are made
+    with awareness of shared usage.
+    """
+
+    collections = serializers.SerializerMethodField()
+    games = serializers.SerializerMethodField()
+
+    def get_collections(self, obj):
+        return [
+            {'id': c.id, 'name': c.name}
+            for c in obj.collections.all().order_by('name')
+        ]
+
+    def get_games(self, obj):
+        return [
+            {'id': g.id, 'name': g.name}
+            for g in Game.objects.filter(collections__in=obj.collections.all())
+            .distinct().order_by('name')
+        ]
+
+
+class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     class Meta:
         model = Zone
-        fields = ('id', 'name', 'game', 'color', 'scoring_type')
+        fields = ('id', 'name', 'color', 'scoring_type', 'collections', 'games')
 
 
-class AdminTowerSerializer(serializers.ModelSerializer):
+class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     class Meta:
         model = Tower
         fields = (
-            'id', 'name', 'game', 'zone', 'category', 'is_active',
-            'initial_bonus', 'rfid_code',
+            'id', 'name', 'zone', 'category', 'is_active',
+            'initial_bonus', 'rfid_code', 'collections', 'games',
         )
 
 
@@ -60,17 +92,31 @@ class AdminChallengeSerializer(serializers.ModelSerializer):
         fields = ('id', 'game', 'text', 'tower', 'difficulty')
 
 
-class AdminZoneViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for Zones. Shape editing stays in Django admin."""
+class CollectionFilterMixin:
+    """Repository scoping for staff Tower/Zone endpoints.
+
+    The whole repository is listed by default; `?collection=<id>`
+    narrows to one Collection's members.
+    """
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        collection_id = self.request.query_params.get('collection')
+        if collection_id:
+            qs = qs.filter(collections=collection_id)
+        return qs
+
+
+class AdminZoneViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
+    """Staff-only CRUD for repository Zones. Shape editing stays in Django admin."""
 
     permission_classes = [IsAdminUser]
     queryset = Zone.objects.all().order_by('name')
     serializer_class = AdminZoneSerializer
-    game_scope_field = 'game'
 
 
-class AdminTowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for Towers + activate/deactivate/unassign actions.
+class AdminTowerViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
+    """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
     Location (PointField) edits stay in Django admin. Everything else
     is reachable through this viewset.
@@ -79,7 +125,6 @@ class AdminTowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     permission_classes = [IsAdminUser]
     queryset = Tower.objects.all().order_by('name')
     serializer_class = AdminTowerSerializer
-    game_scope_field = 'game'
 
     @action(detail=True, methods=['post'])
     def unassign(self, request, pk=None):
@@ -89,9 +134,14 @@ class AdminTowerViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'])
     def unassign_all(self, request):
-        # Restrict the sweep to the staff user's current scope so one
-        # game's admins can't accidentally close ownerships on another.
-        towers = list(self.get_queryset().filter(is_active=True))
+        # Restrict the sweep to the staff user's current session's Game
+        # so one game's admins can't accidentally close ownerships on
+        # another game sharing the same repository towers.
+        session = _current_session(request)
+        if session is None:
+            towers = []
+        else:
+            towers = list(session.game.towers().filter(is_active=True))
         for tower in towers:
             tower.unassign()
         return Response(
@@ -119,12 +169,133 @@ class AdminTeamGroupList(GameScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
 
 
 class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for Challenges (tower-specific or generic)."""
+    """Staff-only CRUD for Challenges (tower-specific or generic).
+
+    The challenge bank is template data: mutating it requires template
+    edit rights on the owning Game (creator / CREATOR collaborator).
+    A runner personalises their own clone instead.
+    """
 
     permission_classes = [IsAdminUser]
     queryset = Challenge.objects.all().order_by('difficulty', 'id')
     serializer_class = AdminChallengeSerializer
     game_scope_field = 'game'
+
+    def _require_edit(self, game):
+        if game is not None and not game.can_edit(self.request.user):
+            raise PermissionDenied(
+                'Only the game creator may modify its challenge bank. '
+                'Clone the game to personalise it.',
+            )
+
+    def perform_create(self, serializer):
+        self._require_edit(serializer.validated_data.get('game'))
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._require_edit(serializer.instance.game)
+        self._require_edit(serializer.validated_data.get('game'))
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_edit(instance.game)
+        instance.delete()
+
+
+# ---------------------------------------------------------------------------
+# Collections (points repository)
+# ---------------------------------------------------------------------------
+
+
+class AdminCollectionSerializer(serializers.ModelSerializer):
+    """Staff payload for Collections.
+
+    `towers` / `zones` list member PKs (read-only here — membership is
+    curated through the dedicated add/remove actions). `games` reports
+    which Games link this collection.
+    """
+
+    towers = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
+    zones = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
+    games = serializers.SerializerMethodField()
+    slug = serializers.SlugField(required=False, allow_blank=True)
+    created_by_username = serializers.CharField(
+        source='created_by.username', read_only=True, default=None,
+    )
+
+    class Meta:
+        model = Collection
+        fields = (
+            'id', 'name', 'slug', 'description',
+            'created_by', 'created_by_username', 'created_at',
+            'towers', 'zones', 'games',
+        )
+        read_only_fields = ('created_by', 'created_at')
+
+    def get_games(self, collection):
+        return [
+            {'id': g.id, 'name': g.name}
+            for g in collection.games.all().order_by('name')
+        ]
+
+    def validate(self, attrs):
+        # Auto-generate a unique slug from the name when absent.
+        if not attrs.get('slug') and self.instance is None:
+            base = slugify(attrs.get('name', ''))[:70] or 'collection'
+            slug, counter = base, 2
+            while Collection.objects.filter(slug=slug).exists():
+                slug = f'{base}-{counter}'
+                counter += 1
+            attrs['slug'] = slug
+        return attrs
+
+
+class AdminCollectionViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for Collections + tower/zone membership curation.
+
+    Membership actions take `{"tower_ids": [...]}` / `{"zone_ids": [...]}`.
+    Removing members never deletes the underlying repository rows.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = Collection.objects.all().order_by('name')
+    serializer_class = AdminCollectionSerializer
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    def _members(self, request, key, model):
+        ids = request.data.get(key)
+        if not isinstance(ids, list) or not all(isinstance(i, int) for i in ids):
+            raise serializers.ValidationError({key: 'Expected a list of integer ids.'})
+        found = list(model.objects.filter(pk__in=ids))
+        if len(found) != len(set(ids)):
+            raise serializers.ValidationError({key: 'One or more ids do not exist.'})
+        return found
+
+    @action(detail=True, methods=['post'], url_path='add-towers')
+    def add_towers(self, request, pk=None):
+        collection = self.get_object()
+        collection.towers.add(*self._members(request, 'tower_ids', Tower))
+        return Response(self.get_serializer(collection).data)
+
+    @action(detail=True, methods=['post'], url_path='remove-towers')
+    def remove_towers(self, request, pk=None):
+        collection = self.get_object()
+        collection.towers.remove(*self._members(request, 'tower_ids', Tower))
+        return Response(self.get_serializer(collection).data)
+
+    @action(detail=True, methods=['post'], url_path='add-zones')
+    def add_zones(self, request, pk=None):
+        collection = self.get_object()
+        collection.zones.add(*self._members(request, 'zone_ids', Zone))
+        return Response(self.get_serializer(collection).data)
+
+    @action(detail=True, methods=['post'], url_path='remove-zones')
+    def remove_zones(self, request, pk=None):
+        collection = self.get_object()
+        collection.zones.remove(*self._members(request, 'zone_ids', Zone))
+        return Response(self.get_serializer(collection).data)
 
 
 class ResetScoresView(APIView):
@@ -173,6 +344,12 @@ class AdminGameSerializer(serializers.ModelSerializer):
     base_lng = serializers.FloatField(
         write_only=True, required=False, allow_null=True,
     )
+    collections = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Collection.objects.all(), required=False,
+    )
+    created_by_username = serializers.CharField(
+        source='created_by.username', read_only=True, default=None,
+    )
 
     class Meta:
         model = Game
@@ -189,9 +366,11 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Repository / roles / cloning.
+            'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
         )
-        read_only_fields = ('created_at',)
+        read_only_fields = ('created_at', 'created_by', 'cloned_from')
 
     def get_base_point(self, game):
         if game.base_point is None:
@@ -221,6 +400,11 @@ class AdminGameViewSet(viewsets.ModelViewSet):
 
     Not session-scoped — admins need to list every Game to switch
     between them in the UI. Attaches `created_by` on create.
+
+    Template mutation (update/delete) requires edit rights: the game's
+    creator, a CREATOR collaborator, or a superuser. Legacy games with
+    no recorded creator stay editable by any staff user. Runners
+    personalise a template by cloning it (`POST {id}/clone/`).
     """
 
     permission_classes = [IsAdminUser]
@@ -229,6 +413,90 @@ class AdminGameViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    def _require_edit(self, game):
+        if not game.can_edit(self.request.user):
+            raise PermissionDenied(
+                'Only the game creator may modify this template. '
+                'Clone the game to personalise and run your own copy.',
+            )
+
+    def perform_update(self, serializer):
+        self._require_edit(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_edit(instance)
+        instance.delete()
+
+    @action(detail=True, methods=['post'])
+    def clone(self, request, pk=None):
+        """Clone this Game template for the calling user (§ cloning).
+
+        Deep-copies template-owned data — rules config, challenge bank,
+        TeamGroup taxonomy — and re-links the SAME Collections, so the
+        clone shares Tower/Zone rows by PK instead of duplicating
+        geometry. Records `cloned_from` and sets `created_by` to the
+        cloning user. Optional body: {"name": ..., "slug": ...}.
+        """
+        source = self.get_object()
+
+        slug = request.data.get('slug')
+        if not slug:
+            base = f'{source.slug}-clone'[:58]
+            slug, counter = base, 2
+            while Game.objects.filter(slug=slug).exists():
+                slug = f'{base}-{counter}'
+                counter += 1
+        elif Game.objects.filter(slug=slug).exists():
+            return Response(
+                {'slug': 'A game with this slug already exists.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            clone = Game.objects.create(
+                name=request.data.get('name') or f'{source.name} (clone)',
+                slug=slug,
+                base_point=source.base_point,
+                base_zoom_level=source.base_zoom_level,
+                # A fresh clone starts inactive; the runner activates it
+                # when their event goes live.
+                is_active=False,
+                proximity_meters=source.proximity_meters,
+                cooloff_minutes=source.cooloff_minutes,
+                initial_bonus_default=source.initial_bonus_default,
+                pause_freezes_floating_score=source.pause_freezes_floating_score,
+                pause_restores_ownerships_on_resume=source.pause_restores_ownerships_on_resume,
+                pause_rejects_submissions=source.pause_rejects_submissions,
+                fail_point_penalty=source.fail_point_penalty,
+                fail_cooloff_scaling=source.fail_cooloff_scaling,
+                fail_tower_lockout_minutes=source.fail_tower_lockout_minutes,
+                fail_difficulty_rollback=source.fail_difficulty_rollback,
+                fail_counter_reset=source.fail_counter_reset,
+                created_by=request.user,
+                cloned_from=source,
+            )
+            # Share the geometry: link the SAME collections, never copy
+            # Tower/Zone rows.
+            clone.collections.set(source.collections.all())
+            # Deep-copy the template layer: TeamGroup taxonomy and the
+            # challenge bank (challenges keep pointing at the shared
+            # repository towers).
+            for group in TeamGroup.objects.filter(game=source):
+                TeamGroup.objects.create(
+                    game=clone, name=group.name, slug=group.slug,
+                )
+            for challenge in Challenge.objects.filter(game=source):
+                Challenge.objects.create(
+                    game=clone,
+                    text=challenge.text,
+                    tower=challenge.tower,
+                    difficulty=challenge.difficulty,
+                )
+        return Response(
+            self.get_serializer(clone).data, status=status.HTTP_201_CREATED,
+        )
 
     @action(detail=True, methods=['post'])
     def pause_all(self, request, pk=None):

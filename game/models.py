@@ -11,7 +11,6 @@ from django.db.models.functions import Greatest
 from organize.models import (
     FAIL_RESET_ANY_ATTEMPT_ELSEWHERE,
     FAIL_RESET_ANY_SUCCESS_ELSEWHERE,
-    Game,
     Team,
     TeamGroup,
 )
@@ -35,7 +34,6 @@ class Zone(models.Model):
     ]
 
     name = models.CharField(max_length=255)
-    game = models.ForeignKey("organize.Game", on_delete=models.CASCADE)
 
     color = ColorField(default="#000000", max_length=18)
     scoring_type = models.PositiveSmallIntegerField(choices=ZONE_SCORING_CHOICES)
@@ -98,7 +96,6 @@ class Tower(models.Model):
     ]
 
     name = models.CharField(max_length=255)
-    game = models.ForeignKey(Game, on_delete=models.CASCADE)
 
     location = models.PointField()
     zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True, blank=True)
@@ -136,8 +133,9 @@ class Tower(models.Model):
         elif zone_tower_count > 0:
             #   recalculeaza ownership pentru situatia cu noul turn
             #   get current zone owners
-            #   for each team type (separate controls)
-            for group in TeamGroup.objects.filter(game=self.zone.game):
+            #   for each team type (separate controls) of every Game that
+            #   reaches this zone through its collections
+            for group in TeamGroup.objects.filter(game__collections__zones=self.zone).distinct():
                 current_zone_control_teams = self.zone.zone_control(group=group)
                 #   recalculate maximum number of towers owned in zone
                 team_stats = TeamTowerOwnership.objects.filter(
@@ -289,20 +287,23 @@ class Tower(models.Model):
             return False
 
         # Base cooloff, scaled by consecutive fails on this tower (Phase 10).
+        # The game context comes from the team's session — a repository
+        # tower has no single owning Game anymore.
         scaling = team.session.effective('fail_cooloff_scaling')
         fails = counter.consecutive_fails if counter else 0
-        cooloff_seconds = self.game.cooloff_minutes * 60 * (scaling ** fails)
+        cooloff_seconds = team.session.game.cooloff_minutes * 60 * (scaling ** fails)
         elapsed = (now - ttc.timestamp_verified).total_seconds()
         return elapsed < cooloff_seconds
 
     def save(self, *args, **kwargs):
+        autocreated_zone = None
         if self.zone is None and self.autocreate_zone:
             p = self.location
             p.transform(3857)
             circle = p.buffer(100)
             circle.transform(4326)
 
-            self.zone = Zone.objects.create(
+            self.zone = autocreated_zone = Zone.objects.create(
                 name=f"{self.name} - zone",
                 color="#000000",
                 shape=circle,
@@ -310,8 +311,45 @@ class Tower(models.Model):
             )
 
         super(Tower, self).save(*args, **kwargs)
+        if autocreated_zone is not None:
+            # Keep the autocreated zone reachable wherever the tower is:
+            # add it to every collection the tower already belongs to.
+            for collection in self.collections.all():
+                collection.zones.add(autocreated_zone)
         if self.__is_active != self.is_active and self.is_active is False:
             self.unassign()
+
+
+class Collection(models.Model):
+    """A named, reusable grouping of repository Towers and Zones.
+
+    Collections are the "maps" a Game references: geometry lives in the
+    repository (Tower / Zone rows without a single-Game owner) and is
+    composed into Collections, which Games link through
+    `Game.collections`. A Tower or Zone may belong to any number of
+    Collections; removing it from a Collection never deletes the row.
+    """
+
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=80, unique=True)
+    description = models.TextField(blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='collections_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    towers = models.ManyToManyField(Tower, related_name='collections', blank=True)
+    zones = models.ManyToManyField(Zone, related_name='collections', blank=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return self.name
 
 
 class Challenge(models.Model):

@@ -7,6 +7,7 @@ from leaflet.admin import LeafletGeoAdmin
 
 from game.models import (
     Challenge,
+    Collection,
     PauseWindow,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -22,7 +23,7 @@ class ZoneAdmin(LeafletGeoAdmin):
 
     def get_zone_control(self, instance: Zone):
         output = "<ul>"
-        for group in TeamGroup.objects.filter(game=instance.game):
+        for group in TeamGroup.objects.filter(game__collections__zones=instance).distinct():
             zone_control_teams = instance.zone_control(group.id)
             zone_control_teams = Team.objects.filter(pk__in=zone_control_teams)
             output += "<li>{}: {}</li>\n".format(group.name, ",".join([t.__str__() for t in zone_control_teams]))
@@ -56,7 +57,7 @@ class TowerAdmin(LeafletGeoAdmin):
 
     def get_tower_control(self, instance):
         output = "<ul>"
-        for group in TeamGroup.objects.filter(game=instance.game):
+        for group in TeamGroup.objects.filter(game__collections__towers=instance).distinct():
             try:
                 t = TeamTowerOwnership.objects.get(tower=instance, timestamp_end__isnull=True, team__group=group).team
             except TeamTowerOwnership.DoesNotExist:
@@ -132,6 +133,21 @@ class TeamTowerFailCounterAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'tower__name')
 
 
+class CollectionAdmin(admin.ModelAdmin):
+    list_display = ('name', 'slug', 'tower_count', 'zone_count', 'created_by', 'created_at')
+    search_fields = ('name', 'slug')
+    prepopulated_fields = {'slug': ('name',)}
+    filter_horizontal = ('towers', 'zones')
+    readonly_fields = ('created_at',)
+
+    def tower_count(self, obj):
+        return obj.towers.count()
+
+    def zone_count(self, obj):
+        return obj.zones.count()
+
+
+admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
 admin.site.register(Team, TeamAdmin)

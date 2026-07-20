@@ -56,8 +56,10 @@ class TowerStateView(APIView):
         )
         cooloff_until = None
         if last_rejected and last_rejected.timestamp_verified:
+            # Rule config comes from the team's Game (via its Session) —
+            # repository towers have no single owning Game.
             candidate = last_rejected.timestamp_verified + timedelta(
-                minutes=tower.game.cooloff_minutes,
+                minutes=team.session.game.cooloff_minutes,
             )
             if candidate > timezone.now():
                 cooloff_until = candidate
@@ -95,7 +97,7 @@ class TowerStateView(APIView):
             'cooloff_until': (
                 cooloff_until.isoformat() if cooloff_until else None
             ),
-            'proximity_meters': tower.game.proximity_meters,
+            'proximity_meters': team.session.game.proximity_meters,
         })
 
 
