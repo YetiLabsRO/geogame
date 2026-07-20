@@ -15,6 +15,9 @@ export class App {
 
   protected readonly isAuthenticated = this.auth.isAuthenticated;
   protected readonly username = computed(() => this.auth.profile()?.username ?? null);
+  protected readonly captainTeamId = computed(
+    () => this.auth.profile()?.captain_of_team_id ?? null,
+  );
 
   constructor() {
     if (this.auth.isAuthenticated() && this.auth.profile() === null) {

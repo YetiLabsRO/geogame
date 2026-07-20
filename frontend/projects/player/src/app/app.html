@@ -4,6 +4,10 @@
     <a class="nav-link small" routerLink="/rules">Rules</a>
     @if (isAuthenticated()) {
       <a class="nav-link small" routerLink="/history">History</a>
+      <a class="nav-link small" routerLink="/teams">Teams</a>
+      @if (captainTeamId(); as teamId) {
+        <a class="nav-link small" [routerLink]="['/team', teamId, 'requests']">My team</a>
+      }
     }
     <div class="ms-auto d-flex align-items-center gap-2">
       @if (isAuthenticated()) {

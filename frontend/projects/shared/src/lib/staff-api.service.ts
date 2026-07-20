@@ -50,6 +50,11 @@ export interface AdminTeam {
   group: number | null;
   color: string;
   description: string | null;
+  captain: number | null;
+  captain_username: string | null;
+  team_join_confirmation: TeamJoinConfirmation | null;
+  join_code: string | null;
+  member_count: number;
 }
 
 export interface AdminTeamGroup {
@@ -84,6 +89,8 @@ export interface Phase10Config {
   fail_counter_reset: FailCounterReset;
 }
 
+export type TeamJoinConfirmation = 'AUTO_APPROVE' | 'CAPTAIN' | 'STAFF';
+
 export interface AdminGame extends Phase10Config {
   id: number;
   slug: string;
@@ -94,6 +101,8 @@ export interface AdminGame extends Phase10Config {
   proximity_meters: number;
   cooloff_minutes: number;
   initial_bonus_default: number;
+  allow_player_team_creation: boolean;
+  team_join_confirmation: TeamJoinConfirmation;
   created_at: string | null;
 }
 
@@ -111,6 +120,8 @@ export type Phase10Overrides = {
 
 export interface AdminSession extends Phase10Overrides {
   id: number;
+  /** Per-session override; null inherits the Game default. */
+  allow_player_team_creation: boolean | null;
   game: number;
   game_slug: string;
   game_name: string;
@@ -126,6 +137,11 @@ export interface AdminSession extends Phase10Overrides {
 export type AdminSessionPayload = Partial<
   Omit<AdminSession, 'id' | 'game_slug' | 'game_name' | 'is_paused' | 'created_at'>
 >;
+
+export interface TeamBuildResult {
+  teams: { id: number; name: string; members: string[] }[];
+  assigned: number;
+}
 
 export interface PauseWindowInfo {
   id: number;
@@ -276,6 +292,23 @@ export class StaffApiService {
 
   pauseSession(id: number): Observable<AdminSession> {
     return this.http.post<AdminSession>(`/api/staff/sessions/${id}/pause/`, {});
+  }
+
+  shuffleTeams(id: number, teamCount: number): Observable<TeamBuildResult> {
+    return this.http.post<TeamBuildResult>(`/api/staff/sessions/${id}/shuffle-teams/`, {
+      team_count: teamCount,
+    });
+  }
+
+  balanceTeams(
+    id: number,
+    teamCount: number,
+    attributeKeys: string[],
+  ): Observable<TeamBuildResult> {
+    return this.http.post<TeamBuildResult>(`/api/staff/sessions/${id}/balance-teams/`, {
+      team_count: teamCount,
+      attribute_keys: attributeKeys,
+    });
   }
 
   resumeSession(id: number): Observable<AdminSession> {

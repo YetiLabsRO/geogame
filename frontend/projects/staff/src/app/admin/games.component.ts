@@ -7,6 +7,7 @@ import {
   AdminGamePayload,
   FailCounterReset,
   StaffApiService,
+  TeamJoinConfirmation,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -291,6 +292,37 @@ interface Row {
                           </div>
                         </div>
                       </div>
+                      <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">Team formation</div>
+                        <div class="form-check form-switch">
+                          <input
+                            type="checkbox"
+                            class="form-check-input"
+                            role="switch"
+                            [id]="'ptc-' + row.game.id"
+                            [ngModel]="row.draft.allow_player_team_creation"
+                            (ngModelChange)="update(row, 'allow_player_team_creation', $event)"
+                          />
+                          <label class="form-check-label small" [for]="'ptc-' + row.game.id">
+                            Players may create their own teams
+                          </label>
+                        </div>
+                        <div class="mt-2">
+                          <label class="form-label small mb-0">Join confirmation</label>
+                          <select
+                            class="form-select form-select-sm"
+                            [ngModel]="row.draft.team_join_confirmation"
+                            (ngModelChange)="update(row, 'team_join_confirmation', $event)"
+                          >
+                            @for (o of confirmationOptions; track o.value) {
+                              <option [ngValue]="o.value">{{ o.label }}</option>
+                            }
+                          </select>
+                          <div class="form-text">
+                            Default for new joins; each team can override it.
+                          </div>
+                        </div>
+                      </div>
                     </div>
                   </td>
                 </tr>
@@ -318,6 +350,12 @@ export class GamesComponent {
     { field: 'pause_freezes_floating_score', label: 'Freeze floating score while paused' },
     { field: 'pause_restores_ownerships_on_resume', label: 'Restore ownerships on resume' },
     { field: 'pause_rejects_submissions', label: 'Reject submissions while paused' },
+  ];
+
+  protected readonly confirmationOptions: { value: TeamJoinConfirmation; label: string }[] = [
+    { value: 'AUTO_APPROVE', label: 'Auto-approve joins' },
+    { value: 'CAPTAIN', label: 'Captain approves joins' },
+    { value: 'STAFF', label: 'Staff approve joins' },
   ];
 
   protected readonly resetOptions: { value: FailCounterReset; label: string }[] = [
@@ -446,6 +484,8 @@ export class GamesComponent {
         fail_tower_lockout_minutes: row.draft.fail_tower_lockout_minutes,
         fail_difficulty_rollback: row.draft.fail_difficulty_rollback,
         fail_counter_reset: row.draft.fail_counter_reset,
+        allow_player_team_creation: row.draft.allow_player_team_creation,
+        team_join_confirmation: row.draft.team_join_confirmation,
       })
       .subscribe({
         next: (updated) => {

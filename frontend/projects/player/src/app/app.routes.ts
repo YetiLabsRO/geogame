@@ -73,5 +73,34 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./auth/invite-accept.component').then((m) => m.InviteAcceptComponent),
   },
+  {
+    path: 'teams',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./team/browse-teams.component').then((m) => m.BrowseTeamsComponent),
+  },
+  {
+    path: 'team/create',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./team/create-team.component').then((m) => m.CreateTeamComponent),
+  },
+  {
+    path: 'team/:id/share',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./team/team-share.component').then((m) => m.TeamShareComponent),
+  },
+  {
+    path: 'team/:id/requests',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./team/join-requests.component').then((m) => m.JoinRequestsComponent),
+  },
+  {
+    path: 'join/:code',
+    loadComponent: () =>
+      import('./team/join-code.component').then((m) => m.JoinCodeComponent),
+  },
   { path: '**', redirectTo: '' },
 ];

@@ -17,6 +17,14 @@ export const routes: Routes = [
       import('./invites/invites.component').then((m) => m.InvitesComponent),
   },
   {
+    path: 'join-requests',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./join-requests/join-requests.component').then(
+        (m) => m.StaffJoinRequestsComponent,
+      ),
+  },
+  {
     path: 'towers',
     canActivate: [staffGuard],
     loadComponent: () =>
