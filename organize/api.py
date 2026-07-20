@@ -10,6 +10,7 @@ from django.utils.http import urlsafe_base64_decode, urlsafe_base64_encode
 from rest_framework import generics, serializers, status
 from rest_framework.authtoken.models import Token
 from rest_framework.decorators import api_view, permission_classes
+from rest_framework.exceptions import APIException
 from rest_framework.permissions import AllowAny, IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -19,6 +20,12 @@ from organize.emails import send_invite_email
 from organize.models import Invite, TeamMembership
 
 User = get_user_model()
+
+
+class TeamFullError(APIException):
+    status_code = status.HTTP_409_CONFLICT
+    default_detail = 'Team is already at its maximum member count.'
+    default_code = 'team_full'
 
 
 # ---------- Serializers ----------
@@ -99,6 +106,9 @@ class MyTeamSerializer(serializers.Serializer):
     score = serializers.IntegerField()
     current_score = serializers.SerializerMethodField()
     members = serializers.SerializerMethodField()
+    active_member_count = serializers.SerializerMethodField()
+    is_ready = serializers.SerializerMethodField()
+    members_needed = serializers.SerializerMethodField()
 
     def get_current_score(self, team):
         return team.current_score()
@@ -106,6 +116,15 @@ class MyTeamSerializer(serializers.Serializer):
     def get_members(self, team):
         active = team.memberships.filter(is_active=True).select_related('user__user')
         return TeamMemberSerializer(active, many=True).data
+
+    def get_active_member_count(self, team):
+        return team.active_member_count()
+
+    def get_is_ready(self, team):
+        return team.is_ready()
+
+    def get_members_needed(self, team):
+        return team.members_needed()
 
 
 # ---------- Views ----------
@@ -716,6 +735,24 @@ def invite_accept(request, token):
                 ),
             },
             status=status.HTTP_409_CONFLICT,
+        )
+
+    # Join-cap: never grow a team past the effective max_members_per_team
+    # (0 = no cap). Re-accepting while already on the team is fine.
+    # Raised (not returned) so the surrounding atomic block rolls back
+    # any account created above for an anonymous acceptor.
+    already_member = TeamMembership.objects.filter(
+        team=invite.team, user=user.profile, is_active=True,
+    ).exists()
+    max_members = invite.team.session.effective('max_members_per_team')
+    if (
+        not already_member
+        and max_members
+        and invite.team.active_member_count() >= max_members
+    ):
+        raise TeamFullError(
+            f'Team "{invite.team.name}" is already at its maximum of '
+            f'{max_members} member(s).',
         )
 
     membership, _ = TeamMembership.objects.get_or_create(

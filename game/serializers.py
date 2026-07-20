@@ -64,13 +64,26 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
 class TeamSerializer(serializers.ModelSerializer):
     group_name = serializers.CharField(source='group.name', read_only=True, default=None)
     group_slug = serializers.CharField(source='group.slug', read_only=True, default=None)
+    active_member_count = serializers.SerializerMethodField()
+    is_ready = serializers.SerializerMethodField()
+    members_needed = serializers.SerializerMethodField()
 
     class Meta:
         model = Team
         fields = [
             "id", "name", "group", "group_name", "group_slug",
             "current_score", "color",
+            "active_member_count", "is_ready", "members_needed",
         ]
+
+    def get_active_member_count(self, team):
+        return team.active_member_count()
+
+    def get_is_ready(self, team):
+        return team.is_ready()
+
+    def get_members_needed(self, team):
+        return team.members_needed()
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
