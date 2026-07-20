@@ -15,11 +15,15 @@ import {
   SessionScoreboard,
   SessionTimeline,
   StaffApiService,
+  StartReadiness,
+  TeamRulesOverrides,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
-const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
+type OverrideMap = Phase10Overrides & TeamRulesOverrides;
+
+const OVERRIDE_FIELDS: (keyof OverrideMap)[] = [
   'pause_freezes_floating_score',
   'pause_restores_ownerships_on_resume',
   'pause_rejects_submissions',
@@ -28,6 +32,10 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
   'fail_tower_lockout_minutes',
   'fail_difficulty_rollback',
   'fail_counter_reset',
+  'min_teams',
+  'max_teams',
+  'min_members_per_team',
+  'max_members_per_team',
 ];
 
 @Component({
@@ -57,6 +65,92 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
           <span class="badge text-bg-success ms-2">Active</span>
         }
       </div>
+
+      <!-- Start readiness (team rules) ------------------------------------- -->
+      @if (readiness(); as r) {
+        <div class="card mb-4">
+          <div class="card-body">
+            <div class="d-flex justify-content-between align-items-center">
+              <h2 class="h6 mb-0">
+                Start readiness
+                @if (r.can_start) {
+                  <span class="badge text-bg-success ms-2">Ready to start</span>
+                } @else {
+                  <span class="badge text-bg-warning ms-2">Blocked</span>
+                }
+              </h2>
+              @if (session(); as s) {
+                @if (!s.is_active) {
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-success"
+                    [disabled]="!r.can_start || startBusy()"
+                    (click)="start()"
+                  >
+                    @if (startBusy()) {
+                      <span class="spinner-border spinner-border-sm me-1"></span>
+                    }
+                    Start session
+                  </button>
+                }
+              }
+            </div>
+            @if (r.blockers.length > 0) {
+              <ul class="small text-danger mt-2 mb-2">
+                @for (b of r.blockers; track $index) {
+                  <li>{{ b.message }}</li>
+                }
+              </ul>
+            }
+            @if (startError(); as msg) {
+              <div class="alert alert-danger py-2 mt-2 mb-2">{{ msg }}</div>
+            }
+            @if (r.teams.length === 0) {
+              <p class="text-body-secondary small mb-0 mt-2">No teams yet.</p>
+            } @else {
+              <div class="table-responsive mt-2">
+                <table class="table table-sm mb-0">
+                  <thead>
+                    <tr>
+                      <th>Team</th>
+                      <th class="text-end">Members</th>
+                      <th class="text-end">Required</th>
+                      <th>Readiness</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (t of r.teams; track t.id) {
+                      <tr>
+                        <td>
+                          <span
+                            class="d-inline-block me-2"
+                            style="width: 0.8rem; height: 0.8rem; border-radius: 50%; vertical-align: middle"
+                            [style.background-color]="t.color"
+                          ></span>
+                          {{ t.name }}
+                        </td>
+                        <td class="text-end">{{ t.active_member_count }}</td>
+                        <td class="text-end">{{ r.min_members_per_team }}</td>
+                        <td>
+                          @if (t.is_ready) {
+                            <span class="badge text-bg-success">ready</span>
+                          } @else if (t.members_needed > 0) {
+                            <span class="badge text-bg-warning">
+                              needs {{ t.members_needed }} more
+                            </span>
+                          } @else {
+                            <span class="badge text-bg-danger">over the cap</span>
+                          }
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          </div>
+        </div>
+      }
 
       <!-- Day pausing ------------------------------------------------------ -->
       <div class="card mb-4">
@@ -257,6 +351,23 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
               </select>
             </div>
           </div>
+          <div class="col-12">
+            <div class="fw-semibold small mb-1">Team rules</div>
+            <div class="row g-2">
+              @for (t of teamRuleOverrides; track t.field) {
+                <div class="col-6 col-lg-3">
+                  <label class="form-label small mb-0">{{ t.label }}</label>
+                  <input
+                    class="form-control form-control-sm"
+                    type="number"
+                    [ngModel]="override()[t.field]"
+                    (ngModelChange)="setOverride(t.field, $event)"
+                    placeholder="Inherit"
+                  />
+                </div>
+              }
+            </div>
+          </div>
         </div>
         <button
           type="button"
@@ -342,22 +453,33 @@ export class StaffSessionDetailComponent {
   protected readonly pauseBusy = signal(false);
   protected readonly pauseError = signal<string | null>(null);
 
-  protected readonly override = signal<Phase10Overrides>(blankOverrides());
+  protected readonly readiness = signal<StartReadiness | null>(null);
+  protected readonly startBusy = signal(false);
+  protected readonly startError = signal<string | null>(null);
+
+  protected readonly override = signal<OverrideMap>(blankOverrides());
   protected readonly overrideDirty = signal(false);
   protected readonly overrideSaving = signal(false);
   protected readonly overrideError = signal<string | null>(null);
 
-  protected readonly boolOverrides: { field: keyof Phase10Overrides; label: string }[] = [
+  protected readonly boolOverrides: { field: keyof OverrideMap; label: string }[] = [
     { field: 'pause_freezes_floating_score', label: 'Freeze floating score while paused' },
     { field: 'pause_restores_ownerships_on_resume', label: 'Restore ownerships on resume' },
     { field: 'pause_rejects_submissions', label: 'Reject submissions while paused' },
     { field: 'fail_difficulty_rollback', label: 'Difficulty rollback after failure' },
   ];
 
-  protected readonly numOverrides: { field: keyof Phase10Overrides; label: string; step: number }[] = [
+  protected readonly numOverrides: { field: keyof OverrideMap; label: string; step: number }[] = [
     { field: 'fail_point_penalty', label: 'Point penalty', step: 1 },
     { field: 'fail_cooloff_scaling', label: 'Cooloff scaling (≥1)', step: 0.1 },
     { field: 'fail_tower_lockout_minutes', label: 'Tower lockout (min)', step: 1 },
+  ];
+
+  protected readonly teamRuleOverrides: { field: keyof OverrideMap; label: string }[] = [
+    { field: 'min_teams', label: 'Min teams (≥1)' },
+    { field: 'max_teams', label: 'Max teams (0 = no cap)' },
+    { field: 'min_members_per_team', label: 'Min members/team (≥1)' },
+    { field: 'max_members_per_team', label: 'Max members/team (0 = no cap)' },
   ];
 
   protected readonly resetOptions: { value: FailCounterReset; label: string }[] = [
@@ -379,6 +501,7 @@ export class StaffSessionDetailComponent {
       session: this.staff.getSession(this.sessionId),
       pauseHistory: this.staff.sessionPauseHistory(this.sessionId),
       failCounters: this.staff.sessionFailCounters(this.sessionId),
+      readiness: this.staff.sessionStartBlockers(this.sessionId),
     }).subscribe({
       next: (r) => {
         this.scoreboard.set(r.scoreboard);
@@ -386,6 +509,7 @@ export class StaffSessionDetailComponent {
         this.setSession(r.session);
         this.pauseHistory.set(r.pauseHistory);
         this.failCounters.set(r.failCounters);
+        this.readiness.set(r.readiness);
       },
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
@@ -395,6 +519,31 @@ export class StaffSessionDetailComponent {
     this.session.set(s);
     this.override.set(pickOverrides(s));
     this.overrideDirty.set(false);
+  }
+
+  protected start(): void {
+    if (this.startBusy()) return;
+    this.startBusy.set(true);
+    this.startError.set(null);
+    this.staff.updateSession(this.sessionId, { is_active: true }).subscribe({
+      next: (s) => {
+        this.startBusy.set(false);
+        this.setSession(s);
+        this.refreshReadiness();
+      },
+      error: (err) => {
+        this.startBusy.set(false);
+        this.startError.set(extractErrorMessage(err));
+        this.refreshReadiness();
+      },
+    });
+  }
+
+  private refreshReadiness(): void {
+    this.staff.sessionStartBlockers(this.sessionId).subscribe({
+      next: (r) => this.readiness.set(r),
+      error: () => {},
+    });
   }
 
   protected pause(): void {
@@ -441,9 +590,9 @@ export class StaffSessionDetailComponent {
     });
   }
 
-  protected setOverride<K extends keyof Phase10Overrides>(
+  protected setOverride<K extends keyof OverrideMap>(
     field: K,
-    value: Phase10Overrides[K],
+    value: OverrideMap[K],
   ): void {
     this.override.update((o) => ({ ...o, [field]: value }));
     this.overrideDirty.set(true);
@@ -458,6 +607,7 @@ export class StaffSessionDetailComponent {
       next: (s) => {
         this.overrideSaving.set(false);
         this.setSession(s);
+        this.refreshReadiness();
       },
       error: (err) => {
         this.overrideSaving.set(false);
@@ -467,7 +617,7 @@ export class StaffSessionDetailComponent {
   }
 }
 
-function blankOverrides(): Phase10Overrides {
+function blankOverrides(): OverrideMap {
   return {
     pause_freezes_floating_score: null,
     pause_restores_ownerships_on_resume: null,
@@ -477,13 +627,17 @@ function blankOverrides(): Phase10Overrides {
     fail_tower_lockout_minutes: null,
     fail_difficulty_rollback: null,
     fail_counter_reset: null,
+    min_teams: null,
+    max_teams: null,
+    min_members_per_team: null,
+    max_members_per_team: null,
   };
 }
 
-function pickOverrides(s: AdminSession): Phase10Overrides {
+function pickOverrides(s: AdminSession): OverrideMap {
   const out = blankOverrides();
   for (const field of OVERRIDE_FIELDS) {
-    (out[field] as Phase10Overrides[typeof field]) = s[field];
+    (out[field] as OverrideMap[typeof field]) = s[field];
   }
   return out;
 }

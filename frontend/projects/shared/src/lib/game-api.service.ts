@@ -132,6 +132,10 @@ export class GameApiService {
   teams(): Observable<TeamSummary[]> {
     return this.http.get<TeamSummary[]>('/api/teams/');
   }
+
+  myTeam(): Observable<MyTeam> {
+    return this.http.get<MyTeam>('/api/my-team/');
+  }
 }
 
 export interface SessionScoreboardEntry {
@@ -174,4 +178,27 @@ export interface TeamSummary {
   group_slug: string | null;
   current_score: number;
   color: string;
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
+}
+
+export interface MyTeamMember {
+  user_id: number;
+  username: string;
+  first_name: string;
+  last_name: string;
+  joined_at: string;
+}
+
+export interface MyTeam {
+  id: number;
+  name: string;
+  color: string;
+  score: number;
+  current_score: number;
+  members: MyTeamMember[];
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
 }

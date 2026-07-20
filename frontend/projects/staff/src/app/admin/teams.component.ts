@@ -41,6 +41,8 @@ interface Row {
               <th>Group</th>
               <th>Color</th>
               <th>Description</th>
+              <th class="text-end">Members</th>
+              <th>Readiness</th>
               <th></th>
             </tr>
           </thead>
@@ -82,6 +84,18 @@ interface Row {
                     [ngModel]="row.draft.description"
                     (ngModelChange)="update(row, 'description', $event)"
                   />
+                </td>
+                <td class="text-end">{{ row.team.active_member_count }}</td>
+                <td>
+                  @if (row.team.is_ready) {
+                    <span class="badge text-bg-success">ready</span>
+                  } @else if (row.team.members_needed > 0) {
+                    <span class="badge text-bg-warning">
+                      needs {{ row.team.members_needed }} more
+                    </span>
+                  } @else {
+                    <span class="badge text-bg-danger">over the cap</span>
+                  }
                 </td>
                 <td class="text-end">
                   <button

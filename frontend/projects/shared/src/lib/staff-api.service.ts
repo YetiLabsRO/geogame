@@ -50,6 +50,9 @@ export interface AdminTeam {
   group: number | null;
   color: string;
   description: string | null;
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
 }
 
 export interface AdminTeamGroup {
@@ -84,7 +87,20 @@ export interface Phase10Config {
   fail_counter_reset: FailCounterReset;
 }
 
-export interface AdminGame extends Phase10Config {
+/** Team-composition rules: minima ≥ 1, maxima use 0 to mean "no cap". */
+export interface TeamRulesConfig {
+  min_teams: number;
+  max_teams: number;
+  min_members_per_team: number;
+  max_members_per_team: number;
+}
+
+/** Per-session team-rule overrides: null means "inherit the Game default". */
+export type TeamRulesOverrides = {
+  [K in keyof TeamRulesConfig]: TeamRulesConfig[K] | null;
+};
+
+export interface AdminGame extends Phase10Config, TeamRulesConfig {
   id: number;
   slug: string;
   name: string;
@@ -109,7 +125,7 @@ export type Phase10Overrides = {
   [K in keyof Phase10Config]: Phase10Config[K] | null;
 };
 
-export interface AdminSession extends Phase10Overrides {
+export interface AdminSession extends Phase10Overrides, TeamRulesOverrides {
   id: number;
   game: number;
   game_slug: string;
@@ -148,6 +164,38 @@ export interface FailCounterInfo {
   consecutive_fails: number;
   locked_until: string | null;
   is_locked: boolean;
+}
+
+/** One reason a Session may not start (machine `code` + human `message`). */
+export interface StartBlocker {
+  code:
+    | 'too_few_teams'
+    | 'too_many_teams'
+    | 'team_below_minimum'
+    | 'team_above_maximum';
+  message: string;
+  required?: number;
+  allowed?: number;
+  current?: number;
+  shortfall?: number;
+  team_id?: number;
+  team_name?: string;
+}
+
+export interface StartReadinessTeam {
+  id: number;
+  name: string;
+  color: string;
+  active_member_count: number;
+  is_ready: boolean;
+  members_needed: number;
+}
+
+export interface StartReadiness {
+  can_start: boolean;
+  blockers: StartBlocker[];
+  min_members_per_team: number;
+  teams: StartReadinessTeam[];
 }
 
 @Injectable({ providedIn: 'root' })
@@ -296,6 +344,14 @@ export class StaffApiService {
   sessionFailCounters(id: number): Observable<FailCounterInfo[]> {
     return this.http.get<FailCounterInfo[]>(
       `/api/staff/sessions/${id}/fail_counters/`,
+    );
+  }
+
+  // ---- Team rules: start-gate readiness -------------------------------------
+
+  sessionStartBlockers(id: number): Observable<StartReadiness> {
+    return this.http.get<StartReadiness>(
+      `/api/staff/sessions/${id}/start_blockers/`,
     );
   }
 }
