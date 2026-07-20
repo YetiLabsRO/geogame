@@ -7,7 +7,12 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from game.models import Challenge, TeamTowerChallenge, Tower
+from game.models import (
+    ROLE_REQUIREMENT_NONE,
+    Challenge,
+    TeamTowerChallenge,
+    Tower,
+)
 from game.scoping import SessionScopedViewSetMixin
 
 
@@ -21,6 +26,27 @@ class OwnershipSummarySerializer(serializers.Serializer):
     team_id = serializers.IntegerField()
     team_name = serializers.CharField()
     team_color = serializers.CharField()
+
+
+def _role_requirement_payload(challenge, team):
+    """Player-facing role requirement + satisfaction hint (team-roles).
+
+    None when the challenge declares no requirement (the default), so
+    pre-change clients see no behavior change.
+    """
+    if challenge is None or challenge.role_requirement_mode == ROLE_REQUIREMENT_NONE:
+        return None
+    ok, missing = challenge.team_satisfies_roles(team)
+    return {
+        'mode': challenge.role_requirement_mode,
+        'required_roles': [
+            {'slug': role.slug, 'name': role.name}
+            for role in challenge.required_roles.all()
+        ],
+        'require_holders_present': challenge.require_holders_present,
+        'team_satisfies': ok,
+        'missing_roles': missing,
+    }
 
 
 class TowerStateView(APIView):
@@ -67,6 +93,12 @@ class TowerStateView(APIView):
         ).exists()
 
         next_challenge = tower.get_next_challenge(team) if not pending else None
+        next_challenge_payload = None
+        if next_challenge is not None:
+            next_challenge_payload = ChallengeSummarySerializer(next_challenge).data
+            next_challenge_payload['role_requirement'] = _role_requirement_payload(
+                next_challenge, team,
+            )
 
         ownership = tower.tower_control(team.group) if team.group else None
         ownership_payload = None
@@ -87,10 +119,7 @@ class TowerStateView(APIView):
             },
             'has_initial_bonus': tower.initial_bonus != 0,
             'ownership': ownership_payload,
-            'next_challenge': (
-                ChallengeSummarySerializer(next_challenge).data
-                if next_challenge else None
-            ),
+            'next_challenge': next_challenge_payload,
             'pending_submission': pending,
             'cooloff_until': (
                 cooloff_until.isoformat() if cooloff_until else None

@@ -21,6 +21,17 @@ def _now():
     return datetime.now(timezone.utc)
 
 
+# Challenge role-requirement modes (team-roles-as-mechanics).
+ROLE_REQUIREMENT_NONE = 'NONE'
+ROLE_REQUIREMENT_ALL = 'ALL'
+ROLE_REQUIREMENT_ANY = 'ANY'
+ROLE_REQUIREMENT_CHOICES = [
+    (ROLE_REQUIREMENT_NONE, 'No role requirement'),
+    (ROLE_REQUIREMENT_ALL, 'One holder for each required role'),
+    (ROLE_REQUIREMENT_ANY, 'At least one required role held'),
+]
+
+
 class Zone(models.Model):
     SCORE_LOG = 1
     SCORE_EXP = 2
@@ -329,10 +340,52 @@ class Challenge(models.Model):
     tower = models.ForeignKey(Tower, null=True, blank=True, on_delete=models.CASCADE)
     difficulty = models.PositiveSmallIntegerField(default=1)
 
+    # --- team-roles-as-mechanics: opt-in role gating. Defaults (NONE /
+    # empty / False) preserve pre-change behavior exactly. ---
+    role_requirement_mode = models.CharField(
+        max_length=8,
+        choices=ROLE_REQUIREMENT_CHOICES,
+        default=ROLE_REQUIREMENT_NONE,
+    )
+    required_roles = models.ManyToManyField(
+        'organize.GameRole', blank=True, related_name='required_by_challenges',
+    )
+    # Creator intent that required-role holders must also be physically
+    # present. The presence test itself is the `presence-rules`
+    # capability; until that ships, assignment alone suffices.
+    require_holders_present = models.BooleanField(default=False)
+
     def __str__(self):
         if self.tower:
             return "(Turn {}) {}".format(self.tower, self.text)
         return self.text
+
+    def team_satisfies_roles(self, team):
+        """Evaluate this challenge's role requirement for `team`.
+
+        Returns `(ok, missing_role_slugs)`. Counts the DISTINCT roles
+        covered by the team's active role holders — never member
+        head-count: one member holding two required roles satisfies an
+        ALL requirement over those two roles alone; many members holding
+        none fail.
+
+        - NONE → always `(True, [])`.
+        - ANY  → ok when at least one required role is covered; on
+          failure every required slug is reported missing.
+        - ALL  → ok only when every required role is covered; the
+          uncovered slugs are reported missing.
+        """
+        if self.role_requirement_mode == ROLE_REQUIREMENT_NONE:
+            return True, []
+        required = list(self.required_roles.all())
+        if not required:
+            return True, []
+        held = team.active_role_slugs()
+        missing = [role.slug for role in required if role.slug not in held]
+        if self.role_requirement_mode == ROLE_REQUIREMENT_ANY:
+            covered = len(missing) < len(required)
+            return covered, ([] if covered else missing)
+        return not missing, missing
 
 
 class TeamTowerChallenge(models.Model):

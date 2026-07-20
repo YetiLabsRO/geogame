@@ -13,12 +13,16 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from organize.models import (
+    BUILTIN_POWER_INVITER,
     Game,
+    GameRole,
     Invite,
     Session,
     Team,
     TeamMembership,
+    TeamRole,
     UserProfile,
+    user_can_invite_to_team,
 )
 
 User = get_user_model()
@@ -994,3 +998,241 @@ class InviteModelTest(TestCase):
             accepted_by=self.creator, accepted_at=timezone.now(),
         )
         self.assertFalse(invite.is_usable())
+
+
+# ---------------------------------------------------------------------------
+# team-roles-as-mechanics — role models, INVITER power, cloning, API surface
+# ---------------------------------------------------------------------------
+
+
+def _member(team, username):
+    """Create a user with an active membership on `team`."""
+    user = User.objects.create_user(
+        username=username, email=f'{username}@example.com', password='password123',
+    )
+    membership = TeamMembership.objects.create(
+        team=team, user=user.profile, is_active=True,
+    )
+    return user, membership
+
+
+def _client_for(user):
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=user).key}')
+    return client
+
+
+class GameRoleModelTest(TestCase):
+    """8.1 — GameRole/TeamRole uniqueness and cross-game rejection."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.team = _make_team(self.game)
+
+    def test_slug_unique_per_game(self):
+        from django.db import IntegrityError
+        GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        with self.assertRaises(IntegrityError):
+            GameRole.objects.create(game=self.game, name='Chef', slug='cook')
+
+    def test_same_slug_ok_across_games(self):
+        other = _make_game(name='Game B')
+        GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        GameRole.objects.create(game=other, name='Cook', slug='cook')
+        self.assertEqual(GameRole.objects.filter(slug='cook').count(), 2)
+
+    def test_membership_cannot_hold_same_role_twice(self):
+        from django.db import IntegrityError
+        role = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        _, membership = _member(self.team, 'scout')
+        TeamRole.objects.create(membership=membership, role=role)
+        with self.assertRaises(IntegrityError):
+            TeamRole.objects.create(membership=membership, role=role)
+
+    def test_role_from_other_game_rejected(self):
+        from django.core.exceptions import ValidationError
+        other = _make_game(name='Game B')
+        foreign_role = GameRole.objects.create(game=other, name='Cook', slug='cook')
+        _, membership = _member(self.team, 'scout')
+        with self.assertRaises(ValidationError):
+            TeamRole.objects.create(membership=membership, role=foreign_role)
+
+    def test_role_accessors_ignore_inactive_memberships(self):
+        cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        medic = GameRole.objects.create(game=self.game, name='Medic', slug='medic')
+        _, active_m = _member(self.team, 'active')
+        gone_user = User.objects.create_user(
+            username='gone', email='gone@example.com', password='password123',
+        )
+        gone_m = TeamMembership.objects.create(
+            team=self.team, user=gone_user.profile, is_active=False,
+            left_at=timezone.now(),
+        )
+        TeamRole.objects.create(membership=active_m, role=cook)
+        TeamRole.objects.create(membership=gone_m, role=medic)
+        self.assertEqual(active_m.role_slugs(), ['cook'])
+        self.assertEqual(self.team.active_role_slugs(), {'cook'})
+
+
+class InviterPowerTest(TestCase):
+    """8.4 — INVITER built-in power extends (never replaces) staff invites."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.team = _make_team(self.game)
+        self.inviter_role = GameRole.objects.create(
+            game=self.game, name='Inviter', slug='inviter',
+            builtin_power=BUILTIN_POWER_INVITER,
+        )
+        self.url = reverse('api-invites')
+
+    def test_inviter_holder_can_create_invite_for_own_team(self):
+        user, membership = _member(self.team, 'holder')
+        TeamRole.objects.create(membership=membership, role=self.inviter_role)
+        resp = _client_for(user).post(
+            self.url, {'team': self.team.id}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['created_by'], user.id)
+
+    def test_inviter_holder_cannot_invite_to_other_team(self):
+        user, membership = _member(self.team, 'holder')
+        TeamRole.objects.create(membership=membership, role=self.inviter_role)
+        other_team = Team.objects.create(
+            name='Rivals', session=self.team.session, color='#00ff00',
+        )
+        resp = _client_for(user).post(
+            self.url, {'team': other_team.id}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_non_holder_member_cannot_create_invite(self):
+        user, _ = _member(self.team, 'plain')
+        resp = _client_for(user).post(
+            self.url, {'team': self.team.id}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(Invite.objects.exists())
+
+    def test_staff_can_still_create_invite(self):
+        staff = User.objects.create_user(
+            username='boss', email='boss@example.com', password='password123',
+            is_staff=True,
+        )
+        resp = _client_for(staff).post(
+            self.url, {'team': self.team.id}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_without_inviter_role_defined_creation_stays_staff_only(self):
+        self.inviter_role.delete()
+        user, _ = _member(self.team, 'plain')
+        resp = _client_for(user).post(
+            self.url, {'team': self.team.id}, content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_inactive_membership_role_does_not_grant_invite(self):
+        user, membership = _member(self.team, 'gone')
+        TeamRole.objects.create(membership=membership, role=self.inviter_role)
+        membership.is_active = False
+        membership.left_at = timezone.now()
+        membership.save()
+        self.assertFalse(user_can_invite_to_team(user, self.team))
+
+    def test_invite_listing_stays_staff_only(self):
+        user, membership = _member(self.team, 'holder')
+        TeamRole.objects.create(membership=membership, role=self.inviter_role)
+        resp = _client_for(user).get(self.url)
+        self.assertEqual(resp.status_code, 403)
+
+
+class GameCloneRolesTest(TestCase):
+    """8.6 — cloning a Game copies roles and rewires challenge requirements."""
+
+    def setUp(self):
+        from game.models import ROLE_REQUIREMENT_ALL, Challenge
+        self.game = _make_game()
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.medic = GameRole.objects.create(game=self.game, name='Medic', slug='medic')
+        from organize.models import TeamGroup
+        TeamGroup.objects.create(game=self.game, name='Explo', slug='explo')
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='Cook a meal', difficulty=2,
+            role_requirement_mode=ROLE_REQUIREMENT_ALL,
+        )
+        self.challenge.required_roles.set([self.cook, self.medic])
+
+    def test_clone_copies_roles_and_remaps_requirements(self):
+        clone = self.game.clone(slug='clone')
+        self.assertNotEqual(clone.pk, self.game.pk)
+        self.assertFalse(clone.is_active)
+
+        cloned_roles = {r.slug: r for r in clone.roles.all()}
+        self.assertEqual(set(cloned_roles), {'cook', 'medic'})
+        self.assertNotIn(
+            self.cook.pk, [r.pk for r in cloned_roles.values()],
+        )
+
+        cloned_challenge = clone.challenges.get()
+        required = list(cloned_challenge.required_roles.all())
+        self.assertEqual({r.slug for r in required}, {'cook', 'medic'})
+        # No reference back to the original's roles.
+        for role in required:
+            self.assertEqual(role.game_id, clone.pk)
+
+    def test_clone_copies_team_groups_and_config(self):
+        self.game.proximity_meters = 75
+        self.game.save(update_fields=['proximity_meters'])
+        clone = self.game.clone(slug='clone', name='The clone')
+        self.assertEqual(clone.name, 'The clone')
+        self.assertEqual(clone.proximity_meters, 75)
+        from organize.models import TeamGroup
+        self.assertTrue(
+            TeamGroup.objects.filter(game=clone, slug='explo').exists(),
+        )
+
+    def test_original_untouched_by_clone(self):
+        self.game.clone(slug='clone')
+        self.challenge.refresh_from_db()
+        self.assertEqual(
+            {r.pk for r in self.challenge.required_roles.all()},
+            {self.cook.pk, self.medic.pk},
+        )
+        self.assertEqual(self.game.roles.count(), 2)
+
+
+class RolesApiSurfaceTest(TestCase):
+    """5.3 — roles surfaced on my-team and me payloads."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.team = _make_team(self.game)
+        self.cook = GameRole.objects.create(game=self.game, name='Cook', slug='cook')
+        self.inviter = GameRole.objects.create(
+            game=self.game, name='Inviter', slug='inviter',
+            builtin_power=BUILTIN_POWER_INVITER,
+        )
+        self.user, self.membership = _member(self.team, 'scout')
+        TeamRole.objects.create(membership=self.membership, role=self.cook)
+        self.client_api = _client_for(self.user)
+
+    def test_my_team_members_expose_roles(self):
+        resp = self.client_api.get(reverse('api-my-team'))
+        self.assertEqual(resp.status_code, 200)
+        member = resp.json()['members'][0]
+        self.assertEqual([r['slug'] for r in member['roles']], ['cook'])
+
+    def test_my_team_exposes_can_invite_flag(self):
+        resp = self.client_api.get(reverse('api-my-team'))
+        self.assertFalse(resp.json()['can_invite'])
+        TeamRole.objects.create(membership=self.membership, role=self.inviter)
+        resp = self.client_api.get(reverse('api-my-team'))
+        self.assertTrue(resp.json()['can_invite'])
+
+    def test_me_exposes_active_roles(self):
+        resp = self.client_api.get(reverse('api-me'))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            [r['slug'] for r in resp.json()['active_roles']], ['cook'],
+        )
