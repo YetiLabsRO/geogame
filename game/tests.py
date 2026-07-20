@@ -2106,3 +2106,220 @@ class FailureConsequencesTest(TestCase):
         self.assertEqual(data[0]['consecutive_fails'], 1)
         self.assertTrue(data[0]['is_locked'])
         self.assertEqual(data[0]['tower_name'], self.tower.name)
+
+
+# ---------------------------------------------------------------------------
+# game-config-team-rules — staff API knobs + start-gate + teams readiness
+# ---------------------------------------------------------------------------
+
+
+class TeamRulesApiTest(TestCase):
+    """5.6 — team-rule knobs over the staff API, start-gate, teams readiness."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.staff_client, self.staff = _staff_client(
+            session=self.session, username='rules-admin',
+        )
+
+    def _add_member(self, team, username):
+        user = User.objects.create_user(
+            username=username, email=f'{username}@example.com',
+            password='password123',
+        )
+        TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+        return user
+
+    # -- Games serializer (3.1) --
+
+    def test_game_knobs_default_and_patch(self):
+        resp = self.staff_client.get(f'/api/staff/games/{self.game.id}/')
+        body = resp.json()
+        self.assertEqual(body['min_teams'], 1)
+        self.assertEqual(body['max_teams'], 0)
+        self.assertEqual(body['min_members_per_team'], 1)
+        self.assertEqual(body['max_members_per_team'], 0)
+
+        resp = self.staff_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'min_teams': 2, 'max_teams': 4,
+             'min_members_per_team': 2, 'max_members_per_team': 6},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.game.refresh_from_db()
+        self.assertEqual(self.game.min_teams, 2)
+        self.assertEqual(self.game.max_teams, 4)
+        self.assertEqual(self.game.min_members_per_team, 2)
+        self.assertEqual(self.game.max_members_per_team, 6)
+
+    def test_game_rejects_minimum_below_one(self):
+        for field in ('min_teams', 'min_members_per_team'):
+            resp = self.staff_client.patch(
+                f'/api/staff/games/{self.game.id}/', {field: 0}, format='json',
+            )
+            self.assertEqual(resp.status_code, 400, resp.content)
+            self.assertIn(field, resp.json())
+
+    def test_game_rejects_nonzero_max_below_min(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'min_teams': 3, 'max_teams': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('max_teams', resp.json())
+
+        resp = self.staff_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'min_members_per_team': 4, 'max_members_per_team': 3},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('max_members_per_team', resp.json())
+
+    # -- Sessions serializer (3.1) --
+
+    def test_session_overrides_default_null_and_patch(self):
+        resp = self.staff_client.get(f'/api/staff/sessions/{self.session.id}/')
+        body = resp.json()
+        for field in ('min_teams', 'max_teams',
+                      'min_members_per_team', 'max_members_per_team'):
+            self.assertIsNone(body[field])
+
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'min_teams': 2, 'max_members_per_team': 5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.min_teams, 2)
+        self.assertEqual(self.session.max_members_per_team, 5)
+
+        # Blank (null) reverts to inherit.
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'min_teams': None},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertIsNone(self.session.min_teams)
+
+    def test_session_rejects_invalid_override_combo(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'min_teams': 3, 'max_teams': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('max_teams', resp.json())
+
+    # -- Start-gate on activation (3.3) --
+
+    def test_activation_blocked_returns_409_with_blockers(self):
+        self.assertFalse(self.session.is_active)
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': True},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 409, resp.content)
+        body = resp.json()
+        self.assertIn('blockers', body)
+        codes = [b['code'] for b in body['blockers']]
+        self.assertIn('too_few_teams', codes)
+        self.session.refresh_from_db()
+        self.assertFalse(self.session.is_active)
+
+    def test_activation_succeeds_when_thresholds_met(self):
+        self._add_member(self.team, 'starter')
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': True},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertTrue(self.session.is_active)
+
+    def test_activation_gate_uses_overrides_from_same_patch(self):
+        self._add_member(self.team, 'lone-wolf')
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': True, 'min_teams': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.session.refresh_from_db()
+        self.assertFalse(self.session.is_active)
+        self.assertIsNone(self.session.min_teams)  # rolled back with the gate
+
+    def test_deactivation_is_never_gated(self):
+        self._add_member(self.team, 'quitter')
+        self.session.is_active = True
+        self.session.save()
+        # Make the session unstartable, then deactivate — allowed.
+        resp = self.staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'is_active': False, 'min_teams': 5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertFalse(self.session.is_active)
+
+    def test_start_blockers_action(self):
+        resp = self.staff_client.get(
+            f'/api/staff/sessions/{self.session.id}/start_blockers/',
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertFalse(body['can_start'])
+        self.assertTrue(body['blockers'])
+        self.assertEqual(body['min_members_per_team'], 1)
+        self.assertEqual(len(body['teams']), 1)
+        self.assertEqual(body['teams'][0]['active_member_count'], 0)
+        self.assertFalse(body['teams'][0]['is_ready'])
+        self.assertEqual(body['teams'][0]['members_needed'], 1)
+
+        self._add_member(self.team, 'filler')
+        resp = self.staff_client.get(
+            f'/api/staff/sessions/{self.session.id}/start_blockers/',
+        )
+        body = resp.json()
+        self.assertTrue(body['can_start'])
+        self.assertEqual(body['blockers'], [])
+        self.assertTrue(body['teams'][0]['is_ready'])
+
+    # -- Teams API readiness (3.2) --
+
+    def test_player_teams_endpoint_exposes_readiness(self):
+        self.game.min_members_per_team = 2
+        self.game.save()
+        client, _ = _authed_client(self.team, username='ready-check')
+        resp = client.get('/api/teams/')
+        self.assertEqual(resp.status_code, 200)
+        payload = {t['id']: t for t in resp.json()}
+        entry = payload[self.team.id]
+        self.assertEqual(entry['active_member_count'], 1)
+        self.assertFalse(entry['is_ready'])
+        self.assertEqual(entry['members_needed'], 1)
+
+        self._add_member(self.team, 'second-member')
+        entry = {t['id']: t for t in client.get('/api/teams/').json()}[self.team.id]
+        self.assertEqual(entry['active_member_count'], 2)
+        self.assertTrue(entry['is_ready'])
+        self.assertEqual(entry['members_needed'], 0)
+
+    def test_staff_teams_endpoint_exposes_readiness(self):
+        resp = self.staff_client.get('/api/staff/teams/')
+        self.assertEqual(resp.status_code, 200)
+        entry = {t['id']: t for t in resp.json()}[self.team.id]
+        self.assertEqual(entry['active_member_count'], 0)
+        self.assertFalse(entry['is_ready'])
+        self.assertEqual(entry['members_needed'], 1)
