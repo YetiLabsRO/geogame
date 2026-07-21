@@ -134,6 +134,10 @@ OVERRIDABLE_CONFIG_FIELDS = (
     # Realtime + push knobs (realtime-and-notifications).
     'realtime_enabled',
     'push_notifications_enabled',
+    # NFC capture-mode knobs (nfc-native-and-secure-links).
+    'nfc_secure_mode',
+    'nfc_require_app',
+    'nfc_replay_hardening',
 )
 
 
@@ -257,6 +261,13 @@ class Game(models.Model):
     # overridable per Session (see Session.effective). ---
     realtime_enabled = models.BooleanField(default=True)
     push_notifications_enabled = models.BooleanField(default=False)
+
+    # --- nfc-native-and-secure-links knobs. All default off so the
+    # legacy forwardable RFID URL behavior is unchanged until a creator
+    # opts in; overridable per Session (see Session.effective). ---
+    nfc_secure_mode = models.BooleanField(default=False)
+    nfc_require_app = models.BooleanField(default=False)
+    nfc_replay_hardening = models.BooleanField(default=False)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -616,6 +627,11 @@ class Session(models.Model):
     score_time_unit = models.CharField(
         max_length=8, choices=TIME_UNIT_CHOICES, null=True, blank=True,
     )
+
+    # --- NFC capture-mode overrides (null = inherit Game default). ---
+    nfc_secure_mode = models.BooleanField(null=True, blank=True)
+    nfc_require_app = models.BooleanField(null=True, blank=True)
+    nfc_replay_hardening = models.BooleanField(null=True, blank=True)
 
     # --- Team-composition overrides. NULL means "inherit the Game
     # default"; a 0 maximum means "explicitly no cap". ---

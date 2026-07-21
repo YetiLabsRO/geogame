@@ -16,10 +16,14 @@ from rest_framework.views import APIView
 
 from game.challenge_types import REVIEW_MANUAL, TYPE_NFC_QR, TYPE_TEXT
 from game.models import (
+    NFC_MODE_LEGACY_URL,
+    NFC_MODE_SECURE_TOKEN,
     ROLE_REQUIREMENT_NONE,
     Challenge,
     Collection,
+    NfcTag,
     PresenceRequirement,
+    TagScan,
     TeamTowerFailCounter,
     TeamTowerOwnership,
     TeamZoneOwnership,
@@ -949,6 +953,170 @@ class AdminTeamMembershipViewSet(SessionScopedViewSetMixin, viewsets.ReadOnlyMod
         return Response(self.get_serializer(membership).data)
 
 
+# ---------------------------------------------------------------------------
+# nfc-native-and-secure-links: tag provisioning + scan audit
+# ---------------------------------------------------------------------------
+
+
+class AdminNfcTagSerializer(serializers.ModelSerializer):
+    """Staff payload for provisioned tags.
+
+    `token` is minted server-side and read-only; `app_link` /
+    `ndef_payload` give the writable provisioning data (also exposed as
+    the dedicated `ndef` / `qr` actions).
+    """
+
+    app_link = serializers.SerializerMethodField()
+    target_summary = serializers.SerializerMethodField()
+    scan_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = NfcTag
+        fields = (
+            'id', 'token', 'mode', 'tower', 'challenge',
+            'label', 'hidden_hint', 'is_active',
+            'expected_counter', 'last_counter',
+            'app_link', 'target_summary', 'scan_count',
+            'created_by', 'created_at',
+        )
+        read_only_fields = ('token', 'last_counter', 'created_by', 'created_at')
+
+    def get_app_link(self, tag):
+        return tag.app_link()
+
+    def get_target_summary(self, tag):
+        if tag.tower_id:
+            return {'kind': 'tower', 'id': tag.tower_id, 'name': tag.tower.name}
+        if tag.challenge_id:
+            return {
+                'kind': 'challenge', 'id': tag.challenge_id,
+                'name': str(tag.challenge)[:80],
+            }
+        return None
+
+    def get_scan_count(self, tag):
+        return tag.scans.count()
+
+    def validate(self, attrs):
+        """Friendly-400 mirror of NfcTag.clean() (task 1.3)."""
+        instance = self.instance
+
+        def resolved(field, default=None):
+            if field in attrs:
+                return attrs[field]
+            return getattr(instance, field) if instance else default
+
+        mode = resolved('mode', NFC_MODE_SECURE_TOKEN)
+        tower = resolved('tower')
+        challenge = resolved('challenge')
+        if mode == NFC_MODE_SECURE_TOKEN:
+            if bool(tower) == bool(challenge):
+                raise serializers.ValidationError(
+                    'A SECURE_TOKEN tag must target exactly one of a Tower or a Challenge.',
+                )
+            if challenge is not None and challenge.tower_id is None:
+                raise serializers.ValidationError(
+                    'A challenge-targeted tag needs a tower-bound challenge.',
+                )
+        else:
+            if challenge is not None or tower is None:
+                raise serializers.ValidationError(
+                    'A LEGACY_URL tag must target a Tower (not a Challenge).',
+                )
+            if tower.category != Tower.CATEGORY_RFID or not tower.rfid_code:
+                raise serializers.ValidationError(
+                    'A LEGACY_URL tag mirrors an RFID-category tower with an rfid_code.',
+                )
+        return attrs
+
+
+class AdminTagScanSerializer(serializers.ModelSerializer):
+    tag_label = serializers.SerializerMethodField()
+    player_username = serializers.CharField(
+        source='player.username', read_only=True, default=None,
+    )
+
+    class Meta:
+        model = TagScan
+        fields = (
+            'id', 'tag', 'tag_label', 'player', 'player_username',
+            'session', 'timestamp', 'outcome',
+            'lat', 'lng', 'accuracy', 'counter',
+        )
+
+    def get_tag_label(self, scan):
+        return scan.tag.label or scan.tag.token[:8]
+
+
+class AdminNfcTagViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for NfcTags + provisioning exports + scan audit.
+
+    Mint (POST — the token is generated server-side), bind to a tower or
+    challenge, edit, deactivate (PATCH is_active=false) or delete.
+    Filters: ?tower=, ?challenge=, ?mode=. `GET {id}/ndef/` returns the
+    writable NDEF records, `GET {id}/qr/` a printable PNG of the
+    app-link, `GET scan-audit/` the TagScan audit list (?tag= filter).
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = (
+        NfcTag.objects
+        .select_related('tower', 'challenge', 'challenge__tower')
+        .order_by('-created_at')
+    )
+    serializer_class = AdminNfcTagSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tower_id = self.request.query_params.get('tower')
+        if tower_id:
+            qs = qs.filter(tower_id=tower_id)
+        challenge_id = self.request.query_params.get('challenge')
+        if challenge_id:
+            qs = qs.filter(challenge_id=challenge_id)
+        mode = self.request.query_params.get('mode')
+        if mode:
+            qs = qs.filter(mode=mode.upper())
+        return qs
+
+    def perform_create(self, serializer):
+        serializer.save(created_by=self.request.user)
+
+    @action(detail=True, methods=['get'])
+    def ndef(self, request, pk=None):
+        """The exact records to write to the physical tag (task 5.2)."""
+        return Response(self.get_object().ndef_payload())
+
+    @action(detail=True, methods=['get'])
+    def qr(self, request, pk=None):
+        """Printable QR PNG of the app-link (stickers / camera fallback)."""
+        import io
+
+        import qrcode
+        from django.http import HttpResponse
+
+        tag = self.get_object()
+        if tag.mode == NFC_MODE_LEGACY_URL:
+            payload = tag.ndef_payload()['records'][0]['uri']
+        else:
+            payload = tag.app_link()
+        buf = io.BytesIO()
+        qrcode.make(payload).save(buf, format='PNG')
+        return HttpResponse(buf.getvalue(), content_type='image/png')
+
+    @action(detail=False, methods=['get'], url_path='scan-audit')
+    def scan_audit(self, request):
+        """Recent TagScan audit rows (newest first, capped at 200)."""
+        scans = TagScan.objects.select_related('tag', 'player').order_by('-timestamp')
+        tag_id = request.query_params.get('tag')
+        if tag_id:
+            scans = scans.filter(tag_id=tag_id)
+        session_id = request.query_params.get('session')
+        if session_id:
+            scans = scans.filter(session_id=session_id)
+        return Response(AdminTagScanSerializer(scans[:200], many=True).data)
+
+
 class ResetScoresView(APIView):
     """Staff-only: zero out all Team.score and close every open ownership.
 
@@ -1066,6 +1234,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'teammate_visibility_count', 'presence_window_seconds',
             # Realtime + push defaults (realtime-and-notifications).
             'realtime_enabled', 'push_notifications_enabled',
+            # NFC capture-mode knobs (defaults preserve legacy URLs).
+            'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -1238,6 +1408,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'teammate_visibility_count', 'presence_window_seconds',
             # Realtime + push overrides (null = inherit Game default).
             'realtime_enabled', 'push_notifications_enabled',
+            # NFC capture-mode overrides (null = inherit Game default).
+            'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
             'created_at',
         )
         read_only_fields = (

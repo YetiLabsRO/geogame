@@ -5,19 +5,22 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 # Register your models here.
-from django.utils.html import format_html
+from django.utils.html import format_html, format_html_join
 from django.utils.safestring import mark_safe
 from leaflet.admin import LeafletGeoAdmin
 
 from game.challenge_types import SCAN_TYPES, TYPE_NFC_QR
 from game.models import (
+    NFC_MODE_SECURE_TOKEN,
     Challenge,
     Collection,
     LocationConsent,
     LocationPing,
+    NfcTag,
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -106,7 +109,8 @@ class TowerPhotoInline(admin.TabularInline):
 class TowerAdmin(LeafletGeoAdmin):
     form = TowerAdminForm
     list_display = [
-        '__str__', 'is_active', 'get_zones', 'category', 'get_tower_control', 'get_rfid_url', 'id',
+        '__str__', 'is_active', 'get_zones', 'category', 'get_tower_control', 'get_rfid_url',
+        'get_capture_mode', 'get_nfc_payload', 'id',
         'initial_bonus', 'decrease_initial_bonus'
     ]
     # `zones` is the many-to-many membership (tower-zone-topology): the
@@ -170,6 +174,37 @@ class TowerAdmin(LeafletGeoAdmin):
         return "-"
 
     get_rfid_url.short_description = "RFID URL"
+
+    # nfc-native-and-secure-links (task 7.2): which capture mode the
+    # tower uses, plus the secure payload + QR next to the legacy URL.
+    def _active_tags(self, obj):
+        return obj.nfc_tags.filter(is_active=True)
+
+    def get_capture_mode(self, obj):
+        modes = sorted({tag.mode for tag in self._active_tags(obj)})
+        if modes:
+            return ' + '.join(modes)
+        return 'LEGACY_URL' if obj.category == Tower.CATEGORY_RFID else '-'
+
+    get_capture_mode.short_description = 'Capture mode'
+
+    def get_nfc_payload(self, obj):
+        tags = [
+            tag for tag in self._active_tags(obj)
+            if tag.mode == NFC_MODE_SECURE_TOKEN
+        ]
+        if not tags:
+            return '-'
+        return format_html_join(
+            mark_safe('<br>'),
+            '<code>{}</code> (<a href="{}" target="_blank">QR</a>)',
+            (
+                (tag.app_link(), f'/api/staff/nfc-tags/{tag.pk}/qr/')
+                for tag in tags
+            ),
+        )
+
+    get_nfc_payload.short_description = 'Secure NFC payload'
 
 
 class TeamAdmin(admin.ModelAdmin):
@@ -275,6 +310,42 @@ class TowerPhotoAdmin(admin.ModelAdmin):
     readonly_fields = ('captured_at',)
 
 
+class NfcTagAdmin(admin.ModelAdmin):
+    list_display = (
+        'token', 'mode', 'tower', 'challenge', 'label', 'is_active',
+        'last_counter', 'get_app_link', 'created_at',
+    )
+    list_filter = ('mode', 'is_active')
+    search_fields = ('token', 'label', 'hidden_hint', 'tower__name')
+    readonly_fields = ('token', 'last_counter', 'created_at')
+
+    def get_app_link(self, obj):
+        return format_html(
+            '<a href="{0}" target="_blank">{0}</a> '
+            '(<a href="/api/staff/nfc-tags/{1}/qr/" target="_blank">QR</a>)',
+            obj.app_link(), obj.pk,
+        )
+
+    get_app_link.short_description = 'App link'
+
+
+class TagScanAdmin(admin.ModelAdmin):
+    """Read-only scan audit — one leg of the documented threat model."""
+
+    list_display = (
+        'timestamp', 'tag', 'player', 'session', 'outcome',
+        'lat', 'lng', 'accuracy', 'counter',
+    )
+    list_filter = ('outcome', 'session')
+    readonly_fields = [field.name for field in TagScan._meta.fields]
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+
 class CollectionAdmin(admin.ModelAdmin):
     list_display = ('name', 'slug', 'tower_count', 'zone_count', 'created_by', 'created_at')
     search_fields = ('name', 'slug')
@@ -332,3 +403,5 @@ admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)
 admin.site.register(TeamTowerOwnership, TeamTowerOwnershipAdmin)
 admin.site.register(PauseWindow, PauseWindowAdmin)
 admin.site.register(TeamTowerFailCounter, TeamTowerFailCounterAdmin)
+admin.site.register(NfcTag, NfcTagAdmin)
+admin.site.register(TagScan, TagScanAdmin)

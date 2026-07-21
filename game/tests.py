@@ -49,7 +49,9 @@ from game.challenge_types import (
     TYPE_TEXT,
     get_handler,
 )
-from game.models import (
+from game.models import (  # nfc-native-and-secure-links
+    NFC_MODE_LEGACY_URL,
+    NFC_MODE_SECURE_TOKEN,
     ROLE_REQUIREMENT_ALL,
     ROLE_REQUIREMENT_ANY,
     ROLE_REQUIREMENT_NONE,
@@ -57,9 +59,11 @@ from game.models import (
     Collection,
     LocationConsent,
     LocationPing,
+    NfcTag,
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -6905,3 +6909,399 @@ class PlayerChallengePayloadTest(TestCase):
             self.assertNotIn('validation_code', row)
             self.assertIn('effective_review_mode', row)
             self.assertIn('required_payload', row)
+
+
+# ---------------------------------------------------------------------------
+# nfc-native-and-secure-links — NfcTag / TagScan / capture endpoint
+# ---------------------------------------------------------------------------
+
+
+class NfcCaptureTest(TestCase):
+    """Secure-token capture flow (tasks 8.1 / 8.2 / 8.5)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.nfc_secure_mode = True
+        self.game.save(update_fields=['nfc_secure_mode'])
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=10)
+        self.team = _make_team(self.game, self.group)
+        self.tag = NfcTag.objects.create(tower=self.tower, label='in the oak')
+
+    def test_valid_scan_confirms_and_assigns_like_rfid(self):
+        client, user = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5, 'accuracy': 5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], 'CONFIRMED')
+        ttc = TeamTowerChallenge.objects.get(tower=self.tower, team=self.team)
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(ttc.submitted_by, user)
+        self.assertIsNone(ttc.checked_by)  # system-attributed, like RFID
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            tower=self.tower, team=self.team, timestamp_end__isnull=True,
+        ).exists())
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 10)
+        scan = TagScan.objects.get(tag=self.tag)
+        self.assertEqual(scan.outcome, TagScan.OUTCOME_CONFIRMED)
+        self.assertEqual(scan.session, self.team.session)
+
+    def test_out_of_proximity_rejected_and_audited(self):
+        client, _ = _authed_client(self.team)
+        lat = 46.5 + 200 / 111_111.0  # ~200m north
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': lat, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+        self.assertFalse(TeamTowerOwnership.objects.filter(tower=self.tower).exists())
+        scan = TagScan.objects.get(tag=self.tag)
+        self.assertEqual(scan.outcome, TagScan.OUTCOME_REJECTED_PROXIMITY)
+
+    def test_landing_page_has_no_capture_side_effect(self):
+        resp = self.client.get(f'/nfc/{self.tag.token}/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'aplica')
+        self.assertFalse(TagScan.objects.exists())
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+        # An unknown token renders the identical page (no validity oracle).
+        self.assertEqual(self.client.get('/nfc/not-a-token/').status_code, 200)
+
+    def test_token_from_another_game_rejected(self):
+        other_game = _make_game(name='Other game')
+        other_game.nfc_secure_mode = True
+        other_game.save(update_fields=['nfc_secure_mode'])
+        _make_group(other_game, slug='other')
+        other_tower = _make_tower(other_game, name='Foreign', lng=23.5, lat=46.5)
+        foreign_tag = NfcTag.objects.create(tower=other_tower)
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': foreign_tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertFalse(TeamTowerOwnership.objects.filter(tower=other_tower).exists())
+        scan = TagScan.objects.get(tag=foreign_tag)
+        self.assertEqual(scan.outcome, TagScan.OUTCOME_REJECTED_SCOPE)
+
+    def test_unknown_token_404(self):
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': 'nope', 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_inactive_tag_rejected(self):
+        self.tag.is_active = False
+        self.tag.save()
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            TagScan.objects.get(tag=self.tag).outcome,
+            TagScan.OUTCOME_REJECTED_INACTIVE,
+        )
+
+    def test_secure_mode_off_rejects_secure_token(self):
+        self.game.nfc_secure_mode = False
+        self.game.save(update_fields=['nfc_secure_mode'])
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(
+            TagScan.objects.get(tag=self.tag).outcome,
+            TagScan.OUTCOME_REJECTED_DISABLED,
+        )
+
+    def test_require_app_rejects_missing_marker(self):
+        self.game.nfc_require_app = True
+        self.game.save(update_fields=['nfc_require_app'])
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(
+            TagScan.objects.get(tag=self.tag).outcome,
+            TagScan.OUTCOME_REJECTED_APP,
+        )
+        resp = client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+            HTTP_X_CERCETADOR_APP='1',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_legacy_rfid_url_capture_unchanged(self):
+        """Backward compat (8.5): the RFID code path still auto-confirms."""
+        rfid_tower = _make_tower(
+            self.game, name='RFID T', zone=self.zone, lng=23.6, lat=46.6,
+            category=Tower.CATEGORY_RFID, rfid_code='LEG123',
+        )
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {'rfid_code': 'LEG123', 'lat': 46.6, 'lng': 23.6},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get(tower=rfid_tower, team=self.team)
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+
+
+class NfcReplayHardeningTest(TestCase):
+    """Rolling-counter replay protection (task 8.3)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.nfc_secure_mode = True
+        self.game.save(update_fields=['nfc_secure_mode'])
+        self.group = _make_group(self.game)
+        self.tower = _make_tower(self.game, zone=_make_zone(self.game))
+        self.team = _make_team(self.game, self.group)
+        self.tag = NfcTag.objects.create(tower=self.tower)
+        self.client_api, _ = _authed_client(self.team)
+
+    def _scan(self, **extra):
+        return self.client_api.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5, **extra},
+            format='json',
+        )
+
+    def test_hardening_off_accepts_static_token_repeatedly(self):
+        self.assertEqual(self._scan().status_code, 201)
+        self.assertEqual(self._scan().status_code, 201)
+
+    def test_hardening_on_requires_and_enforces_monotonic_counter(self):
+        self.game.nfc_replay_hardening = True
+        self.game.save(update_fields=['nfc_replay_hardening'])
+        # Counter missing → rejected.
+        self.assertEqual(self._scan().status_code, 400)
+        # First counted scan accepted; the counter is recorded.
+        self.assertEqual(self._scan(counter=5).status_code, 201)
+        self.tag.refresh_from_db()
+        self.assertEqual(self.tag.last_counter, 5)
+        # Repeat and lower counters are replays.
+        self.assertEqual(self._scan(counter=5).status_code, 400)
+        self.assertEqual(self._scan(counter=4).status_code, 400)
+        replays = TagScan.objects.filter(
+            tag=self.tag, outcome=TagScan.OUTCOME_REJECTED_REPLAY,
+        )
+        self.assertEqual(replays.count(), 3)
+        # A higher counter proceeds.
+        self.assertEqual(self._scan(counter=6).status_code, 201)
+
+    def test_session_override_wins_over_game_default(self):
+        session = self.team.session
+        session.nfc_replay_hardening = True
+        session.save(update_fields=['nfc_replay_hardening'])
+        self.assertEqual(self._scan().status_code, 400)
+
+
+class NfcChallengeTargetTest(TestCase):
+    """Challenge-targeted tags route through the challenge-type flow."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.nfc_secure_mode = True
+        self.game.save(update_fields=['nfc_secure_mode'])
+        self.group = _make_group(self.game)
+        self.tower = _make_tower(self.game, zone=_make_zone(self.game))
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='Venue visit', tower=self.tower,
+            type=TYPE_NFC_QR, validation_code='VENUE1',
+            type_config={'single_use': True},
+        )
+        self.tag = NfcTag.objects.create(challenge=self.challenge)
+
+    def _scan(self, client):
+        return client.post(
+            '/api/nfc/capture/',
+            {'token': self.tag.token, 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+
+    def test_auto_confirms_and_consumes_single_use(self):
+        client, _ = _authed_client(self.team)
+        resp = self._scan(client)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], 'CONFIRMED')
+        ttc = TeamTowerChallenge.objects.get(challenge=self.challenge)
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        # Second team re-scanning the consumed single-use code: rejected.
+        team_b = Team.objects.create(
+            name='explo2', color='#663300',
+            session=self.team.session, group=self.group,
+        )
+        client_b, _ = _authed_client(team_b, username='scout2')
+        resp_b = self._scan(client_b)
+        self.assertEqual(resp_b.status_code, 201)
+        self.assertEqual(resp_b.json()['outcome'], TagScan.OUTCOME_REJECTED_CODE)
+
+    def test_manual_review_override_stays_pending(self):
+        self.challenge.review_mode = REVIEW_MANUAL
+        self.challenge.save(update_fields=['review_mode'])
+        client, _ = _authed_client(self.team)
+        resp = self._scan(client)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], 'PENDING')
+        ttc = TeamTowerChallenge.objects.get(challenge=self.challenge)
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+
+
+class NfcConfigResolutionTest(TestCase):
+    """Effective-value resolution for the three NFC knobs (task 8.4)."""
+
+    def test_defaults_preserve_legacy_behavior(self):
+        game = _make_game()
+        session = _default_session(game)
+        for knob in ('nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening'):
+            self.assertFalse(session.effective(knob))
+
+    def test_session_override_wins_else_game_default(self):
+        game = _make_game()
+        game.nfc_secure_mode = True
+        game.save(update_fields=['nfc_secure_mode'])
+        session = _default_session(game)
+        self.assertTrue(session.effective('nfc_secure_mode'))
+        session.nfc_secure_mode = False
+        session.save(update_fields=['nfc_secure_mode'])
+        self.assertFalse(session.effective('nfc_secure_mode'))
+        session.nfc_require_app = True
+        session.save(update_fields=['nfc_require_app'])
+        self.assertTrue(session.effective('nfc_require_app'))
+
+
+class NfcTagModelTest(TestCase):
+    """Targeting invariants + NDEF payloads (tasks 1.3 / 5.2)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.tower = _make_tower(self.game)
+        self.rfid_tower = _make_tower(
+            self.game, name='RFID', lng=23.6, lat=46.6,
+            category=Tower.CATEGORY_RFID, rfid_code='RF1',
+        )
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='C', tower=self.tower, type=TYPE_NFC_QR,
+            validation_code='X',
+        )
+
+    def test_secure_tag_needs_exactly_one_target(self):
+        from django.core.exceptions import ValidationError
+        with self.assertRaises(ValidationError):
+            NfcTag.objects.create()
+        with self.assertRaises(ValidationError):
+            NfcTag.objects.create(tower=self.tower, challenge=self.challenge)
+        # Challenge without a tower cannot be targeted.
+        generic = Challenge.objects.create(game=self.game, text='G')
+        with self.assertRaises(ValidationError):
+            NfcTag.objects.create(challenge=generic)
+
+    def test_legacy_tag_mirrors_rfid_tower(self):
+        from django.core.exceptions import ValidationError
+        with self.assertRaises(ValidationError):
+            NfcTag.objects.create(mode=NFC_MODE_LEGACY_URL, tower=self.tower)
+        tag = NfcTag.objects.create(mode=NFC_MODE_LEGACY_URL, tower=self.rfid_tower)
+        payload = tag.ndef_payload()
+        self.assertEqual(len(payload['records']), 1)
+        self.assertTrue(payload['records'][0]['uri'].endswith('/tower/rfid/RF1'))
+
+    def test_secure_ndef_payload_has_app_records(self):
+        tag = NfcTag.objects.create(tower=self.tower)
+        payload = tag.ndef_payload()
+        types = [r['type'] for r in payload['records']]
+        self.assertIn('uri', types)
+        self.assertIn('android_application_record', types)
+        self.assertIn(f'/nfc/{tag.token}/', payload['records'][0]['uri'])
+        self.assertEqual(payload['token'], tag.token)
+
+
+class AdminNfcTagEndpointTest(TestCase):
+    """Staff provisioning API (tasks 5.1–5.3)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.tower = _make_tower(self.game)
+        self.staff, self.user = _staff_client(session=self.session)
+
+    def test_mint_list_deactivate(self):
+        resp = self.staff.post(
+            '/api/staff/nfc-tags/',
+            {'tower': self.tower.id, 'label': 'oak', 'hidden_hint': 'inside the oak'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['mode'], NFC_MODE_SECURE_TOKEN)
+        self.assertTrue(body['token'])
+        self.assertIn(f"/nfc/{body['token']}/", body['app_link'])
+        tag_id = body['id']
+
+        listing = self.staff.get('/api/staff/nfc-tags/').json()
+        self.assertEqual(len(listing), 1)
+
+        resp = self.staff.patch(
+            f'/api/staff/nfc-tags/{tag_id}/', {'is_active': False}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(NfcTag.objects.get(pk=tag_id).is_active)
+
+    def test_validation_errors(self):
+        resp = self.staff.post('/api/staff/nfc-tags/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+        resp = self.staff.post(
+            '/api/staff/nfc-tags/',
+            {'mode': NFC_MODE_LEGACY_URL, 'tower': self.tower.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_ndef_and_qr_actions(self):
+        tag = NfcTag.objects.create(tower=self.tower)
+        ndef = self.staff.get(f'/api/staff/nfc-tags/{tag.id}/ndef/')
+        self.assertEqual(ndef.status_code, 200)
+        self.assertEqual(ndef.json()['token'], tag.token)
+        qr = self.staff.get(f'/api/staff/nfc-tags/{tag.id}/qr/')
+        self.assertEqual(qr.status_code, 200)
+        self.assertEqual(qr['Content-Type'], 'image/png')
+        self.assertEqual(qr.content[:8], b'\x89PNG\r\n\x1a\n')
+
+    def test_scan_audit_list(self):
+        tag = NfcTag.objects.create(tower=self.tower)
+        TagScan.objects.create(tag=tag, outcome=TagScan.OUTCOME_REJECTED_PROXIMITY)
+        TagScan.objects.create(tag=tag, outcome=TagScan.OUTCOME_CONFIRMED)
+        rows = self.staff.get('/api/staff/nfc-tags/scan-audit/').json()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]['outcome'], TagScan.OUTCOME_CONFIRMED)
+        rows = self.staff.get(f'/api/staff/nfc-tags/scan-audit/?tag={tag.id}').json()
+        self.assertEqual(len(rows), 2)
+
+    def test_player_cannot_access_staff_tags(self):
+        group = _make_group(self.game)
+        team = _make_team(self.game, group)
+        client, _ = _authed_client(team)
+        self.assertEqual(client.get('/api/staff/nfc-tags/').status_code, 403)

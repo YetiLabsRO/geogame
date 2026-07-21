@@ -6,6 +6,7 @@ django-leaflet>=0.33
 django-colorfield>=0.14
 django-smart-selects @ git+https://github.com/jazzband/django-smart-selects.git@1f3ac7c08a31d2e8cc792f1de484a027a25eef1f
 pillow>=12
+qrcode>=8
 psycopg[binary]>=3.2
 gunicorn>=23
 channels>=4.3

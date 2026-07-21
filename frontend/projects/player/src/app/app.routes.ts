@@ -21,6 +21,19 @@ export const routes: Routes = [
     loadComponent: () => import('./map/map.component').then((m) => m.MapComponent),
   },
   {
+    // nfc-native-and-secure-links: manual scan entry ("Scan tag").
+    path: 'scan',
+    canActivate: [authGuard],
+    loadComponent: () => import('./nfc/nfc-scan.component').then((m) => m.NfcScanComponent),
+  },
+  {
+    // App-link / QR deep link target: /nfc/<token> lands in the scan
+    // flow with the token bound from the route (withComponentInputBinding).
+    path: 'nfc/:token',
+    canActivate: [authGuard],
+    loadComponent: () => import('./nfc/nfc-scan.component').then((m) => m.NfcScanComponent),
+  },
+  {
     path: 'rules',
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },

@@ -139,6 +139,14 @@ export interface TowerFeature {
   ownership: TowerOwnership | Record<string, never>;
 }
 
+export interface NfcCaptureResponse {
+  outcome: string;
+  detail?: string;
+  submission_id?: number;
+  tower?: { id: number; name: string };
+  challenge?: number | null;
+}
+
 @Injectable({ providedIn: 'root' })
 export class GameApiService {
   private readonly http = inject(HttpClient);
@@ -218,6 +226,22 @@ export class GameApiService {
 
   liveLocations(): Observable<LiveLocations> {
     return this.http.get<LiveLocations>('/api/location/live/');
+  }
+
+  /** nfc-native-and-secure-links: the single capture call every scan
+   *  transport (Web NFC, native bridge, QR camera, manual entry)
+   *  resolves to. The X-Cercetador-App header marks the app origin for
+   *  sessions with nfc_require_app enabled. */
+  nfcCapture(payload: {
+    token: string;
+    lat: number;
+    lng: number;
+    accuracy?: number;
+    counter?: number;
+  }): Observable<NfcCaptureResponse> {
+    return this.http.post<NfcCaptureResponse>('/api/nfc/capture/', payload, {
+      headers: { 'X-Cercetador-App': '1' },
+    });
   }
 }
 
