@@ -12,9 +12,11 @@ from game.models import (
     Challenge,
     TeamTowerChallenge,
     Tower,
+    effective_challenge_visibility,
     effective_proximity,
 )
 from game.scoping import SessionScopedViewSetMixin
+from organize.models import CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
 
 
 class ChallengeSummarySerializer(serializers.ModelSerializer):
@@ -75,6 +77,16 @@ class TowerStateView(APIView):
             )
         team = membership.team
 
+        # tower-visibility: an undiscovered HIDDEN/FOG_REVEAL tower must
+        # not leak through the detail endpoint either — same 404 as a
+        # nonexistent tower so probing reveals nothing.
+        from game.discovery import visible_towers
+        if not visible_towers(team.session, team).filter(pk=tower.pk).exists():
+            return Response(
+                {'detail': 'No Tower matches the given query.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+
         last_rejected = (
             TeamTowerChallenge.objects
             .filter(team=team, tower=tower, outcome=TeamTowerChallenge.REJECTED)
@@ -95,9 +107,38 @@ class TowerStateView(APIView):
             team=team, tower=tower, outcome=TeamTowerChallenge.PENDING,
         ).exists()
 
+        proximity = effective_proximity(tower, team.session.game)
+
+        # tower-visibility (challenge axis): under HIDDEN_UNTIL_ARRIVAL
+        # the challenge text is withheld until the caller's reported
+        # position (optional ?lat=&lng= query params) is inside the
+        # activation area; no position reported means concealed. The
+        # VISIBLE_ANYWHERE default always exposes the text — completion
+        # is gated by the submission proximity check either way.
+        challenge_visibility = effective_challenge_visibility(
+            tower, session=team.session,
+        )
+        challenge_hidden = False
+        if challenge_visibility == CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL:
+            challenge_hidden = True
+            lat = request.query_params.get('lat')
+            lng = request.query_params.get('lng')
+            if lat and lng:
+                from django.contrib.gis.geos import Point
+                from django.contrib.gis.measure import Distance
+                try:
+                    point = Point(float(lng), float(lat), srid=4326)
+                except (TypeError, ValueError):
+                    point = None
+                if point is not None and Tower.objects.filter(
+                    pk=tower.pk,
+                    location__distance_lte=(point, Distance(m=proximity)),
+                ).exists():
+                    challenge_hidden = False
+
         next_challenge = tower.get_next_challenge(team) if not pending else None
         next_challenge_payload = None
-        if next_challenge is not None:
+        if next_challenge is not None and not challenge_hidden:
             next_challenge_payload = ChallengeSummarySerializer(next_challenge).data
             next_challenge_payload['role_requirement'] = _role_requirement_payload(
                 next_challenge, team,
@@ -113,6 +154,15 @@ class TowerStateView(APIView):
         )
 
         ownership = tower.tower_control(team.group) if team.group else None
+        # tower-visibility: conceal another team's control when the
+        # effective `reveal_other_teams_ownership` is off. Own control
+        # is always shown.
+        if (
+            ownership is not None
+            and ownership.pk != team.pk
+            and not team.session.effective('reveal_other_teams_ownership')
+        ):
+            ownership = None
         ownership_payload = None
         if ownership is not None:
             ownership_payload = {
@@ -139,7 +189,11 @@ class TowerStateView(APIView):
             ),
             # Effective capture radius: the tower's own override when
             # set, else the Game default (zone-conquest-and-scoring-config).
-            'proximity_meters': effective_proximity(tower, team.session.game),
+            'proximity_meters': proximity,
+            # tower-visibility (challenge axis): clients render a "get
+            # closer to reveal" affordance while `challenge_hidden`.
+            'challenge_visibility': challenge_visibility,
+            'challenge_hidden': challenge_hidden,
         })
 
 

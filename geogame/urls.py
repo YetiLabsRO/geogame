@@ -38,6 +38,11 @@ from game.api import (
     StaffSubmissionReview,
     TowerStateView,
 )
+from game.discovery_api import (
+    DiscoveredTowersView,
+    DiscoveryPingView,
+    StaffRevealView,
+)
 from game.location_api import (
     LocationConsentView,
     LocationLiveView,
@@ -94,6 +99,22 @@ urlpatterns = [
     path('health/', health, name="health"),
     path('api/', include(router.urls)),
     path('api/towers/<int:pk>/state/', TowerStateView.as_view(), name='api-tower-state'),
+    # Discovery (discovery-tracking capability).
+    path(
+        'api/discovery/ping/',
+        DiscoveryPingView.as_view(),
+        name='api-discovery-ping',
+    ),
+    path(
+        'api/discovery/towers/',
+        DiscoveredTowersView.as_view(),
+        name='api-discovery-towers',
+    ),
+    path(
+        'api/staff/discovery/reveal/',
+        StaffRevealView.as_view(),
+        name='api-staff-discovery-reveal',
+    ),
     # Live-location (live-location capability).
     path('api/location/ping/', LocationPingView.as_view(), name='api-location-ping'),
     path('api/location/live/', LocationLiveView.as_view(), name='api-location-live'),

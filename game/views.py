@@ -10,6 +10,8 @@ from django.http import JsonResponse
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
 
+from game.discovery import evaluate_discovery, visible_towers, visible_zone_ids
+from game.location_api import _active_team
 from game.models import Challenge, TeamTowerChallenge, Tower, Zone
 from game.scoping import (
     GameGeometryScopedViewSetMixin,
@@ -32,7 +34,35 @@ from organize.models import (
 )
 
 
-class ZoneViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
+class TeamVisibilityMixin:
+    """Caller-team resolution + ownership-reveal context (tower-visibility).
+
+    Staff and team-less callers are omniscient: the visibility filter is
+    bypassed and ownership colouring stays complete. Player callers are
+    filtered to their team's visible geometry, and the serializers are
+    handed the context needed to conceal other teams' control when the
+    effective `reveal_other_teams_ownership` is False.
+    """
+
+    def _visibility_context(self):
+        session = _current_session(self.request)
+        team = None
+        if session is not None and not self.request.user.is_staff:
+            team = _active_team(self.request.user, session)
+        reveal_others = True
+        if session is not None and team is not None:
+            reveal_others = bool(session.effective('reveal_other_teams_ownership'))
+        return session, team, reveal_others
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        session, team, reveal_others = self._visibility_context()
+        context['team'] = team
+        context['reveal_others'] = reveal_others
+        return context
+
+
+class ZoneViewSet(TeamVisibilityMixin, GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Zone.objects.all()
     serializer_class = ZoneSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -42,9 +72,15 @@ class ZoneViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
         qs = super().get_queryset()
         # Member towers are the many-to-many `towers` reverse
         # (tower-zone-topology) — not the removed single FK.
-        return qs.annotate(
+        qs = qs.annotate(
             num_towers=Count('towers', filter=Q(towers__is_active=True)),
         ).filter(num_towers__gte=1)
+        # tower-visibility: hide a zone whose only towers are
+        # undiscovered FOG_REVEAL towers. Staff/team-less callers bypass.
+        session, team, _reveal = self._visibility_context()
+        if session is not None and team is not None:
+            qs = qs.filter(pk__in=visible_zone_ids(session, team))
+        return qs
 
     def get_serializer_context(self):
         context = super(ZoneViewSet, self).get_serializer_context()
@@ -57,7 +93,7 @@ class ZoneViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
         return context
 
 
-class TowerViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
+class TowerViewSet(TeamVisibilityMixin, GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
     queryset = Tower.objects.exclude(is_active=False).exclude(category=Tower.CATEGORY_RFID)
     serializer_class = TowerSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -65,6 +101,24 @@ class TowerViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        session, team, _reveal = self._visibility_context()
+        if session is not None and team is not None:
+            lat = self.request.query_params.get('lat')
+            lng = self.request.query_params.get('lng')
+            if lat and lng:
+                # A reported position drives discovery evaluation too, so
+                # walking near a HIDDEN tower pops it up on the next fetch
+                # (discovery-tracking capability).
+                evaluate_discovery(
+                    session, team,
+                    Point(float(lng), float(lat), srid=4326),
+                    user=self.request.user,
+                )
+            # Team-visibility filter at the queryset level: undiscovered
+            # HIDDEN/FOG_REVEAL geometry never reaches the client.
+            queryset = queryset.filter(
+                pk__in=visible_towers(session, team).values('pk'),
+            )
         if self.request.query_params.get("lat") and self.request.query_params.get("lng"):
             lat = float(self.request.query_params.get("lat"))
             lng = float(self.request.query_params.get("lng"))

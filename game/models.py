@@ -11,10 +11,14 @@ from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, pre_delete
 
 from organize.models import (
+    CHALLENGE_VIS_VISIBLE_ANYWHERE,
+    CHALLENGE_VISIBILITY_CHOICES,
     CONQUEST_RULE_ALL,
     CONQUEST_RULE_ANY,
     CONQUEST_RULE_CHOICES,
     CONQUEST_RULE_MAJORITY,
+    DISCOVERABILITY_CHOICES,
+    DISCOVERABILITY_VISIBLE,
     FAIL_RESET_ANY_ATTEMPT_ELSEWHERE,
     FAIL_RESET_ANY_SUCCESS_ELSEWHERE,
     TIME_UNIT_MINUTE,
@@ -59,6 +63,46 @@ def effective_proximity(tower, game):
 def effective_time_unit(session):
     """Scoring time unit: Session override when set, else the Game default."""
     return session.effective('score_time_unit')
+
+
+# ---------------------------------------------------------------------------
+# Effective-value helpers (tower-visibility). Resolution order for each
+# axis: per-tower/per-zone override → Session override → Game default.
+# ---------------------------------------------------------------------------
+
+
+def _effective_visibility(override, session, game, field, fallback):
+    if override is not None and override != '':
+        return override
+    if session is not None:
+        return session.effective(field)
+    if game is not None:
+        return getattr(game, field)
+    return fallback
+
+
+def effective_discoverability(tower, session=None, game=None):
+    """Tower discoverability axis: Tower override > Session > Game default."""
+    return _effective_visibility(
+        tower.discoverability, session, game,
+        'tower_discoverability_default', DISCOVERABILITY_VISIBLE,
+    )
+
+
+def effective_challenge_visibility(tower, session=None, game=None):
+    """Challenge visibility axis: Tower override > Session > Game default."""
+    return _effective_visibility(
+        tower.challenge_visibility, session, game,
+        'challenge_visibility_default', CHALLENGE_VIS_VISIBLE_ANYWHERE,
+    )
+
+
+def effective_fog_reveal_pct(zone, session=None, game=None):
+    """Fog-reveal coverage threshold: Zone override > Session > Game default."""
+    return _effective_visibility(
+        zone.fog_reveal_coverage_pct, session, game,
+        'fog_reveal_coverage_pct_default', 60.0,
+    )
 
 
 # Challenge role-requirement modes (team-roles-as-mechanics).
@@ -117,8 +161,17 @@ class Zone(models.Model):
         max_length=16, choices=CONQUEST_RULE_CHOICES, null=True, blank=True,
     )
 
+    # Per-zone fog-of-war reveal threshold override, percent of zone
+    # area a team must cover to reveal the zone's FOG_REVEAL towers
+    # (tower-visibility). NULL inherits the Session override / Game default.
+    fog_reveal_coverage_pct = models.FloatField(null=True, blank=True)
+
     def __str__(self):
         return self.name
+
+    def effective_fog_reveal_pct(self, session=None, game=None):
+        """Effective fog threshold: Zone override > Session > Game default."""
+        return effective_fog_reveal_pct(self, session=session, game=game)
 
     def clean(self):
         """At-least-one-tower invariant (tower-zone-topology).
@@ -206,6 +259,16 @@ class Tower(models.Model):
     # NULL falls back to the game-wide Game.proximity_meters default.
     proximity_meters = models.PositiveIntegerField(null=True, blank=True)
 
+    # --- tower-visibility: the two independent visibility axes. NULL
+    # inherits the Session override / Game default (VISIBLE and
+    # VISIBLE_ANYWHERE by default, preserving shipped behavior). ---
+    discoverability = models.CharField(
+        max_length=16, choices=DISCOVERABILITY_CHOICES, null=True, blank=True,
+    )
+    challenge_visibility = models.CharField(
+        max_length=32, choices=CHALLENGE_VISIBILITY_CHOICES, null=True, blank=True,
+    )
+
     initial_bonus = models.PositiveIntegerField(default=0, help_text="Număr inițial de puncte obținute la câștigarea turnului")
     decrease_initial_bonus = models.BooleanField(default=False, help_text="Dacă la fiecare recucerire ulterioară de către aceeași echipă să se înjumătățească numărul inițial de puncte obținute (minimul va fi 1)")
 
@@ -220,6 +283,14 @@ class Tower(models.Model):
 
     def __str__(self):
         return self.name
+
+    def effective_discoverability(self, session=None, game=None):
+        """Effective discoverability axis: Tower override > Session > Game."""
+        return effective_discoverability(self, session=session, game=game)
+
+    def effective_challenge_visibility(self, session=None, game=None):
+        """Effective challenge-visibility axis: Tower override > Session > Game."""
+        return effective_challenge_visibility(self, session=session, game=game)
 
     def unassign(self):
         handover_time = datetime.now(timezone.utc)
@@ -1170,6 +1241,87 @@ class LocationConsent(models.Model):
         self.withdrawn_at = _now()
         self.save(update_fields=['withdrawn_at'])
         LocationPing.objects.filter(user=self.user, session=self.session).delete()
+
+
+class TowerDiscovery(models.Model):
+    """One team's discovery of one tower in one Session (discovery-tracking).
+
+    Append-only: created the first time the team reveals the tower and
+    NEVER deleted by conquest, loss of ownership, or ownerlessness — "a
+    team sees a tower" ⇔ the tower's effective discoverability is
+    VISIBLE **or** a TowerDiscovery row exists, fully decoupled from
+    ownership. Unique per (session, team, tower) so re-revealing never
+    duplicates.
+    """
+
+    METHOD_PROXIMITY = 'PROXIMITY'
+    METHOD_ZONE_ENTRY = 'ZONE_ENTRY'
+    METHOD_ZONE_COVERAGE = 'ZONE_COVERAGE'
+    METHOD_ALWAYS_VISIBLE = 'ALWAYS_VISIBLE'
+    METHOD_STAFF = 'STAFF'
+    METHOD_CHOICES = [
+        (METHOD_PROXIMITY, 'Walked within the tower proximity'),
+        (METHOD_ZONE_ENTRY, 'Entered the tower zone'),
+        (METHOD_ZONE_COVERAGE, 'Covered enough of the tower zone'),
+        (METHOD_ALWAYS_VISIBLE, 'Always visible'),
+        (METHOD_STAFF, 'Revealed by staff'),
+    ]
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='tower_discoveries',
+    )
+    team = models.ForeignKey(
+        'organize.Team', on_delete=models.CASCADE, related_name='tower_discoveries',
+    )
+    tower = models.ForeignKey(
+        Tower, on_delete=models.CASCADE, related_name='discoveries',
+    )
+    discovered_at = models.DateTimeField(auto_now_add=True)
+    discovered_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='tower_discoveries',
+    )
+    method = models.CharField(max_length=16, choices=METHOD_CHOICES)
+
+    class Meta:
+        unique_together = (('session', 'team', 'tower'),)
+        ordering = ['-discovered_at']
+
+    def __str__(self):
+        return f'{self.team} discovered {self.tower} ({self.method})'
+
+
+class TeamZoneCoverage(models.Model):
+    """Accumulated visited geometry of one team over one zone (fog-of-war).
+
+    The incremental store behind the ZONE_COVERAGE reveal: each reported
+    position is buffered and unioned into `visited`; `coverage_pct` is
+    area(visited ∩ zone) / area(zone). `revealed` short-circuits further
+    accumulation once the zone's effective threshold has been crossed.
+    """
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='zone_coverages',
+    )
+    team = models.ForeignKey(
+        'organize.Team', on_delete=models.CASCADE, related_name='zone_coverages',
+    )
+    zone = models.ForeignKey(
+        Zone, on_delete=models.CASCADE, related_name='team_coverages',
+    )
+    visited = models.GeometryField(null=True, blank=True)
+    coverage_pct = models.FloatField(default=0)
+    revealed = models.BooleanField(default=False)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = (('session', 'team', 'zone'),)
+
+    def __str__(self):
+        return f'{self.team} covered {self.coverage_pct:.1f}% of {self.zone}'
 
 
 class TeamTowerFailCounter(models.Model):

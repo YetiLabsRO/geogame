@@ -49,8 +49,10 @@ from game.models import (
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
+    TeamZoneCoverage,
     TeamZoneOwnership,
     Tower,
+    TowerDiscovery,
     Zone,
 )
 from organize.models import (
@@ -5435,3 +5437,646 @@ class TopologyApiTest(TestCase):
         self.assertEqual(
             [z['id'] for z in resp.json()], [self.z2.pk],
         )
+
+
+# ---------------------------------------------------------------------------
+# tower-visibility-and-discovery — two-axis visibility, TowerDiscovery,
+# fog-of-war coverage, payload filtering, ownership reveal knob.
+# ---------------------------------------------------------------------------
+
+from game.discovery import (  # noqa: E402
+    COVERAGE_BUFFER_METERS,
+    evaluate_discovery,
+    staff_reveal,
+    visible_zone_ids,
+)
+from organize.models import (  # noqa: E402
+    CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL,
+    CHALLENGE_VIS_VISIBLE_ANYWHERE,
+    DISCOVERABILITY_FOG_REVEAL,
+    DISCOVERABILITY_HIDDEN,
+    DISCOVERABILITY_VISIBLE,
+)
+
+# A ~50m × ~50m box at (23.5, 46.5) for fog-of-war geometry, with an
+# inside point, a near-outside point (~10m south of the south edge —
+# within the coverage buffer) and a far-outside point.
+_FOG_BBOX = (23.5, 46.5, 23.50065, 46.50045)
+_FOG_INSIDE = {'lng': 23.50032, 'lat': 46.50022}
+_FOG_NEAR_OUTSIDE = {'lng': 23.50032, 'lat': 46.49991}
+_FOG_FAR = {'lng': 23.6, 'lat': 46.6}
+
+
+def _small_fog_zone(game, name='Fog zone'):
+    return _make_zone(
+        game, name=name, shape=Polygon.from_bbox(_FOG_BBOX),
+    )
+
+
+class EffectiveVisibilityResolutionTest(TestCase):
+    """Task 7.8: tower/zone override → Session override → Game default."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+
+    def test_defaults_resolve_to_visible_anywhere(self):
+        self.assertEqual(
+            self.tower.effective_discoverability(session=self.session),
+            DISCOVERABILITY_VISIBLE,
+        )
+        self.assertEqual(
+            self.tower.effective_challenge_visibility(session=self.session),
+            CHALLENGE_VIS_VISIBLE_ANYWHERE,
+        )
+        self.assertEqual(
+            self.zone.effective_fog_reveal_pct(session=self.session), 60,
+        )
+        self.assertTrue(self.session.effective('reveal_other_teams_ownership'))
+
+    def test_game_default_applies_when_tower_is_null(self):
+        self.game.tower_discoverability_default = DISCOVERABILITY_HIDDEN
+        self.game.challenge_visibility_default = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.game.fog_reveal_coverage_pct_default = 42
+        self.game.save()
+        self.assertEqual(
+            self.tower.effective_discoverability(session=self.session),
+            DISCOVERABILITY_HIDDEN,
+        )
+        self.assertEqual(
+            self.tower.effective_challenge_visibility(session=self.session),
+            CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL,
+        )
+        self.assertEqual(
+            self.zone.effective_fog_reveal_pct(session=self.session), 42,
+        )
+
+    def test_session_override_beats_game_default(self):
+        self.game.tower_discoverability_default = DISCOVERABILITY_HIDDEN
+        self.game.save()
+        self.session.tower_discoverability_default = DISCOVERABILITY_FOG_REVEAL
+        self.session.fog_reveal_coverage_pct_default = 30
+        self.session.reveal_other_teams_ownership = False
+        self.session.save()
+        self.assertEqual(
+            self.tower.effective_discoverability(session=self.session),
+            DISCOVERABILITY_FOG_REVEAL,
+        )
+        self.assertEqual(
+            self.zone.effective_fog_reveal_pct(session=self.session), 30,
+        )
+        self.assertFalse(self.session.effective('reveal_other_teams_ownership'))
+
+    def test_tower_and_zone_overrides_win(self):
+        self.session.tower_discoverability_default = DISCOVERABILITY_FOG_REVEAL
+        self.session.save()
+        self.tower.discoverability = DISCOVERABILITY_HIDDEN
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        self.zone.fog_reveal_coverage_pct = 10
+        self.zone.save()
+        self.assertEqual(
+            self.tower.effective_discoverability(session=self.session),
+            DISCOVERABILITY_HIDDEN,
+        )
+        self.assertEqual(
+            self.tower.effective_challenge_visibility(session=self.session),
+            CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL,
+        )
+        self.assertEqual(
+            self.zone.effective_fog_reveal_pct(session=self.session), 10,
+        )
+
+    def test_game_only_resolution_without_session(self):
+        self.game.tower_discoverability_default = DISCOVERABILITY_HIDDEN
+        self.game.save()
+        self.assertEqual(
+            self.tower.effective_discoverability(game=self.game),
+            DISCOVERABILITY_HIDDEN,
+        )
+        self.assertEqual(
+            self.zone.effective_fog_reveal_pct(game=self.game), 60,
+        )
+
+
+class VisibilityBackwardCompatTest(TestCase):
+    """Task 7.1: an all-default game renders exactly as before the change."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.other = _make_tower(self.game, name='T2', zone=self.zone, lng=23.6)
+        self.team = _make_team(self.game, self.group)
+        self.client, self.user = _authed_client(self.team, username='compat')
+
+    def test_every_active_tower_listed_without_any_discovery(self):
+        resp = self.client.get('/api/towers/')
+        self.assertEqual(resp.status_code, 200)
+        ids = {t['id'] for t in resp.json()}
+        self.assertEqual(ids, {self.tower.id, self.other.id})
+        self.assertEqual(TowerDiscovery.objects.count(), 0)
+
+    def test_zone_listed_and_ownership_colored(self):
+        self.tower.assign_to_team(self.team)
+        resp = self.client.get('/api/zones/', {'group': self.group.id})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 1)
+        self.assertEqual(resp.json()[0]['team_color'], self.team.color)
+
+    def test_tower_ownership_visible_by_default(self):
+        self.tower.assign_to_team(self.team)
+        resp = self.client.get('/api/towers/')
+        payload = next(t for t in resp.json() if t['id'] == self.tower.id)
+        self.assertEqual(payload['ownership'].get('id'), self.team.id)
+
+
+class HiddenTowerDiscoveryTest(TestCase):
+    """Task 7.2: HIDDEN towers are absent until a proximity reveal."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.visible_tower = _make_tower(self.game, name='Seen', zone=self.zone)
+        self.hidden_tower = _make_tower(
+            self.game, name='Sneaky', zone=self.zone, lng=23.51, lat=46.51,
+        )
+        self.hidden_tower.discoverability = DISCOVERABILITY_HIDDEN
+        self.hidden_tower.save()
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.client, self.user = _authed_client(self.team, username='seeker')
+
+    def test_undiscovered_hidden_tower_absent_from_towers_endpoint(self):
+        resp = self.client.get('/api/towers/')
+        ids = {t['id'] for t in resp.json()}
+        self.assertIn(self.visible_tower.id, ids)
+        self.assertNotIn(self.hidden_tower.id, ids)
+
+    def test_undiscovered_hidden_tower_state_is_404(self):
+        resp = self.client.get(f'/api/towers/{self.hidden_tower.id}/state/')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_far_ping_reveals_nothing(self):
+        resp = self.client.post(
+            '/api/discovery/ping/',
+            {'lat': 46.6, 'lng': 23.6},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['newly_revealed'], [])
+        self.assertEqual(TowerDiscovery.objects.count(), 0)
+
+    def test_proximity_ping_creates_discovery_and_tower_appears(self):
+        resp = self.client.post(
+            '/api/discovery/ping/',
+            {'lat': 46.51, 'lng': 23.51},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        revealed = resp.json()['newly_revealed']
+        self.assertEqual(
+            [r['tower_id'] for r in revealed], [self.hidden_tower.id],
+        )
+        discovery = TowerDiscovery.objects.get()
+        self.assertEqual(discovery.method, TowerDiscovery.METHOD_PROXIMITY)
+        self.assertEqual(discovery.team, self.team)
+        self.assertEqual(discovery.discovered_by, self.user)
+
+        ids = {t['id'] for t in self.client.get('/api/towers/').json()}
+        self.assertIn(self.hidden_tower.id, ids)
+        state = self.client.get(f'/api/towers/{self.hidden_tower.id}/state/')
+        self.assertEqual(state.status_code, 200)
+
+    def test_re_reveal_does_not_duplicate(self):
+        for _ in range(2):
+            self.client.post(
+                '/api/discovery/ping/',
+                {'lat': 46.51, 'lng': 23.51},
+                format='json',
+            )
+        self.assertEqual(TowerDiscovery.objects.count(), 1)
+
+    def test_towers_endpoint_position_params_drive_discovery(self):
+        # Fetching the map with a reported position near the hidden
+        # tower reveals it in the same request (task 3.3 / spec 4.1).
+        resp = self.client.get(
+            '/api/towers/', {'lat': 46.51, 'lng': 23.51, 'accuracy': 10000},
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(
+            TowerDiscovery.objects.filter(
+                team=self.team, tower=self.hidden_tower,
+            ).exists(),
+        )
+
+    def test_discovered_towers_endpoint_lists_team_discoveries(self):
+        self.client.post(
+            '/api/discovery/ping/', {'lat': 46.51, 'lng': 23.51}, format='json',
+        )
+        resp = self.client.get('/api/discovery/towers/')
+        self.assertEqual(resp.status_code, 200)
+        towers = resp.json()['towers']
+        self.assertEqual([t['tower_id'] for t in towers], [self.hidden_tower.id])
+        self.assertEqual(towers[0]['method'], TowerDiscovery.METHOD_PROXIMITY)
+
+    def test_ping_requires_coordinates(self):
+        resp = self.client.post('/api/discovery/ping/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_staff_bypasses_visibility_filter(self):
+        staff_client, _ = _staff_client(self.session, username='omniscient')
+        ids = {t['id'] for t in staff_client.get('/api/towers/').json()}
+        self.assertIn(self.hidden_tower.id, ids)
+
+    def test_game_wide_hidden_default_applies_to_null_towers(self):
+        self.game.tower_discoverability_default = DISCOVERABILITY_HIDDEN
+        self.game.save()
+        resp = self.client.get('/api/towers/')
+        self.assertEqual(resp.json(), [])
+
+
+class FogRevealTest(TestCase):
+    """Tasks 7.3 / 7.4: zone entry and zone coverage reveals."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.fog_zone = _small_fog_zone(self.game)
+        self.fog_tower = _make_tower(
+            self.game, name='Foggy', zone=self.fog_zone,
+            lng=_FOG_INSIDE['lng'], lat=_FOG_INSIDE['lat'],
+        )
+        self.fog_tower.discoverability = DISCOVERABILITY_FOG_REVEAL
+        self.fog_tower.save()
+        # A second, plainly visible zone+tower keeps the map non-empty.
+        self.plain_zone = _make_zone(self.game, name='Plain')
+        self.plain_tower = _make_tower(self.game, name='Plain T', zone=self.plain_zone)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.client, self.user = _authed_client(self.team, username='roamer')
+
+    def test_fog_zone_and_tower_hidden_before_reveal(self):
+        tower_ids = {t['id'] for t in self.client.get('/api/towers/').json()}
+        self.assertNotIn(self.fog_tower.id, tower_ids)
+        zone_names = [z['name'] for z in self.client.get('/api/zones/').json()]
+        self.assertNotIn(self.fog_zone.name, zone_names)
+        self.assertIn(self.plain_zone.name, zone_names)
+
+    def test_zone_entry_reveals_fog_towers(self):
+        resp = self.client.post(
+            '/api/discovery/ping/', _FOG_INSIDE, format='json',
+        )
+        revealed = resp.json()['newly_revealed']
+        self.assertEqual([r['tower_id'] for r in revealed], [self.fog_tower.id])
+        discovery = TowerDiscovery.objects.get()
+        self.assertEqual(discovery.method, TowerDiscovery.METHOD_ZONE_ENTRY)
+
+        tower_ids = {t['id'] for t in self.client.get('/api/towers/').json()}
+        self.assertIn(self.fog_tower.id, tower_ids)
+        zone_names = [z['name'] for z in self.client.get('/api/zones/').json()]
+        self.assertIn(self.fog_zone.name, zone_names)
+
+    def test_coverage_below_threshold_stays_hidden(self):
+        # Default threshold (60%): one near-outside ping accumulates
+        # coverage but must not reveal.
+        resp = self.client.post(
+            '/api/discovery/ping/', _FOG_NEAR_OUTSIDE, format='json',
+        )
+        self.assertEqual(resp.json()['newly_revealed'], [])
+        coverage = TeamZoneCoverage.objects.get(
+            session=self.session, team=self.team, zone=self.fog_zone,
+        )
+        self.assertGreater(coverage.coverage_pct, 0)
+        self.assertLess(coverage.coverage_pct, 60)
+        self.assertFalse(coverage.revealed)
+        self.assertEqual(TowerDiscovery.objects.count(), 0)
+
+    def test_coverage_crossing_threshold_reveals_without_entering(self):
+        self.fog_zone.fog_reveal_coverage_pct = 5
+        self.fog_zone.save()
+        resp = self.client.post(
+            '/api/discovery/ping/', _FOG_NEAR_OUTSIDE, format='json',
+        )
+        revealed = resp.json()['newly_revealed']
+        self.assertEqual([r['tower_id'] for r in revealed], [self.fog_tower.id])
+        discovery = TowerDiscovery.objects.get()
+        self.assertEqual(discovery.method, TowerDiscovery.METHOD_ZONE_COVERAGE)
+        coverage = TeamZoneCoverage.objects.get(zone=self.fog_zone)
+        self.assertTrue(coverage.revealed)
+
+    def test_coverage_short_circuits_after_reveal(self):
+        self.fog_zone.fog_reveal_coverage_pct = 5
+        self.fog_zone.save()
+        self.client.post('/api/discovery/ping/', _FOG_NEAR_OUTSIDE, format='json')
+        coverage = TeamZoneCoverage.objects.get(zone=self.fog_zone)
+        pct = coverage.coverage_pct
+        # Further pings must not grow the stored geometry once revealed.
+        self.client.post('/api/discovery/ping/', _FOG_INSIDE, format='json')
+        coverage.refresh_from_db()
+        self.assertEqual(coverage.coverage_pct, pct)
+
+    def test_far_ping_accumulates_nothing_useful(self):
+        self.client.post('/api/discovery/ping/', _FOG_FAR, format='json')
+        coverage = TeamZoneCoverage.objects.get(zone=self.fog_zone)
+        self.assertEqual(coverage.coverage_pct, 0)
+        self.assertFalse(coverage.revealed)
+
+    def test_mixed_zone_stays_visible(self):
+        # A zone containing a fog tower AND a normal tower is never
+        # hidden — only all-fog zones fog out.
+        self.plain_tower.zones.add(self.fog_zone)
+        self.assertIn(
+            self.fog_zone.pk, visible_zone_ids(self.session, self.team),
+        )
+
+    def test_coverage_buffer_constant_sane(self):
+        self.assertGreater(COVERAGE_BUFFER_METERS, 0)
+
+
+class DiscoveryPersistenceTest(TestCase):
+    """Task 7.5: discovery survives conquest and ownerlessness."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='Contested', zone=self.zone)
+        self.tower.discoverability = DISCOVERABILITY_HIDDEN
+        self.tower.save()
+        self.team_a = _make_team(self.game, self.group, name='A', color='#111111')
+        self.team_b = _make_team(self.game, self.group, name='B', color='#222222')
+        self.session = self.team_a.session
+        self.client_a, self.user_a = _authed_client(self.team_a, username='keeper')
+
+    def _discover_for_a(self):
+        evaluate_discovery(
+            self.session, self.team_a,
+            Point(23.5, 46.5, srid=4326), user=self.user_a,
+        )
+
+    def test_discovery_survives_conquest_by_another_team(self):
+        self._discover_for_a()
+        self.tower.assign_to_team(self.team_b)
+        self.assertTrue(
+            TowerDiscovery.objects.filter(
+                team=self.team_a, tower=self.tower,
+            ).exists(),
+        )
+        ids = {t['id'] for t in self.client_a.get('/api/towers/').json()}
+        self.assertIn(self.tower.id, ids)
+
+    def test_discovery_survives_ownerlessness(self):
+        self._discover_for_a()
+        self.tower.assign_to_team(self.team_b)
+        self.tower.unassign()
+        self.assertTrue(
+            TowerDiscovery.objects.filter(
+                team=self.team_a, tower=self.tower,
+            ).exists(),
+        )
+        ids = {t['id'] for t in self.client_a.get('/api/towers/').json()}
+        self.assertIn(self.tower.id, ids)
+
+    def test_visible_towers_is_ownership_independent(self):
+        self._discover_for_a()
+        before = set(
+            self.session.visible_towers(self.team_a).values_list('pk', flat=True),
+        )
+        self.tower.assign_to_team(self.team_b)
+        after = set(
+            self.session.visible_towers(self.team_a).values_list('pk', flat=True),
+        )
+        self.assertEqual(before, after)
+        self.assertIn(self.tower.pk, after)
+
+
+class ChallengeVisibilityGateTest(TestCase):
+    """Task 7.6: the challenge-visibility axis on the tower state payload."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text='secret task', game=self.game, tower=self.tower, difficulty=1,
+        )
+        self.team = _make_team(self.game, self.group)
+        self.client, self.user = _authed_client(self.team, username='athlete')
+
+    def test_visible_anywhere_shows_challenge_from_afar(self):
+        resp = self.client.get(f'/api/towers/{self.tower.id}/state/')
+        body = resp.json()
+        self.assertEqual(
+            body['challenge_visibility'], CHALLENGE_VIS_VISIBLE_ANYWHERE,
+        )
+        self.assertFalse(body['challenge_hidden'])
+        self.assertEqual(body['next_challenge']['text'], 'secret task')
+
+    def test_visible_anywhere_blocks_completion_from_afar(self):
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.6,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_hidden_until_arrival_conceals_challenge_from_afar(self):
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        # No reported position → concealed.
+        body = self.client.get(f'/api/towers/{self.tower.id}/state/').json()
+        self.assertTrue(body['challenge_hidden'])
+        self.assertIsNone(body['next_challenge'])
+        # A position outside the activation area → still concealed.
+        body = self.client.get(
+            f'/api/towers/{self.tower.id}/state/',
+            {'lat': 46.6, 'lng': 23.5},
+        ).json()
+        self.assertTrue(body['challenge_hidden'])
+        self.assertIsNone(body['next_challenge'])
+
+    def test_hidden_until_arrival_reveals_inside_activation_area(self):
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        body = self.client.get(
+            f'/api/towers/{self.tower.id}/state/',
+            {'lat': 46.5, 'lng': 23.5},
+        ).json()
+        self.assertFalse(body['challenge_hidden'])
+        self.assertEqual(body['next_challenge']['text'], 'secret task')
+        # Submitting on-site works exactly as before.
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+
+class OwnershipRevealTest(TestCase):
+    """Task 7.7: the reveal_other_teams_ownership knob."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team_a = _make_team(self.game, self.group, name='A', color='#111111')
+        self.team_b = _make_team(self.game, self.group, name='B', color='#222222')
+        self.client_a, _ = _authed_client(self.team_a, username='rival')
+
+    def _conquer_with_b(self):
+        self.tower.assign_to_team(self.team_b)
+
+    def test_default_reveals_other_teams(self):
+        self._conquer_with_b()
+        zones = self.client_a.get('/api/zones/', {'group': self.group.id}).json()
+        self.assertEqual(zones[0]['team_color'], self.team_b.color)
+        towers = self.client_a.get('/api/towers/').json()
+        self.assertEqual(towers[0]['ownership'].get('id'), self.team_b.id)
+
+    def test_conceal_hides_other_teams_control(self):
+        self.game.reveal_other_teams_ownership = False
+        self.game.save()
+        self._conquer_with_b()
+        zones = self.client_a.get('/api/zones/', {'group': self.group.id}).json()
+        self.assertEqual(zones[0]['team_color'], '#000000')
+        towers = self.client_a.get('/api/towers/').json()
+        self.assertIsNone(towers[0]['ownership'].get('id'))
+        state = self.client_a.get(f'/api/towers/{self.tower.id}/state/').json()
+        self.assertIsNone(state['ownership'])
+
+    def test_conceal_keeps_own_control_visible(self):
+        self.game.reveal_other_teams_ownership = False
+        self.game.save()
+        self.tower.assign_to_team(self.team_a)
+        zones = self.client_a.get('/api/zones/', {'group': self.group.id}).json()
+        self.assertEqual(zones[0]['team_color'], self.team_a.color)
+        towers = self.client_a.get('/api/towers/').json()
+        self.assertEqual(towers[0]['ownership'].get('id'), self.team_a.id)
+
+    def test_session_override_beats_game_default(self):
+        self.team_a.session.reveal_other_teams_ownership = False
+        self.team_a.session.save()
+        self._conquer_with_b()
+        zones = self.client_a.get('/api/zones/', {'group': self.group.id}).json()
+        self.assertEqual(zones[0]['team_color'], '#000000')
+
+
+class StaffDiscoveryTest(TestCase):
+    """Staff reveal override + the discovery matrix payload."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.hidden = _make_tower(self.game, name='H', zone=self.zone)
+        self.hidden.discoverability = DISCOVERABILITY_HIDDEN
+        self.hidden.save()
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.player_client, _ = _authed_client(self.team, username='pl')
+        self.staff_client, self.staff = _staff_client(self.session, username='gm')
+
+    def test_staff_reveal_creates_staff_discovery(self):
+        resp = self.staff_client.post(
+            '/api/staff/discovery/reveal/',
+            {'team': self.team.id, 'tower': self.hidden.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        discovery = TowerDiscovery.objects.get()
+        self.assertEqual(discovery.method, TowerDiscovery.METHOD_STAFF)
+        self.assertEqual(discovery.discovered_by, self.staff)
+        ids = {t['id'] for t in self.player_client.get('/api/towers/').json()}
+        self.assertIn(self.hidden.id, ids)
+
+    def test_staff_reveal_is_idempotent(self):
+        staff_reveal(self.team, self.hidden, user=self.staff)
+        resp = self.staff_client.post(
+            '/api/staff/discovery/reveal/',
+            {'team': self.team.id, 'tower': self.hidden.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(TowerDiscovery.objects.count(), 1)
+
+    def test_staff_reveal_rejects_foreign_tower(self):
+        other_game = _make_game(name='Other')
+        foreign = _make_tower(other_game, name='F', zone=_make_zone(other_game))
+        resp = self.staff_client.post(
+            '/api/staff/discovery/reveal/',
+            {'team': self.team.id, 'tower': foreign.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_reveal_requires_staff(self):
+        resp = self.player_client.post(
+            '/api/staff/discovery/reveal/',
+            {'team': self.team.id, 'tower': self.hidden.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_discovery_matrix_lists_teams_towers_and_cells(self):
+        staff_reveal(self.team, self.hidden, user=self.staff)
+        resp = self.staff_client.get(
+            f'/api/staff/sessions/{self.session.id}/discovery-matrix/',
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual([t['id'] for t in body['teams']], [self.team.id])
+        self.assertEqual([t['id'] for t in body['towers']], [self.hidden.id])
+        self.assertEqual(len(body['discoveries']), 1)
+        cell = body['discoveries'][0]
+        self.assertEqual(cell['team_id'], self.team.id)
+        self.assertEqual(cell['tower_id'], self.hidden.id)
+        self.assertEqual(cell['method'], TowerDiscovery.METHOD_STAFF)
+
+
+class LocationPingDrivenDiscoveryTest(TestCase):
+    """Task 3.3: the live-location stream drives the same evaluation."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.save()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.hidden = _make_tower(self.game, name='H', zone=self.zone)
+        self.hidden.discoverability = DISCOVERABILITY_HIDDEN
+        self.hidden.save()
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.client, self.user = _authed_client(self.team, username='tracked')
+        LocationConsent.grant(self.user, self.session)
+
+    def test_location_ping_reveals_hidden_tower(self):
+        resp = self.client.post(
+            '/api/location/ping/',
+            {'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        revealed = resp.json()['newly_revealed']
+        self.assertEqual([r['tower_id'] for r in revealed], [self.hidden.id])
+        discovery = TowerDiscovery.objects.get()
+        self.assertEqual(discovery.method, TowerDiscovery.METHOD_PROXIMITY)
+        self.assertEqual(discovery.team, self.team)

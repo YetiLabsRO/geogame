@@ -418,6 +418,10 @@ class CurrentSessionSerializer(serializers.Serializer):
     # paces streaming off `location_ping_interval_seconds`; there is no
     # player-facing frequency control.
     location = serializers.SerializerMethodField()
+    # Effective tower-visibility config (tower-visibility capability) —
+    # lets the player app decide whether to render the fog overlay and
+    # run discovery pings at all.
+    visibility = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
@@ -428,6 +432,30 @@ class CurrentSessionSerializer(serializers.Serializer):
             'ping_interval_seconds': session.effective('location_ping_interval_seconds'),
             'visibility': session.effective('location_visibility'),
             'consent_text': session.effective('location_consent_text') or '',
+        }
+
+    def get_visibility(self, session):
+        from organize.models import (
+            DISCOVERABILITY_FOG_REVEAL,
+            DISCOVERABILITY_VISIBLE,
+        )
+        default = session.effective('tower_discoverability_default')
+        uses_fog = default == DISCOVERABILITY_FOG_REVEAL or session.towers().filter(
+            discoverability=DISCOVERABILITY_FOG_REVEAL,
+        ).exists()
+        # Any non-VISIBLE effective tower means positions should be
+        # reported for discovery even when live-location is off.
+        uses_discovery = uses_fog or default != DISCOVERABILITY_VISIBLE or (
+            session.towers().exclude(discoverability__isnull=True)
+            .exclude(discoverability=DISCOVERABILITY_VISIBLE).exists()
+        )
+        return {
+            'default_discoverability': default,
+            'uses_fog': uses_fog,
+            'uses_discovery': uses_discovery,
+            'reveal_other_teams_ownership': bool(
+                session.effective('reveal_other_teams_ownership'),
+            ),
         }
 
 
