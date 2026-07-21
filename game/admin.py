@@ -20,6 +20,7 @@ from game.models import (
     TeamTowerFailCounter,
     TeamTowerOwnership,
     Tower,
+    TowerPhoto,
     Zone,
 )
 from organize.models import Team, TeamGroup
@@ -94,6 +95,12 @@ class TowerAdminForm(forms.ModelForm):
         return zones
 
 
+class TowerPhotoInline(admin.TabularInline):
+    model = TowerPhoto
+    extra = 0
+    readonly_fields = ['captured_by', 'captured_at']
+
+
 class TowerAdmin(LeafletGeoAdmin):
     form = TowerAdminForm
     list_display = [
@@ -106,6 +113,7 @@ class TowerAdmin(LeafletGeoAdmin):
     filter_horizontal = ['zones']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]
+    inlines = [TowerPhotoInline]
 
     def get_zones(self, instance):
         return ', '.join(instance.zones.values_list('name', flat=True)) or '-'
@@ -217,6 +225,12 @@ class TeamTowerFailCounterAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'tower__name')
 
 
+class TowerPhotoAdmin(admin.ModelAdmin):
+    list_display = ('tower', 'caption', 'captured_by', 'captured_at')
+    list_filter = ('tower',)
+    readonly_fields = ('captured_at',)
+
+
 class CollectionAdmin(admin.ModelAdmin):
     list_display = ('name', 'slug', 'tower_count', 'zone_count', 'created_by', 'created_at')
     search_fields = ('name', 'slug')
@@ -267,6 +281,7 @@ admin.site.register(PresenceCheck, PresenceCheckAdmin)
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
+admin.site.register(TowerPhoto, TowerPhotoAdmin)
 admin.site.register(Team, TeamAdmin)
 admin.site.register(Challenge, ChallengeAdmin)
 admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)

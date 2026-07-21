@@ -142,7 +142,7 @@
             "browser": "projects/staff/src/main.ts",
             "tsConfig": "projects/staff/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
-            "allowedCommonJsDependencies": ["qrcode"],
+            "allowedCommonJsDependencies": ["qrcode", "leaflet"],
             "assets": [
               {
                 "glob": "**/*",

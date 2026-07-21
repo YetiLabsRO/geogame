@@ -51,6 +51,7 @@ from game.models import (
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
+    TowerPhoto,
     Zone,
 )
 from organize.models import (
@@ -5435,3 +5436,384 @@ class TopologyApiTest(TestCase):
         self.assertEqual(
             [z['id'] for z in resp.json()], [self.z2.pk],
         )
+
+
+
+
+# ---------------------------------------------------------------------------
+# field-authoring-mode — create-at-GPS, reference photos, zone drawing,
+# attach-challenge, collection permission gate, draft staging (tasks 5.1–5.6)
+# ---------------------------------------------------------------------------
+
+
+class FieldAuthoringTowerApiTest(TestCase):
+    """Tasks 5.1 / 5.2 — drop-at-GPS with provenance + reference photos."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.collection = _game_collection(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='curator',
+        )
+
+    def test_drop_tower_records_accuracy_and_files_into_collection(self):
+        resp = self.staff_client.post(
+            '/api/staff/towers/',
+            {
+                'name': 'Fountain',
+                'category': Tower.CATEGORY_NORMAL,
+                'is_active': False,
+                'lat': 46.51,
+                'lng': 23.52,
+                'authored_accuracy_m': 12.5,
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        tower = Tower.objects.get(pk=resp.json()['id'])
+        self.assertAlmostEqual(tower.location.x, 23.52)
+        self.assertAlmostEqual(tower.location.y, 46.51)
+        self.assertEqual(tower.authored_accuracy_m, 12.5)
+        self.assertFalse(tower.is_active)
+        self.assertIn(tower, self.collection.towers.all())
+        # Read side reports GeoJSON location + provenance.
+        self.assertEqual(resp.json()['location']['coordinates'], [23.52, 46.51])
+        self.assertEqual(resp.json()['authored_accuracy_m'], 12.5)
+
+    def test_desk_authored_towers_have_null_provenance(self):
+        tower = _make_tower(self.game, name='Desk')
+        self.assertIsNone(tower.authored_accuracy_m)
+
+    def test_create_without_coordinates_is_rejected(self):
+        resp = self.staff_client.post(
+            '/api/staff/towers/',
+            {'name': 'Nowhere', 'category': 1, 'is_active': True},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_nudge_updates_location_via_lat_lng(self):
+        tower = _make_tower(self.game, name='T1')
+        resp = self.staff_client.patch(
+            f'/api/staff/towers/{tower.id}/',
+            {'lat': 46.499, 'lng': 23.501},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        tower.refresh_from_db()
+        self.assertAlmostEqual(tower.location.x, 23.501)
+        self.assertAlmostEqual(tower.location.y, 46.499)
+
+    def test_photo_upload_records_capture_provenance(self):
+        tower = _make_tower(self.game, name='T1')
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{tower.id}/photos/',
+            {
+                'image': f'data:image/png;base64,{_tiny_png_b64()}',
+                'caption': 'north face',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        photo = TowerPhoto.objects.get(pk=resp.json()['id'])
+        self.assertEqual(photo.tower, tower)
+        self.assertEqual(photo.caption, 'north face')
+        self.assertEqual(photo.captured_by, self.staff)
+        self.assertIsNotNone(photo.captured_at)
+
+    def test_tower_may_have_multiple_photos_listed_and_deleted(self):
+        tower = _make_tower(self.game, name='T1')
+        for caption in ('front', 'back'):
+            self.staff_client.post(
+                f'/api/staff/towers/{tower.id}/photos/',
+                {'image': f'data:image/png;base64,{_tiny_png_b64()}', 'caption': caption},
+                format='json',
+            )
+        resp = self.staff_client.get(f'/api/staff/towers/{tower.id}/photos/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
+
+        photo_id = resp.json()[0]['id']
+        resp = self.staff_client.delete(
+            f'/api/staff/towers/{tower.id}/photos/{photo_id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(tower.photos.count(), 1)
+
+    def test_photo_endpoints_require_staff(self):
+        tower = _make_tower(self.game, name='T1')
+        player_client, _ = _authed_client(self.team)
+        resp = player_client.post(
+            f'/api/staff/towers/{tower.id}/photos/',
+            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+class FieldAuthoringZoneApiTest(TestCase):
+    """Task 5.3 — walked/tapped vertices persist and file into the collection."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.collection = _game_collection(self.game)
+        self.staff_client, self.staff = _staff_client(username='curator')
+
+    def test_walked_boundary_creates_zone_in_collection(self):
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Old town',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.50, 46.50], [23.52, 46.50], [23.52, 46.52]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        zone = Zone.objects.get(pk=resp.json()['id'])
+        # Ring closed server-side: 3 marks -> 4 ring points.
+        self.assertEqual(len(zone.shape.coords[0]), 4)
+        self.assertEqual(zone.shape.coords[0][0], zone.shape.coords[0][-1])
+        self.assertIn(zone, self.collection.zones.all())
+        self.assertEqual(resp.json()['shape']['type'], 'Polygon')
+
+    def test_adjusting_vertices_persists_the_new_boundary(self):
+        zone = _make_zone(self.game, name='Z1')
+        resp = self.staff_client.patch(
+            f'/api/staff/zones/{zone.id}/',
+            {'vertices': [[23.1, 46.1], [23.2, 46.1], [23.2, 46.2], [23.1, 46.2]]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        zone.refresh_from_db()
+        self.assertEqual(len(zone.shape.coords[0]), 5)
+        self.assertAlmostEqual(zone.shape.coords[0][0][0], 23.1)
+
+    def test_too_few_vertices_rejected(self):
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Line',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.5, 46.5], [23.6, 46.5]],
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class FieldAuthoringChallengeAttachTest(TestCase):
+    """Task 5.4 — attach existing/new challenge; visible to players at the tower."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='curator',
+        )
+
+    def test_attach_existing_challenge(self):
+        challenge = Challenge.objects.create(
+            game=self.game, text='Sing a song', difficulty=1,
+        )
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{self.tower.id}/attach-challenge/',
+            {'challenge': challenge.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        challenge.refresh_from_db()
+        self.assertEqual(challenge.tower, self.tower)
+
+    def test_attach_creates_new_challenge_on_the_spot(self):
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{self.tower.id}/attach-challenge/',
+            {'game': self.game.id, 'text': 'Count the windows', 'difficulty': 2},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        challenge = Challenge.objects.get(pk=resp.json()['id'])
+        self.assertEqual(challenge.tower, self.tower)
+        self.assertEqual(challenge.difficulty, 2)
+
+    def test_attached_challenge_is_visible_to_players_at_the_tower(self):
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{self.tower.id}/attach-challenge/',
+            {'game': self.game.id, 'text': 'Field challenge'},
+            format='json',
+        )
+        challenge_id = resp.json()['id']
+        player_client, _ = _authed_client(self.team)
+        resp = player_client.get(f'/api/towers/{self.tower.id}/state/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()['next_challenge']['id'], challenge_id)
+
+    def test_attach_requires_a_challenge_or_game_and_text(self):
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{self.tower.id}/attach-challenge/',
+            {},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class FieldAuthoringPermissionTest(TestCase):
+    """Task 5.5 — writes are gated to staff authorised for the Collection."""
+
+    def setUp(self):
+        self.owner = User.objects.create_user(
+            username='owner', email='owner@example.com',
+            password='password123', is_staff=True,
+        )
+        # A Game with a recorded creator: only the creator (or a CREATOR
+        # collaborator / superuser) may edit its template.
+        self.game = Game.objects.create(
+            name='Owned game', slug='owned-game', created_by=self.owner,
+        )
+        self.collection = Collection.objects.create(
+            name='Owned map', slug='owned-map', created_by=self.owner,
+        )
+        self.game.collections.add(self.collection)
+        self.tower = Tower.objects.create(
+            name='Owned T', location=Point(23.5, 46.5),
+            is_active=True, category=Tower.CATEGORY_NORMAL,
+        )
+        self.collection.towers.add(self.tower)
+        self.zone = Zone.objects.create(
+            name='Owned Z', scoring_type=Zone.SCORE_LIN,
+            shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
+        )
+        self.collection.zones.add(self.zone)
+        # A staff user with no rights on the owner's game.
+        self.other_client, self.other = _staff_client(username='outsider')
+
+    def test_unauthorised_staff_cannot_create_into_the_collection(self):
+        resp = self.other_client.post(
+            '/api/staff/towers/',
+            {
+                'name': 'Intruder', 'category': 1, 'is_active': False,
+                'lat': 46.5, 'lng': 23.5, 'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.other_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Intruder Z', 'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.5, 46.5], [23.6, 46.5], [23.6, 46.6]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_unauthorised_staff_cannot_adjust_collection_geometry(self):
+        resp = self.other_client.patch(
+            f'/api/staff/towers/{self.tower.id}/',
+            {'lat': 46.6, 'lng': 23.6},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.other_client.patch(
+            f'/api/staff/zones/{self.zone.id}/',
+            {'vertices': [[23.5, 46.5], [23.6, 46.5], [23.6, 46.6]]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.other_client.post(
+            f'/api/staff/towers/{self.tower.id}/photos/',
+            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_creator_may_author_into_their_collection(self):
+        token = Token.objects.create(user=self.owner)
+        owner_client = APIClient()
+        owner_client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = owner_client.post(
+            '/api/staff/towers/',
+            {
+                'name': 'Legit', 'category': 1, 'is_active': False,
+                'lat': 46.5, 'lng': 23.5, 'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_creator_collaborator_may_author(self):
+        GameCollaborator.objects.create(
+            game=self.game, user=self.other,
+            role=GameCollaborator.ROLE_CREATOR,
+        )
+        resp = self.other_client.post(
+            '/api/staff/towers/',
+            {
+                'name': 'Collab T', 'category': 1, 'is_active': False,
+                'lat': 46.5, 'lng': 23.5, 'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+
+class FieldAuthoringDraftStagingTest(TestCase):
+    """Task 5.6 — inactive field drafts stay out of live session scoping."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.live_tower = _make_tower(self.game, name='Live', zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='curator',
+        )
+        self.player_client, _ = _authed_client(self.team)
+
+    def _drop_draft(self):
+        resp = self.staff_client.post(
+            '/api/staff/towers/',
+            {
+                'name': 'Draft', 'category': 1, 'is_active': False,
+                'lat': 46.55, 'lng': 23.55,
+                'collection': _game_collection(self.game).id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()['id']
+
+    def test_inactive_draft_hidden_from_players_until_activated(self):
+        draft_id = self._drop_draft()
+
+        resp = self.player_client.get('/api/towers/')
+        self.assertEqual(resp.status_code, 200)
+        names = [t['name'] for t in resp.json()]
+        self.assertIn('Live', names)
+        self.assertNotIn('Draft', names)
+
+        # Tower state view also refuses the inactive draft.
+        resp = self.player_client.get(f'/api/towers/{draft_id}/state/')
+        self.assertEqual(resp.status_code, 404)
+
+        # Activation publishes it to the live session scope.
+        resp = self.staff_client.patch(
+            f'/api/staff/towers/{draft_id}/', {'is_active': True}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        resp = self.player_client.get('/api/towers/')
+        self.assertIn('Draft', [t['name'] for t in resp.json()])
+
+    def test_staff_list_still_shows_drafts(self):
+        self._drop_draft()
+        resp = self.staff_client.get('/api/staff/towers/')
+        self.assertIn('Draft', [t['name'] for t in resp.json()])

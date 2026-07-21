@@ -214,6 +214,15 @@ class Tower(models.Model):
     rfid_code = models.CharField(max_length=16, unique=True, null=True, blank=True)
     order = models.PositiveIntegerField(null=True, blank=True, help_text="if the game requires any tower order, use this to order towers")
 
+    # field-authoring-mode: GPS accuracy (metres) of the geolocation fix
+    # a field curator dropped this tower from. NULL for desk-authored
+    # towers — pure capture provenance, never used in gameplay.
+    authored_accuracy_m = models.FloatField(
+        null=True,
+        blank=True,
+        help_text='GPS accuracy in metres of the field capture that placed this tower (provenance).',
+    )
+
     def __init__(self, *args, **kwargs):
         super(Tower, self).__init__(*args, **kwargs)
         self.__is_active = self.is_active
@@ -582,6 +591,35 @@ pre_delete.connect(
 )
 
 
+class TowerPhoto(models.Model):
+    """A curator-captured reference photo of a Tower's physical objective.
+
+    Field-authoring provenance: helps players recognise the thing the
+    tower stands for. Explicitly distinct from the player submission
+    photos on `TeamTowerChallenge` — a Tower MAY have many reference
+    photos (several angles of the same fountain).
+    """
+
+    tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='photos')
+    image = models.ImageField(upload_to='tower_photos')
+    caption = models.CharField(max_length=255, blank=True, default='')
+    captured_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='tower_photos',
+    )
+    captured_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-captured_at']
+
+    def __str__(self):
+        return f'Reference photo of {self.tower.name} ({self.captured_at:%Y-%m-%d})' \
+            if self.captured_at else f'Reference photo of {self.tower.name}'
+
+
 class Collection(models.Model):
     """A named, reusable grouping of repository Towers and Zones.
 
@@ -612,6 +650,27 @@ class Collection(models.Model):
 
     def __str__(self):
         return self.name
+
+    def can_author(self, user):
+        """Field-authoring permission on this Collection.
+
+        Writing geometry into a Collection mutates the map of every Game
+        that links it, so authoring requires template edit rights
+        (`Game.can_edit`) on ALL referencing Games. Superusers and the
+        collection's own creator always pass; an unreferenced collection
+        with no recorded creator stays open to any staff user (legacy
+        behavior, mirroring `Game.can_edit`).
+        """
+        if user is None or not getattr(user, 'is_authenticated', False) or not user.is_staff:
+            return False
+        if user.is_superuser:
+            return True
+        if self.created_by_id == user.id:
+            return True
+        games = list(self.games.all())
+        if games:
+            return all(game.can_edit(user) for game in games)
+        return self.created_by_id is None
 
 
 class PresenceRequirement(models.Model):
