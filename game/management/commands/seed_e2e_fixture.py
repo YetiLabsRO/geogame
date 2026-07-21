@@ -93,12 +93,12 @@ class Command(BaseCommand):
         )
         tower = Tower.objects.create(
             name=f'{MARKER}-tower-alpha',
-            zone=zone,
             location=Point(23.571797, 46.068374),
             is_active=True,
             category=Tower.CATEGORY_NORMAL,
             initial_bonus=10,
         )
+        tower.zones.add(zone)
         collection.zones.add(zone)
         collection.towers.add(tower)
         Challenge.objects.create(

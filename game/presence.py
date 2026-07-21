@@ -70,7 +70,12 @@ def resolve_presence(session, challenge, tower, team=None):
     if requirement is not None:
         radius = requirement.geofence_radius_meters
     if radius is None:
-        radius = session.game.proximity_meters
+        # zone-conquest-and-scoring-config: the fallback is the tower's
+        # per-tower effective radius (Tower.proximity_meters override,
+        # else the Game default) — the same radius the submitter's own
+        # proximity check uses.
+        from game.models import effective_proximity
+        radius = effective_proximity(tower, session.game)
 
     window = None
     if requirement is not None:

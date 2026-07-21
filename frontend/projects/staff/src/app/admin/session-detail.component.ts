@@ -7,14 +7,17 @@ import { forkJoin } from 'rxjs';
 import { HttpErrorResponse } from '@angular/common/http';
 
 import {
+  AdminGame,
   AdminSession,
   AdminSessionPayload,
+  ConquestRule,
   FailCounterInfo,
   FailCounterReset,
   GameApiService,
   PauseHistory,
   Phase10Overrides,
   PresenceRulesOverrides,
+  ScoreTimeUnit,
   SessionScoreboard,
   SessionState,
   SessionTimeline,
@@ -374,6 +377,41 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
                 }
               </select>
             </div>
+            <!-- Conquest & scoring overrides
+                 (zone-conquest-and-scoring-config) --------------------- -->
+            <div class="mb-2">
+              <label class="form-label small mb-0">Zone conquest rule</label>
+              <select
+                class="form-select form-select-sm"
+                [ngModel]="conquestOverride()"
+                (ngModelChange)="setConquestOverride($event)"
+              >
+                <option [ngValue]="null">Inherit</option>
+                @for (o of conquestRuleOptions; track o.value) {
+                  <option [ngValue]="o.value">{{ o.label }}</option>
+                }
+              </select>
+              <div class="form-text">
+                Effective rule: <strong>{{ effectiveConquestRule() }}</strong>
+                (zones with their own override win over this).
+              </div>
+            </div>
+            <div class="mb-2">
+              <label class="form-label small mb-0">Score time unit</label>
+              <select
+                class="form-select form-select-sm"
+                [ngModel]="timeUnitOverride()"
+                (ngModelChange)="setTimeUnitOverride($event)"
+              >
+                <option [ngValue]="null">Inherit</option>
+                @for (o of timeUnitOptions; track o.value) {
+                  <option [ngValue]="o.value">{{ o.label }}</option>
+                }
+              </select>
+              <div class="form-text">
+                Effective unit: <strong>{{ effectiveTimeUnit() }}</strong>
+              </div>
+            </div>
           </div>
           <div class="col-12">
             <div class="fw-semibold small mb-2 mt-2">
@@ -598,6 +636,11 @@ export class StaffSessionDetailComponent {
   protected readonly presenceOverride = signal<PresenceRulesOverrides>(
     blankPresenceOverrides(),
   );
+  // Conquest & scoring overrides (null = inherit the Game default).
+  protected readonly conquestOverride = signal<ConquestRule | null>(null);
+  protected readonly timeUnitOverride = signal<ScoreTimeUnit | null>(null);
+  // The Session's Game — fetched for the effective-value readout.
+  protected readonly game = signal<AdminGame | null>(null);
 
   protected readonly buildCount = signal<number | null>(null);
   protected readonly buildKeys = signal('');
@@ -641,6 +684,18 @@ export class StaffSessionDetailComponent {
     { value: 'SELECT_COUNT', label: 'Nearest N players' },
   ];
 
+  protected readonly conquestRuleOptions: { value: ConquestRule; label: string }[] = [
+    { value: 'MAJORITY', label: 'Majority of towers (default)' },
+    { value: 'ALL', label: 'All towers — hold every active tower' },
+    { value: 'ANY', label: 'Any tower — most towers, latest capture breaks ties' },
+  ];
+
+  protected readonly timeUnitOptions: { value: ScoreTimeUnit; label: string }[] = [
+    { value: 'SECOND', label: 'Seconds' },
+    { value: 'MINUTE', label: 'Minutes (default)' },
+    { value: 'HOUR', label: 'Hours' },
+  ];
+
   protected readonly sessionId = Number(this.route.snapshot.paramMap.get('id'));
 
   constructor() {
@@ -671,8 +726,35 @@ export class StaffSessionDetailComponent {
     this.override.set(pickOverrides(s));
     this.teamFormationOverride.set(s.allow_player_team_creation);
     this.presenceOverride.set(pickPresenceOverrides(s));
+    this.conquestOverride.set(s.zone_conquest_rule);
+    this.timeUnitOverride.set(s.score_time_unit);
     this.overrideDirty.set(false);
     this.refreshReadiness();
+    if (this.game()?.id !== s.game) {
+      this.staff.getGame(s.game).subscribe({
+        next: (g) => this.game.set(g),
+        error: () => this.game.set(null),
+      });
+    }
+  }
+
+  /** Session override when set, else the Game default (readout only). */
+  protected effectiveConquestRule(): string {
+    return this.conquestOverride() ?? this.game()?.zone_conquest_rule ?? 'MAJORITY';
+  }
+
+  protected effectiveTimeUnit(): string {
+    return this.timeUnitOverride() ?? this.game()?.score_time_unit ?? 'MINUTE';
+  }
+
+  protected setConquestOverride(value: ConquestRule | null): void {
+    this.conquestOverride.set(value);
+    this.overrideDirty.set(true);
+  }
+
+  protected setTimeUnitOverride(value: ScoreTimeUnit | null): void {
+    this.timeUnitOverride.set(value);
+    this.overrideDirty.set(true);
   }
 
   private refreshReadiness(): void {
@@ -853,6 +935,8 @@ export class StaffSessionDetailComponent {
       ...this.override(),
       ...this.presenceOverride(),
       allow_player_team_creation: this.teamFormationOverride(),
+      zone_conquest_rule: this.conquestOverride(),
+      score_time_unit: this.timeUnitOverride(),
     };
     this.staff.updateSession(id, payload).subscribe({
       next: (s) => {

@@ -6,7 +6,9 @@ import {
   AdminCollection,
   AdminGame,
   AdminGamePayload,
+  ConquestRule,
   FailCounterReset,
+  ScoreTimeUnit,
   StaffApiService,
   TeamJoinConfirmation,
   TeammateVisibilityMode,
@@ -446,6 +448,46 @@ interface Row {
                         </div>
                       </div>
                       <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">Conquest &amp; scoring</div>
+                        <div class="mb-2">
+                          <label class="form-label small mb-0" [for]="'zcr-' + row.game.id">
+                            Zone conquest rule
+                          </label>
+                          <select
+                            class="form-select form-select-sm"
+                            [id]="'zcr-' + row.game.id"
+                            [ngModel]="row.draft.zone_conquest_rule"
+                            (ngModelChange)="update(row, 'zone_conquest_rule', $event)"
+                          >
+                            @for (o of conquestRuleOptions; track o.value) {
+                              <option [ngValue]="o.value">{{ o.label }}</option>
+                            }
+                          </select>
+                          <div class="form-text">
+                            Game-wide default; each Session or Zone may override it.
+                          </div>
+                        </div>
+                        <div class="mb-2">
+                          <label class="form-label small mb-0" [for]="'stu-' + row.game.id">
+                            Score time unit
+                          </label>
+                          <select
+                            class="form-select form-select-sm"
+                            [id]="'stu-' + row.game.id"
+                            [ngModel]="row.draft.score_time_unit"
+                            (ngModelChange)="update(row, 'score_time_unit', $event)"
+                          >
+                            @for (o of timeUnitOptions; track o.value) {
+                              <option [ngValue]="o.value">{{ o.label }}</option>
+                            }
+                          </select>
+                          <div class="form-text">
+                            Zone scores accrue per this unit. Minutes preserves the
+                            historical formulas.
+                          </div>
+                        </div>
+                      </div>
+                      <div class="col-md-6">
                         <div class="fw-semibold small mb-2">Team formation</div>
                         <div class="form-check form-switch">
                           <input
@@ -531,6 +573,18 @@ export class GamesComponent {
     { value: 'OWN_TEAM', label: 'Own team only' },
     { value: 'EVERYONE', label: 'Everyone in the session' },
     { value: 'SELECT_COUNT', label: 'The nearest N players' },
+  ];
+
+  protected readonly conquestRuleOptions: { value: ConquestRule; label: string }[] = [
+    { value: 'MAJORITY', label: 'Majority of towers (default)' },
+    { value: 'ALL', label: 'All towers — hold every active tower' },
+    { value: 'ANY', label: 'Any tower — most towers, latest capture breaks ties' },
+  ];
+
+  protected readonly timeUnitOptions: { value: ScoreTimeUnit; label: string }[] = [
+    { value: 'SECOND', label: 'Seconds' },
+    { value: 'MINUTE', label: 'Minutes (default)' },
+    { value: 'HOUR', label: 'Hours' },
   ];
 
   protected readonly teamRuleKnobs: { field: TeamRuleKnob; label: string; min: number }[] = [
@@ -705,6 +759,8 @@ export class GamesComponent {
         fail_tower_lockout_minutes: row.draft.fail_tower_lockout_minutes,
         fail_difficulty_rollback: row.draft.fail_difficulty_rollback,
         fail_counter_reset: row.draft.fail_counter_reset,
+        zone_conquest_rule: row.draft.zone_conquest_rule,
+        score_time_unit: row.draft.score_time_unit,
         min_teams: row.draft.min_teams,
         max_teams: row.draft.max_teams,
         min_members_per_team: row.draft.min_members_per_team,

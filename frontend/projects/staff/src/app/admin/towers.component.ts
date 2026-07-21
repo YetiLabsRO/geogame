@@ -54,8 +54,9 @@ interface Row {
           <thead>
             <tr>
               <th>Name</th>
-              <th>Zone</th>
+              <th>Zones</th>
               <th>Category</th>
+              <th>Prox (m)</th>
               <th>Initial bonus</th>
               <th>RFID code</th>
               <th>Used by</th>
@@ -75,16 +76,28 @@ interface Row {
                   />
                 </td>
                 <td style="min-width: 12rem">
-                  <select
-                    class="form-select form-select-sm"
-                    [ngModel]="row.draft.zone"
-                    (ngModelChange)="update(row, 'zone', $event)"
-                  >
-                    <option [ngValue]="null">—</option>
-                    @for (z of zones(); track z.id) {
-                      <option [ngValue]="z.id">{{ z.name }}</option>
-                    }
-                  </select>
+                  <!-- Many-to-many membership (tower-zone-topology): a
+                       tower may belong to several, overlapping zones. -->
+                  @if (zones().length === 0) {
+                    <span class="text-body-secondary small">no zones yet</span>
+                  }
+                  @for (z of zones(); track z.id) {
+                    <div class="form-check form-check-inline">
+                      <input
+                        type="checkbox"
+                        class="form-check-input"
+                        [id]="'tz-' + row.tower.id + '-' + z.id"
+                        [checked]="row.draft.zones.includes(z.id)"
+                        (change)="toggleZone(row, z.id)"
+                      />
+                      <label
+                        class="form-check-label small"
+                        [for]="'tz-' + row.tower.id + '-' + z.id"
+                      >
+                        {{ z.name }}
+                      </label>
+                    </div>
+                  }
                 </td>
                 <td>
                   <select
@@ -95,6 +108,18 @@ interface Row {
                     <option [ngValue]="1">Normal</option>
                     <option [ngValue]="2">RFID</option>
                   </select>
+                </td>
+                <td style="max-width: 7rem">
+                  <!-- Per-tower capture radius; blank = inherit the
+                       Game's game-wide proximity default. -->
+                  <input
+                    class="form-control form-control-sm"
+                    type="number"
+                    min="1"
+                    placeholder="inherit"
+                    [ngModel]="row.draft.proximity_meters"
+                    (ngModelChange)="update(row, 'proximity_meters', $event)"
+                  />
                 </td>
                 <td style="max-width: 8rem">
                   <input
@@ -217,6 +242,14 @@ export class TowersComponent {
     this.rows.update((rows) =>
       rows.map((r) => (r.tower.id === row.tower.id ? { ...r, draft, dirty } : r)),
     );
+  }
+
+  protected toggleZone(row: Row, zoneId: number): void {
+    const has = row.draft.zones.includes(zoneId);
+    const next = has
+      ? row.draft.zones.filter((id) => id !== zoneId)
+      : [...row.draft.zones, zoneId];
+    this.update(row, 'zones', next);
   }
 
   protected save(row: Row): void {

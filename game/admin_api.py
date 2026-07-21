@@ -2,6 +2,7 @@ import random
 import secrets
 
 from django.contrib.gis.geos import Point
+from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
 from django.utils import timezone
 from django.utils.text import slugify
@@ -75,18 +76,49 @@ class GeometryUsageMixin(serializers.Serializer):
 
 
 class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
+    # Member towers via the many-to-many (tower-zone-topology) — shown
+    # in the staff Zone editor; membership is edited from the Tower side.
+    towers = serializers.SerializerMethodField()
+
     class Meta:
         model = Zone
-        fields = ('id', 'name', 'color', 'scoring_type', 'collections', 'games')
+        fields = (
+            'id', 'name', 'color', 'scoring_type', 'conquest_rule',
+            'towers', 'collections', 'games',
+        )
+
+    def get_towers(self, zone):
+        return [
+            {'id': t.id, 'name': t.name}
+            for t in zone.towers.all().order_by('name')
+        ]
 
 
 class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
+    # Many-to-many zone membership (tower-zone-topology).
+    zones = serializers.PrimaryKeyRelatedField(
+        many=True, queryset=Zone.objects.all(), required=False,
+    )
+
     class Meta:
         model = Tower
         fields = (
-            'id', 'name', 'zone', 'category', 'is_active',
+            'id', 'name', 'zones', 'category', 'is_active',
+            'proximity_meters',
             'initial_bonus', 'rfid_code', 'collections', 'games',
         )
+
+    def update(self, instance, validated_data):
+        # Removing a zone's last member tower violates the
+        # at-least-one-tower invariant; surface the model-layer guard's
+        # Django ValidationError as a DRF 400 instead of a 500. The
+        # explicit atomic() gives the guard's raise a savepoint so an
+        # enclosing transaction stays usable.
+        try:
+            with transaction.atomic():
+                return super().update(instance, validated_data)
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'zones': exc.messages})
 
 
 class AdminTeamSerializer(serializers.ModelSerializer):
@@ -186,23 +218,51 @@ class CollectionFilterMixin:
 
 
 class AdminZoneViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for repository Zones. Shape editing stays in Django admin."""
+    """Staff-only CRUD for repository Zones. Shape editing stays in Django admin.
+
+    `?tower=<id>` narrows to the zones a tower belongs to (many-to-many
+    membership, tower-zone-topology).
+    """
 
     permission_classes = [IsAdminUser]
     queryset = Zone.objects.all().order_by('name')
     serializer_class = AdminZoneSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        tower_id = self.request.query_params.get('tower')
+        if tower_id:
+            qs = qs.filter(towers=tower_id)
+        return qs
 
 
 class AdminTowerViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
     Location (PointField) edits stay in Django admin. Everything else
-    is reachable through this viewset.
+    is reachable through this viewset. `?zone=<id>` narrows to one
+    zone's member towers (many-to-many membership, tower-zone-topology).
     """
 
     permission_classes = [IsAdminUser]
     queryset = Tower.objects.all().order_by('name')
     serializer_class = AdminTowerSerializer
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        zone_id = self.request.query_params.get('zone')
+        if zone_id:
+            qs = qs.filter(zones=zone_id)
+        return qs
+
+    def perform_destroy(self, instance):
+        # Deleting a zone's last member tower is rejected by the
+        # at-least-one-tower invariant guard (tower-zone-topology).
+        try:
+            with transaction.atomic():
+                instance.delete()
+        except DjangoValidationError as exc:
+            raise serializers.ValidationError({'detail': exc.messages})
 
     @action(detail=True, methods=['post'])
     def unassign(self, request, pk=None):
@@ -653,6 +713,9 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'base_point', 'base_lat', 'base_lng',
             'base_zoom_level', 'is_active',
             'proximity_meters', 'cooloff_minutes', 'initial_bonus_default',
+            # Conquest + scoring-cadence defaults
+            # (zone-conquest-and-scoring-config).
+            'zone_conquest_rule', 'score_time_unit',
             # Phase 10 day-pausing knobs.
             'pause_freezes_floating_score',
             'pause_restores_ownerships_on_resume',
@@ -828,6 +891,9 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'fail_point_penalty', 'fail_cooloff_scaling',
             'fail_tower_lockout_minutes', 'fail_difficulty_rollback',
             'fail_counter_reset',
+            # Conquest-rule / scoring-time-unit overrides (null = inherit
+            # the Game default; zone-conquest-and-scoring-config).
+            'zone_conquest_rule', 'score_time_unit',
             # Team-rule overrides (null = inherit; maxima: 0 = no cap).
             'min_teams', 'max_teams',
             'min_members_per_team', 'max_members_per_team',

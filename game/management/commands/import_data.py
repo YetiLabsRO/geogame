@@ -83,8 +83,9 @@ class Command(BaseCommand):
             point_data = (float(point_data[0]), float(point_data[1]))
             t = Tower.objects.create(
                 name=point_name, location=Point(point_data), category=1,
-                zone=default_zone, is_active=True,
+                is_active=True,
             )
+            t.zones.add(default_zone)
             collection.towers.add(t)
             for c in zone_desc:
                 Challenge.objects.create(text=c, tower=t, difficulty=1)

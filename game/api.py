@@ -12,6 +12,7 @@ from game.models import (
     Challenge,
     TeamTowerChallenge,
     Tower,
+    effective_proximity,
 )
 from game.scoping import SessionScopedViewSetMixin
 
@@ -136,7 +137,9 @@ class TowerStateView(APIView):
             'cooloff_until': (
                 cooloff_until.isoformat() if cooloff_until else None
             ),
-            'proximity_meters': team.session.game.proximity_meters,
+            # Effective capture radius: the tower's own override when
+            # set, else the Game default (zone-conquest-and-scoring-config).
+            'proximity_meters': effective_proximity(tower, team.session.game),
         })
 
 

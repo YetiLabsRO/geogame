@@ -147,11 +147,21 @@ def _make_zone(game, name="Zone A", scoring=Zone.SCORE_LIN, shape=None):
 
 
 def _make_tower(game, name="T", zone=None, lng=23.5, lat=46.5, is_active=True,
-                initial_bonus=0, category=Tower.CATEGORY_NORMAL, rfid_code=None):
+                initial_bonus=0, category=Tower.CATEGORY_NORMAL, rfid_code=None,
+                proximity_meters=None):
+    """Create a repository Tower attached to `game`'s default collection.
+
+    `zone` (single, for fixture convenience) is linked through the
+    many-to-many `zones` (tower-zone-topology); link further zones with
+    `tower.zones.add(...)`.
+    """
     tower = Tower.objects.create(
-        name=name, zone=zone, location=Point(lng, lat), is_active=is_active,
+        name=name, location=Point(lng, lat), is_active=is_active,
         category=category, initial_bonus=initial_bonus, rfid_code=rfid_code,
+        proximity_meters=proximity_meters,
     )
+    if zone is not None:
+        tower.zones.add(zone)
     _game_collection(game).towers.add(tower)
     return tower
 
@@ -3200,9 +3210,10 @@ class CollectionModelTest(TestCase):
             shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
         )
         tower = Tower.objects.create(
-            name='T', zone=zone, location=Point(23.5, 46.5),
+            name='T', location=Point(23.5, 46.5),
             is_active=True, category=Tower.CATEGORY_NORMAL,
         )
+        tower.zones.add(zone)
         collection.zones.add(zone)
         collection.towers.add(tower)
 
@@ -4619,3 +4630,808 @@ class TeammateVisibilitySelectCountTest(TestCase):
         response = self.client_a.get(reverse('api-location-live'))
         names = {p['username'] for p in response.data['players']}
         self.assertEqual(names, {'va', 'vb', 'vc'})
+
+
+# ---------------------------------------------------------------------------
+# zone-conquest-and-scoring-config — effective-value helpers (task 6.1)
+# ---------------------------------------------------------------------------
+
+
+class EffectiveValueHelpersTest(TestCase):
+    """Precedence of the three effective-value helpers.
+
+    Conquest rule: Zone > Session > Game. Proximity: Tower > Game.
+    Time unit: Session > Game. The all-defaults path reproduces the
+    historical behavior (MAJORITY, game-wide radius, MINUTE).
+    """
+
+    def setUp(self):
+        from game.models import (
+            effective_conquest_rule,
+            effective_proximity,
+            effective_time_unit,
+        )
+        self.effective_conquest_rule = effective_conquest_rule
+        self.effective_proximity = effective_proximity
+        self.effective_time_unit = effective_time_unit
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+
+    def test_conquest_rule_all_defaults_is_majority(self):
+        from organize.models import CONQUEST_RULE_MAJORITY
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=self.session),
+            CONQUEST_RULE_MAJORITY,
+        )
+
+    def test_conquest_rule_game_default(self):
+        from organize.models import CONQUEST_RULE_ALL
+        self.game.zone_conquest_rule = CONQUEST_RULE_ALL
+        self.game.save()
+        self.session.refresh_from_db()
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=self.session),
+            CONQUEST_RULE_ALL,
+        )
+
+    def test_conquest_rule_session_override_beats_game(self):
+        from organize.models import CONQUEST_RULE_ALL, CONQUEST_RULE_ANY
+        self.game.zone_conquest_rule = CONQUEST_RULE_ALL
+        self.game.save()
+        Session.objects.filter(pk=self.session.pk).update(
+            zone_conquest_rule=CONQUEST_RULE_ANY,
+        )
+        self.session.refresh_from_db()
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=self.session),
+            CONQUEST_RULE_ANY,
+        )
+
+    def test_conquest_rule_zone_override_wins(self):
+        from organize.models import CONQUEST_RULE_ALL, CONQUEST_RULE_ANY
+        Session.objects.filter(pk=self.session.pk).update(
+            zone_conquest_rule=CONQUEST_RULE_ANY,
+        )
+        self.session.refresh_from_db()
+        self.zone.conquest_rule = CONQUEST_RULE_ALL
+        self.zone.save()
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=self.session),
+            CONQUEST_RULE_ALL,
+        )
+
+    def test_conquest_rule_without_session_uses_game(self):
+        from organize.models import CONQUEST_RULE_ALL, CONQUEST_RULE_MAJORITY
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=None, game=self.game),
+            CONQUEST_RULE_MAJORITY,
+        )
+        self.game.zone_conquest_rule = CONQUEST_RULE_ALL
+        self.game.save()
+        self.assertEqual(
+            self.effective_conquest_rule(self.zone, session=None, game=self.game),
+            CONQUEST_RULE_ALL,
+        )
+
+    def test_proximity_game_default(self):
+        self.assertEqual(
+            self.effective_proximity(self.tower, self.game),
+            self.game.proximity_meters,
+        )
+
+    def test_proximity_tower_override_wins(self):
+        self.tower.proximity_meters = 500
+        self.tower.save()
+        self.assertEqual(self.effective_proximity(self.tower, self.game), 500)
+
+    def test_time_unit_game_default(self):
+        from organize.models import TIME_UNIT_MINUTE
+        self.assertEqual(
+            self.effective_time_unit(self.session), TIME_UNIT_MINUTE,
+        )
+
+    def test_time_unit_session_override(self):
+        from organize.models import TIME_UNIT_SECOND
+        Session.objects.filter(pk=self.session.pk).update(
+            score_time_unit=TIME_UNIT_SECOND,
+        )
+        self.session.refresh_from_db()
+        self.assertEqual(
+            self.effective_time_unit(self.session), TIME_UNIT_SECOND,
+        )
+
+
+# ---------------------------------------------------------------------------
+# zone-conquest-and-scoring-config — conquest rules (task 6.2)
+# ---------------------------------------------------------------------------
+
+
+class ConquestRuleTest(TestCase):
+    """ALL / MAJORITY / ANY control computation over a zone's members."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.t1 = _make_team(self.game, self.group, name='t1')
+        self.t2 = _make_team(self.game, self.group, name='t2')
+
+    def _towers(self, n):
+        return [
+            _make_tower(self.game, zone=self.zone, name=f'tw{i}', lng=23.5 + i / 100)
+            for i in range(n)
+        ]
+
+    def _controller_ids(self):
+        return set(self.zone.zone_control(self.group))
+
+    def test_all_rule_requires_every_active_tower(self):
+        from organize.models import CONQUEST_RULE_ALL
+        self.zone.conquest_rule = CONQUEST_RULE_ALL
+        self.zone.save()
+        t_a, t_b = self._towers(2)
+
+        t_a.assign_to_team(self.t1)
+        self.assertEqual(self._controller_ids(), set())
+
+        t_b.assign_to_team(self.t1)
+        self.assertEqual(self._controller_ids(), {self.t1.pk})
+
+    def test_all_rule_control_lost_when_a_tower_is_taken(self):
+        from organize.models import CONQUEST_RULE_ALL
+        self.zone.conquest_rule = CONQUEST_RULE_ALL
+        self.zone.save()
+        t_a, t_b = self._towers(2)
+        t_a.assign_to_team(self.t1)
+        t_b.assign_to_team(self.t1)
+        self.assertEqual(self._controller_ids(), {self.t1.pk})
+
+        # t2 takes one tower: nobody holds ALL of them any more.
+        t_b.assign_to_team(self.t2)
+        self.assertEqual(self._controller_ids(), set())
+        closed = TeamZoneOwnership.objects.get(zone=self.zone, team=self.t1)
+        self.assertIsNotNone(closed.timestamp_end)
+
+    def test_majority_rule_matches_prechange_behavior(self):
+        # Default rule (no overrides anywhere) — the historical
+        # most-towers computation, retained verbatim.
+        towers = self._towers(3)
+        towers[0].assign_to_team(self.t1)
+        towers[1].assign_to_team(self.t1)
+        towers[2].assign_to_team(self.t2)
+        self.assertEqual(self._controller_ids(), {self.t1.pk})
+
+    def test_any_rule_grants_on_single_tower(self):
+        from organize.models import CONQUEST_RULE_ANY
+        self.zone.conquest_rule = CONQUEST_RULE_ANY
+        self.zone.save()
+        t_a, _ = self._towers(2)
+        t_a.assign_to_team(self.t1)
+        self.assertEqual(self._controller_ids(), {self.t1.pk})
+
+    def test_any_rule_most_towers_wins(self):
+        from organize.models import CONQUEST_RULE_ANY
+        self.zone.conquest_rule = CONQUEST_RULE_ANY
+        self.zone.save()
+        t_a, t_b, t_c = self._towers(3)
+        t_a.assign_to_team(self.t1)
+        t_b.assign_to_team(self.t2)
+        t_c.assign_to_team(self.t2)
+        self.assertEqual(self._controller_ids(), {self.t2.pk})
+
+    def test_any_rule_tie_breaks_by_most_recent_capture(self):
+        from organize.models import CONQUEST_RULE_ANY
+        self.zone.conquest_rule = CONQUEST_RULE_ANY
+        self.zone.save()
+        t_a, t_b = self._towers(2)
+        t_a.assign_to_team(self.t1)
+        t_b.assign_to_team(self.t2)
+        # 1 tower each — the more recent capture (t2's) wins the zone.
+        self.assertEqual(self._controller_ids(), {self.t2.pk})
+        closed = TeamZoneOwnership.objects.get(zone=self.zone, team=self.t1)
+        self.assertIsNotNone(closed.timestamp_end)
+
+    def test_session_override_applies_when_zone_unset(self):
+        from organize.models import CONQUEST_RULE_ALL
+        session = _default_session(self.game)
+        Session.objects.filter(pk=session.pk).update(
+            zone_conquest_rule=CONQUEST_RULE_ALL,
+        )
+        # Re-fetch: the setUp team instance caches its (stale) session.
+        self.t1 = Team.objects.get(pk=self.t1.pk)
+        t_a, _ = self._towers(2)
+        t_a.assign_to_team(self.t1)
+        # 1 of 2 towers: MAJORITY would grant, ALL does not.
+        self.assertEqual(self._controller_ids(), set())
+
+
+# ---------------------------------------------------------------------------
+# zone-conquest-and-scoring-config — scoring time unit (task 6.3)
+# ---------------------------------------------------------------------------
+
+
+class ScoreTimeUnitTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.team = _make_team(self.game, self.group)
+
+    def test_minute_default_reproduces_historical_scores(self):
+        from organize.models import TIME_UNIT_MINUTE
+        # 600 seconds → 10 minutes → LINEAR gives 10 points, exactly as
+        # before the change (regression).
+        self.assertAlmostEqual(self.zone.get_score(600), 10.0)
+        self.assertAlmostEqual(
+            self.zone.get_score(600, time_unit=TIME_UNIT_MINUTE), 10.0,
+        )
+
+    def test_second_unit_scales_duration(self):
+        from organize.models import TIME_UNIT_SECOND
+        self.assertAlmostEqual(
+            self.zone.get_score(600, time_unit=TIME_UNIT_SECOND), 600.0,
+        )
+
+    def test_hour_unit_scales_duration(self):
+        from organize.models import TIME_UNIT_HOUR
+        self.assertAlmostEqual(
+            self.zone.get_score(7200, time_unit=TIME_UNIT_HOUR), 2.0,
+        )
+
+    def test_nonlinear_formulas_use_converted_units(self):
+        from organize.models import TIME_UNIT_HOUR
+        self.zone.scoring_type = Zone.SCORE_EXP
+        # 2 hours → units=2 → 2^2/140 + 10.
+        self.assertAlmostEqual(
+            self.zone.get_score(7200, time_unit=TIME_UNIT_HOUR),
+            2 ** 2 / 140 + 10,
+        )
+
+    def _backdated_ownership(self, seconds):
+        ownership = TeamZoneOwnership.objects.create(zone=self.zone, team=self.team)
+        TeamZoneOwnership.objects.filter(pk=ownership.pk).update(
+            timestamp_start=timezone.now() - timedelta(seconds=seconds),
+        )
+        ownership.refresh_from_db()
+        return ownership
+
+    def test_ownership_score_defaults_to_minutes(self):
+        ownership = self._backdated_ownership(600)
+        self.assertAlmostEqual(ownership.get_score(), 10.0, places=1)
+
+    def test_ownership_score_honors_session_override(self):
+        from organize.models import TIME_UNIT_SECOND
+        Session.objects.filter(pk=self.team.session_id).update(
+            score_time_unit=TIME_UNIT_SECOND,
+        )
+        ownership = self._backdated_ownership(600)
+        self.assertAlmostEqual(ownership.get_score(), 600.0, delta=2.0)
+
+
+# ---------------------------------------------------------------------------
+# zone-conquest-and-scoring-config — per-tower proximity (task 6.4)
+# ---------------------------------------------------------------------------
+
+
+class ProximityOverrideTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        # Two towers at the same point: one inherits the game-wide 50m
+        # default, the other overrides its radius to 5km.
+        self.tower_default = _make_tower(
+            self.game, zone=self.zone, name='default', lng=23.5, lat=46.5,
+        )
+        self.tower_wide = _make_tower(
+            self.game, zone=self.zone, name='wide', lng=23.5, lat=46.5,
+            proximity_meters=5000,
+        )
+        self.team = _make_team(self.game, self.group)
+        self.challenge_default = Challenge.objects.create(
+            text='c1', tower=self.tower_default, difficulty=1,
+        )
+        self.challenge_wide = Challenge.objects.create(
+            text='c2', tower=self.tower_wide, difficulty=1,
+        )
+        self.client, self.user = _authed_client(self.team)
+        # ~1km north of both towers.
+        self.far_lat = 46.5 + 1000 / 111_111.0
+
+    def test_submission_accepted_within_tower_override_radius(self):
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower_wide.pk,
+                'challenge': self.challenge_wide.pk,
+                'lat': self.far_lat,
+                'lng': 23.5,
+                'photo': _tiny_png_b64(),
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_sibling_tower_still_uses_game_default(self):
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower_default.pk,
+                'challenge': self.challenge_default.pk,
+                'lat': self.far_lat,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_towers_endpoint_uses_per_tower_radius(self):
+        resp = self.client.get(
+            '/api/towers/',
+            {'lat': self.far_lat, 'lng': 23.5, 'accuracy': 10000},
+        )
+        self.assertEqual(resp.status_code, 200)
+        ids = [t['id'] for t in resp.json()]
+        self.assertIn(self.tower_wide.id, ids)
+        self.assertNotIn(self.tower_default.id, ids)
+
+    def test_towers_endpoint_default_radius_unchanged(self):
+        # Right at the towers, both are inside their effective radius.
+        resp = self.client.get(
+            '/api/towers/',
+            {'lat': 46.5, 'lng': 23.5, 'accuracy': 50},
+        )
+        ids = [t['id'] for t in resp.json()]
+        self.assertIn(self.tower_default.id, ids)
+        self.assertIn(self.tower_wide.id, ids)
+
+    def test_tower_state_reports_effective_proximity(self):
+        resp = self.client.get(f'/api/towers/{self.tower_wide.pk}/state/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['proximity_meters'], 5000)
+        resp = self.client.get(f'/api/towers/{self.tower_default.pk}/state/')
+        self.assertEqual(
+            resp.json()['proximity_meters'], self.game.proximity_meters,
+        )
+
+
+# ---------------------------------------------------------------------------
+# zone-conquest-and-scoring-config — staff API knobs (tasks 4.1–4.3) and
+# migration/defaults parity (task 6.5)
+# ---------------------------------------------------------------------------
+
+
+class ConquestConfigApiTest(TestCase):
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.session = _default_session(self.game)
+        self.client, self.staff = _staff_client(session=self.session)
+
+    def test_game_defaults_editable(self):
+        resp = self.client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'zone_conquest_rule': 'ALL', 'score_time_unit': 'HOUR'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.game.refresh_from_db()
+        self.assertEqual(self.game.zone_conquest_rule, 'ALL')
+        self.assertEqual(self.game.score_time_unit, 'HOUR')
+
+    def test_invalid_choice_rejected(self):
+        resp = self.client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'zone_conquest_rule': 'SOMETIMES'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'score_time_unit': 'FORTNIGHT'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_session_overrides_nullable(self):
+        resp = self.client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'zone_conquest_rule': 'ANY', 'score_time_unit': 'SECOND'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.effective('zone_conquest_rule'), 'ANY')
+        self.assertEqual(self.session.effective('score_time_unit'), 'SECOND')
+
+        # Clearing back to null re-inherits the Game defaults.
+        resp = self.client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'zone_conquest_rule': None, 'score_time_unit': None},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.session.refresh_from_db()
+        self.assertEqual(self.session.effective('zone_conquest_rule'), 'MAJORITY')
+        self.assertEqual(self.session.effective('score_time_unit'), 'MINUTE')
+
+    def test_zone_conquest_rule_editable(self):
+        resp = self.client.patch(
+            f'/api/staff/zones/{self.zone.id}/',
+            {'conquest_rule': 'ALL'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.zone.refresh_from_db()
+        self.assertEqual(self.zone.conquest_rule, 'ALL')
+
+    def test_tower_proximity_editable(self):
+        resp = self.client.patch(
+            f'/api/staff/towers/{self.tower.id}/',
+            {'proximity_meters': 120},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.tower.refresh_from_db()
+        self.assertEqual(self.tower.proximity_meters, 120)
+
+
+class DefaultsParityTest(TestCase):
+    """Task 6.5 — an untouched Game/Session keeps the historical behavior.
+
+    All new knobs default to values that reproduce pre-change results:
+    MAJORITY control, game-wide proximity, minute-based accrual.
+    """
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.session = _default_session(self.game)
+
+    def test_field_defaults(self):
+        self.assertEqual(self.game.zone_conquest_rule, 'MAJORITY')
+        self.assertEqual(self.game.score_time_unit, 'MINUTE')
+        self.assertIsNone(self.session.zone_conquest_rule)
+        self.assertIsNone(self.session.score_time_unit)
+        self.assertIsNone(self.zone.conquest_rule)
+        tower = _make_tower(self.game, zone=self.zone)
+        self.assertIsNone(tower.proximity_meters)
+
+    def test_control_and_scores_identical_to_prechange(self):
+        t1 = _make_team(self.game, self.group, name='a')
+        t2 = _make_team(self.game, self.group, name='b')
+        towers = [
+            _make_tower(self.game, zone=self.zone, name=f'p{i}', lng=23.5 + i / 100)
+            for i in range(3)
+        ]
+        towers[0].assign_to_team(t1)
+        towers[1].assign_to_team(t1)
+        towers[2].assign_to_team(t2)
+        # Pre-change majority outcome.
+        self.assertEqual(set(self.zone.zone_control(self.group)), {t1.pk})
+        # Pre-change minute-based floating score.
+        ownership = TeamZoneOwnership.objects.get(
+            zone=self.zone, team=t1, timestamp_end__isnull=True,
+        )
+        TeamZoneOwnership.objects.filter(pk=ownership.pk).update(
+            timestamp_start=timezone.now() - timedelta(minutes=10),
+        )
+        ownership.refresh_from_db()
+        self.assertAlmostEqual(ownership.get_score(), 10.0, places=1)
+
+
+# ---------------------------------------------------------------------------
+# tower-zone-topology — many-to-many membership (tasks 7.1–7.5)
+# ---------------------------------------------------------------------------
+
+
+class TowerZonesDataMigrationTest(TransactionTestCase):
+    """Task 7.1 — the data migration copies each single-FK link into the
+    many-to-many and keeps (reports, never deletes) empty zones."""
+
+    migrate_from = [('game', '0027_tower_zones_m2m')]
+    migrate_to = [('game', '0028_copy_tower_zone_to_zones')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_single_fk_links_copied_and_empty_zones_kept(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldZone = old_apps.get_model('game', 'Zone')
+        OldTower = old_apps.get_model('game', 'Tower')
+
+        bbox = Polygon.from_bbox((23.0, 46.0, 24.0, 47.0))
+        linked = OldZone.objects.create(
+            name='Linked', scoring_type=3, shape=bbox, color='#000000',
+        )
+        empty = OldZone.objects.create(
+            name='Empty', scoring_type=3, shape=bbox, color='#000000',
+        )
+        tower = OldTower.objects.create(
+            name='T', zone=linked, location=Point(23.5, 46.5),
+            is_active=True, category=1,
+        )
+
+        new_apps = self._migrate(self.migrate_to)
+        NewZone = new_apps.get_model('game', 'Zone')
+        NewTower = new_apps.get_model('game', 'Tower')
+
+        migrated = NewTower.objects.get(pk=tower.pk)
+        self.assertEqual(
+            list(migrated.zones.values_list('pk', flat=True)), [linked.pk],
+        )
+        # The empty zone is reported, never deleted.
+        self.assertTrue(NewZone.objects.filter(pk=empty.pk).exists())
+
+
+class OverlappingZonesTest(TestCase):
+    """Task 7.2 — overlapping zones are evaluated independently."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team_a = _make_team(self.game, self.group, name='A')
+        self.team_b = _make_team(self.game, self.group, name='B', color='#663300')
+        self.z1 = _make_zone(self.game, name='Z1', scoring=Zone.SCORE_LIN)
+        self.z2 = _make_zone(self.game, name='Z2', scoring=Zone.SCORE_LIN)
+        # Shared tower belongs to BOTH zones; z2 has two more members.
+        self.shared = _make_tower(self.game, zone=self.z1, name='shared')
+        self.shared.zones.add(self.z2)
+        self.t2 = _make_tower(self.game, zone=self.z2, name='t2', lng=23.6)
+        self.t3 = _make_tower(self.game, zone=self.z2, name='t3', lng=23.7)
+
+    def test_capture_recomputes_each_zone_independently(self):
+        self.t2.assign_to_team(self.team_b)
+        self.t3.assign_to_team(self.team_b)
+        self.shared.assign_to_team(self.team_a)
+
+        # Z1 (only the shared tower): team A controls it.
+        self.assertEqual(
+            set(self.z1.zone_control(self.group)), {self.team_a.pk},
+        )
+        # Z2 (B holds 2 of 3): team B keeps control — A won one
+        # overlapping zone but not the other.
+        self.assertEqual(
+            set(self.z2.zone_control(self.group)), {self.team_b.pk},
+        )
+
+
+class ZoneInvariantTest(TestCase):
+    """Task 7.3 — every zone retains at least one member tower."""
+
+    def setUp(self):
+        from django.core.exceptions import ValidationError
+        self.ValidationError = ValidationError
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.t1 = _make_tower(self.game, zone=self.zone, name='t1')
+        self.t2 = _make_tower(self.game, zone=self.zone, name='t2', lng=23.6)
+
+    def test_removing_non_last_member_is_allowed(self):
+        self.t1.zones.remove(self.zone)
+        self.assertEqual(self.zone.towers.count(), 1)
+
+    def test_removing_last_member_is_rejected(self):
+        from django.db import transaction
+        self.t1.zones.remove(self.zone)
+        with self.assertRaises(self.ValidationError), transaction.atomic():
+            self.t2.zones.remove(self.zone)
+        self.assertEqual(self.zone.towers.count(), 1)
+
+    def test_clearing_zone_members_is_rejected(self):
+        from django.db import transaction
+        with self.assertRaises(self.ValidationError), transaction.atomic():
+            self.zone.towers.clear()
+        self.assertEqual(self.zone.towers.count(), 2)
+
+    def test_deleting_last_member_tower_is_rejected(self):
+        from django.db import transaction
+        self.t1.delete()
+        with self.assertRaises(self.ValidationError), transaction.atomic():
+            self.t2.delete()
+        self.assertTrue(Tower.objects.filter(pk=self.t2.pk).exists())
+
+    def test_zone_clean_rejects_empty_zone(self):
+        self.t1.zones.remove(self.zone)
+        # Bypass the guard to simulate a legacy empty zone.
+        self.zone.towers.through.objects.filter(zone=self.zone).delete()
+        with self.assertRaises(self.ValidationError):
+            self.zone.clean()
+
+    def test_zone_delete_itself_is_allowed(self):
+        # Deleting the zone removes the memberships with it — the
+        # invariant constrains emptying a zone, not deleting it.
+        self.zone.delete()
+        self.assertFalse(Zone.objects.filter(pk=self.zone.pk).exists())
+        self.assertTrue(Tower.objects.filter(pk=self.t1.pk).exists())
+
+
+class LogicalNotSpatialTest(TestCase):
+    """Task 7.4 — membership is an explicit link, never geometry."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        # Zone polygon spans (23..24, 46..47).
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+
+    def test_tower_outside_polygon_still_contributes_when_linked(self):
+        outside = _make_tower(
+            self.game, zone=self.zone, name='outside', lng=30.0, lat=50.0,
+        )
+        outside.assign_to_team(self.team)
+        self.assertEqual(
+            set(self.zone.zone_control(self.group)), {self.team.pk},
+        )
+
+    def test_tower_inside_polygon_is_never_auto_added(self):
+        inside = _make_tower(self.game, name='inside', lng=23.5, lat=46.5)
+        self.assertEqual(inside.zones.count(), 0)
+        inside.assign_to_team(self.team)
+        # No membership → no control contribution.
+        self.assertEqual(set(self.zone.zone_control(self.group)), set())
+
+
+class UnassignAcrossZonesTest(TestCase):
+    """Task 7.5 — deactivating a tower recomputes all of its zones."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team_a = _make_team(self.game, self.group, name='A')
+        self.team_b = _make_team(self.game, self.group, name='B', color='#663300')
+        self.z1 = _make_zone(self.game, name='Z1', scoring=Zone.SCORE_LIN)
+        self.z2 = _make_zone(self.game, name='Z2', scoring=Zone.SCORE_LIN)
+        self.shared = _make_tower(self.game, zone=self.z1, name='shared')
+        self.shared.zones.add(self.z2)
+        self.other = _make_tower(self.game, zone=self.z2, name='other', lng=23.6)
+
+    def test_deactivation_closes_and_reopens_across_all_zones(self):
+        self.shared.assign_to_team(self.team_a)
+        self.other.assign_to_team(self.team_b)
+        # Z1 → A. Z2 → tie (1–1) keeps both (historical plurality).
+        self.assertEqual(set(self.z1.zone_control(self.group)), {self.team_a.pk})
+        self.assertEqual(
+            set(self.z2.zone_control(self.group)),
+            {self.team_a.pk, self.team_b.pk},
+        )
+
+        self.shared.is_active = False
+        self.shared.save()
+
+        # Z1 has no active members left: every ownership closed.
+        self.assertEqual(set(self.z1.zone_control(self.group)), set())
+        # Z2 recomputed: only B still holds a member tower.
+        self.assertEqual(set(self.z2.zone_control(self.group)), {self.team_b.pk})
+        closed = TeamZoneOwnership.objects.get(zone=self.z2, team=self.team_a)
+        self.assertIsNotNone(closed.timestamp_end)
+
+
+class AutocreateZoneTest(TestCase):
+    """Autocreate-circle-zone adds to the tower's zones set (task 1.3)."""
+
+    def setUp(self):
+        self.game = _make_game()
+
+    def test_autocreate_zone_added_to_set(self):
+        tower = Tower.objects.create(
+            name='Solo', location=Point(23.5, 46.5), is_active=True,
+            category=Tower.CATEGORY_NORMAL, autocreate_zone=True,
+        )
+        zones = list(tower.zones.all())
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0].name, 'Solo - zone')
+        # Founding member — the invariant holds from creation.
+        self.assertEqual(zones[0].towers.count(), 1)
+
+    def test_autocreate_is_idempotent(self):
+        tower = Tower.objects.create(
+            name='Solo', location=Point(23.5, 46.5), is_active=True,
+            category=Tower.CATEGORY_NORMAL, autocreate_zone=True,
+        )
+        tower.save()
+        self.assertEqual(tower.zones.count(), 1)
+
+    def test_no_autocreate_when_tower_has_zones(self):
+        zone = _make_zone(self.game)
+        tower = _make_tower(self.game, zone=zone)
+        tower.autocreate_zone = True
+        tower.save()
+        self.assertEqual(
+            list(tower.zones.values_list('pk', flat=True)), [zone.pk],
+        )
+
+    def test_autocreated_zone_joins_tower_collections(self):
+        tower = Tower.objects.create(
+            name='Solo', location=Point(23.5, 46.5), is_active=True,
+            category=Tower.CATEGORY_NORMAL,
+        )
+        collection = _game_collection(self.game)
+        collection.towers.add(tower)
+        tower.autocreate_zone = True
+        tower.save()
+        zone = tower.zones.get()
+        self.assertIn(collection.pk, zone.collections.values_list('pk', flat=True))
+
+
+class TopologyApiTest(TestCase):
+    """Tasks 4.1–4.2 — serializers and staff filters over the M2M."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.z1 = _make_zone(self.game, name='Z1')
+        self.z2 = _make_zone(self.game, name='Z2')
+        self.tower = _make_tower(self.game, zone=self.z1)
+        self.keeper = _make_tower(self.game, zone=self.z2, name='keeper', lng=23.6)
+        self.team = _make_team(self.game, self.group)
+        self.session = _default_session(self.game)
+        self.player_client, _ = _authed_client(self.team, username='mapviewer')
+        self.staff_client, _ = _staff_client(session=self.session)
+
+    def test_player_tower_payload_lists_zones(self):
+        self.tower.zones.add(self.z2)
+        resp = self.player_client.get('/api/towers/')
+        self.assertEqual(resp.status_code, 200)
+        payload = next(t for t in resp.json() if t['id'] == self.tower.id)
+        self.assertNotIn('zone', payload)
+        self.assertEqual(set(payload['zones']), {self.z1.pk, self.z2.pk})
+
+    def test_staff_tower_zones_editable(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/towers/{self.tower.id}/',
+            {'zones': [self.z1.pk, self.z2.pk]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(
+            set(self.tower.zones.values_list('pk', flat=True)),
+            {self.z1.pk, self.z2.pk},
+        )
+
+    def test_staff_tower_update_rejects_emptying_a_zone(self):
+        resp = self.staff_client.patch(
+            f'/api/staff/towers/{self.tower.id}/',
+            {'zones': []},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.z1.towers.count(), 1)
+
+    def test_staff_tower_delete_rejected_for_last_member(self):
+        resp = self.staff_client.delete(f'/api/staff/towers/{self.tower.id}/')
+        self.assertEqual(resp.status_code, 400)
+        self.assertTrue(Tower.objects.filter(pk=self.tower.pk).exists())
+
+    def test_staff_zone_lists_member_towers(self):
+        resp = self.staff_client.get('/api/staff/zones/')
+        self.assertEqual(resp.status_code, 200)
+        z1 = next(z for z in resp.json() if z['id'] == self.z1.pk)
+        self.assertEqual(
+            [t['id'] for t in z1['towers']], [self.tower.pk],
+        )
+
+    def test_staff_filters_by_membership(self):
+        resp = self.staff_client.get('/api/staff/towers/', {'zone': self.z1.pk})
+        self.assertEqual(
+            [t['id'] for t in resp.json()], [self.tower.pk],
+        )
+        resp = self.staff_client.get('/api/staff/zones/', {'tower': self.keeper.pk})
+        self.assertEqual(
+            [z['id'] for z in resp.json()], [self.z2.pk],
+        )

@@ -10,6 +10,7 @@ from game.models import (
     TeamTowerFailCounter,
     Tower,
     Zone,
+    effective_proximity,
 )
 from organize.models import Team
 
@@ -29,7 +30,7 @@ class TowerLockedError(APIException):
 class ZoneSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Zone
-        fields = ["name", "color", "scoring_type", "shape", "team_color"]
+        fields = ["name", "color", "scoring_type", "shape", "team_color", "conquest_rule"]
 
     team_color = serializers.SerializerMethodField()
 
@@ -48,8 +49,14 @@ class ZoneSerializer(serializers.HyperlinkedModelSerializer):
 class TowerSerializer(serializers.HyperlinkedModelSerializer):
     class Meta:
         model = Tower
-        fields = ["name", "location", "zone", "category", "is_active", "ownership", "id", "has_initial_bonus"]
+        fields = [
+            "name", "location", "zones", "category", "is_active",
+            "ownership", "id", "has_initial_bonus", "proximity_meters",
+        ]
 
+    # Many-to-many zone membership (tower-zone-topology): a list of zone
+    # ids, never a single zone.
+    zones = serializers.PrimaryKeyRelatedField(many=True, read_only=True)
     ownership = serializers.SerializerMethodField()
     has_initial_bonus = serializers.SerializerMethodField()
 
@@ -240,7 +247,9 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Dacă nu ești la turn, nu poți face provocarea!")
 
         point = Point(attrs['lng'], attrs['lat'])
-        proximity = attrs['_team'].session.game.proximity_meters
+        # Per-tower capture radius when set, else the game-wide default
+        # (zone-conquest-and-scoring-config: effective proximity).
+        proximity = effective_proximity(tower, attrs['_team'].session.game)
         if not Tower.objects.filter(
             pk=tower.id,
             location__distance_lte=(point, Distance(m=proximity)),

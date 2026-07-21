@@ -29,6 +29,33 @@ BUILTIN_POWER_CHOICES = [
     (BUILTIN_POWER_INVITER, 'Inviter — may invite players into their team'),
 ]
 
+# Zone conquest rules (zone-conquest-and-scoring-config). MAJORITY is the
+# historical behavior and the default everywhere.
+CONQUEST_RULE_ALL = 'ALL'
+CONQUEST_RULE_MAJORITY = 'MAJORITY'
+CONQUEST_RULE_ANY = 'ANY'
+CONQUEST_RULE_CHOICES = [
+    (CONQUEST_RULE_ALL, 'All towers — a team must hold every active member tower'),
+    (CONQUEST_RULE_MAJORITY, 'Majority of towers (default, historical behavior)'),
+    (CONQUEST_RULE_ANY, 'Any tower — most towers wins, ties broken by most recent capture'),
+]
+
+# Scoring time units (zone-conquest-and-scoring-config). The zone score
+# functions accrue per this unit; MINUTE reproduces historical scores.
+TIME_UNIT_SECOND = 'SECOND'
+TIME_UNIT_MINUTE = 'MINUTE'
+TIME_UNIT_HOUR = 'HOUR'
+TIME_UNIT_CHOICES = [
+    (TIME_UNIT_SECOND, 'Seconds'),
+    (TIME_UNIT_MINUTE, 'Minutes (default, historical behavior)'),
+    (TIME_UNIT_HOUR, 'Hours'),
+]
+TIME_UNIT_SECONDS = {
+    TIME_UNIT_SECOND: 1,
+    TIME_UNIT_MINUTE: 60,
+    TIME_UNIT_HOUR: 3600,
+}
+
 # Team-join confirmation policies (player-team-formation).
 JOIN_CONFIRM_AUTO_APPROVE = 'AUTO_APPROVE'
 JOIN_CONFIRM_CAPTAIN = 'CAPTAIN'
@@ -101,6 +128,9 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'teammate_visibility_mode',
     'teammate_visibility_count',
     'presence_window_seconds',
+    # Zone-conquest & scoring knobs (zone-conquest-and-scoring-config).
+    'zone_conquest_rule',
+    'score_time_unit',
 )
 
 
@@ -151,6 +181,21 @@ class Game(models.Model):
         max_length=32,
         choices=FAIL_RESET_CHOICES,
         default=FAIL_RESET_TOWER_SUCCESS_ONLY,
+    )
+
+    # --- zone-conquest-and-scoring-config knobs. Defaults reproduce the
+    # historical behavior (strict-majority control, minute-based score
+    # accrual); overridable per Session (see Session.effective) and, for
+    # the conquest rule, per Zone (game.Zone.conquest_rule). ---
+    zone_conquest_rule = models.CharField(
+        max_length=16,
+        choices=CONQUEST_RULE_CHOICES,
+        default=CONQUEST_RULE_MAJORITY,
+    )
+    score_time_unit = models.CharField(
+        max_length=8,
+        choices=TIME_UNIT_CHOICES,
+        default=TIME_UNIT_MINUTE,
     )
 
     # --- Team-composition rules. Minima default to 1, maxima use 0 to
@@ -544,6 +589,15 @@ class Session(models.Model):
     )
     allow_player_team_creation = models.BooleanField(null=True, blank=True)
 
+    # --- zone-conquest-and-scoring-config overrides. NULL means
+    # "inherit the Game default". ---
+    zone_conquest_rule = models.CharField(
+        max_length=16, choices=CONQUEST_RULE_CHOICES, null=True, blank=True,
+    )
+    score_time_unit = models.CharField(
+        max_length=8, choices=TIME_UNIT_CHOICES, null=True, blank=True,
+    )
+
     # --- Team-composition overrides. NULL means "inherit the Game
     # default"; a 0 maximum means "explicitly no cap". ---
     min_teams = models.PositiveSmallIntegerField(null=True, blank=True)
@@ -720,7 +774,9 @@ class Session(models.Model):
         zone_ownerships = list(
             TeamZoneOwnership.objects
             .filter(team_id__in=team_ids, timestamp_end__isnull=True)
-            .select_related('team', 'zone')
+            # team__session__game: get_score resolves the effective
+            # scoring time unit through the owning team's Session.
+            .select_related('team__session__game', 'zone')
         )
         for zone_ownership in zone_ownerships:
             zone_ownership.timestamp_end = now
