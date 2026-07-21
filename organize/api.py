@@ -525,9 +525,13 @@ class SessionScoreboardView(APIView):
             for t in teams
         ]
         entries.sort(key=lambda e: (-e['current_score'], e['team_name']))
+        # score-multipliers: what is boosted right now, so scoreboards
+        # can badge "x2 everywhere" / "x2 at Old Tower".
+        from game.multipliers_api import active_multiplier_payload
         return Response({
             'session': CurrentSessionSerializer(session).data,
             'entries': entries,
+            'active_multipliers': active_multiplier_payload(session),
         })
 
 

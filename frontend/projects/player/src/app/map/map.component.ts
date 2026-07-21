@@ -17,6 +17,7 @@ import { forkJoin } from 'rxjs';
 import * as L from 'leaflet';
 
 import {
+  ActiveMultiplier,
   CurrentSession,
   GameApiService,
   LivePlayer,
@@ -37,6 +38,8 @@ const FALLBACK_ZOOM = 17;
 const LIVE_POLL_MIN_SECONDS = 10;
 /** Poll interval used only while the realtime socket is down. */
 const FALLBACK_POLL_MS = 30_000;
+/** Poll interval for the active-multiplier boost banner. */
+const BOOST_POLL_MS = 60_000;
 
 @Component({
   selector: 'app-map',
@@ -61,6 +64,16 @@ const FALLBACK_POLL_MS = 30_000;
           </div>
         }
       </div>
+      @if (boosts().length > 0) {
+        <div class="boost-banner">
+          @for (b of boosts(); track b.id) {
+            <div class="badge text-bg-warning d-block text-start mb-1">
+              <i class="bi bi-lightning-charge-fill"></i>
+              &times;{{ b.factor }} points {{ boostTarget(b) }}
+            </div>
+          }
+        </div>
+      }
       <div class="map" #mapContainer></div>
       @if (errorMessage(); as msg) {
         <div class="alert alert-warning map-error">{{ msg }}</div>
@@ -82,9 +95,19 @@ const FALLBACK_POLL_MS = 30_000;
       border-radius: 0.375rem;
     }
     .map-error,
-    .badges {
+    .badges,
+    .boost-banner {
       position: absolute;
       z-index: 1000;
+    }
+    .boost-banner {
+      top: 0.75rem;
+      left: 3.25rem;
+      max-width: 60%;
+    }
+    .boost-banner .badge {
+      font-size: 0.85rem;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
     }
     .badges {
       top: 0.75rem;
@@ -118,6 +141,8 @@ export class MapComponent {
 
   protected readonly mapContainer = viewChild.required<ElementRef<HTMLDivElement>>('mapContainer');
   protected readonly errorMessage = signal<string | null>(null);
+  /** Multipliers in effect right now — "Double points" banner (5.3). */
+  protected readonly boosts = signal<ActiveMultiplier[]>([]);
   protected readonly groupSlug = computed(
     () => this.route.snapshot.paramMap.get('slug') ?? null,
   );
@@ -195,6 +220,7 @@ export class MapComponent {
         // Open the live socket (skipped when realtime is disabled for
         // the session — polling then remains the update path).
         this.realtime.connect(session.id, session.realtime_enabled);
+        this.watchBoosts(session.id);
       },
       error: (err) => {
         // 404 (no session) and 409 (multiple candidates) mean the
@@ -350,6 +376,25 @@ export class MapComponent {
       fillColor: fill,
       fillOpacity: unheld ? 0.05 : 0.35,
     });
+  }
+
+  /** Poll the in-effect multipliers so the banner tracks live boosts. */
+  private watchBoosts(sessionId: number): void {
+    const load = () =>
+      this.api.sessionActiveMultipliers(sessionId).subscribe({
+        next: (list) => this.boosts.set(list),
+        error: () => {},
+      });
+    load();
+    const handle = setInterval(load, BOOST_POLL_MS);
+    this.destroyRef.onDestroy(() => clearInterval(handle));
+  }
+
+  protected boostTarget(b: ActiveMultiplier): string {
+    if (b.label) return `— ${b.label}`;
+    if (b.scope === 'TOWER') return `at ${b.tower_name}`;
+    if (b.scope === 'ZONE') return `in ${b.zone_name}`;
+    return 'everywhere';
   }
 
   // ---- rendering -----------------------------------------------------------

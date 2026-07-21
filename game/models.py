@@ -7,7 +7,7 @@ from django.conf import settings
 from django.contrib.gis.db import models
 from django.core.exceptions import ValidationError
 from django.db import transaction
-from django.db.models import Count, F, Max, Value
+from django.db.models import Count, F, Max, Q, Value
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, pre_delete
 
@@ -284,6 +284,13 @@ class Tower(models.Model):
                 while previous_tower_ownerships > 0:
                     bonus = bonus / 2.
                     previous_tower_ownerships -= 1
+            # score-multipliers: scale the base bonus by the tower's
+            # effective factor at capture time. With no multiplier the
+            # factor is exactly 1.0 and the bonus (and its max(..., 1)
+            # floor) is unchanged.
+            factor = effective_tower_factor(team.session, self)
+            if factor != 1.0:
+                bonus = bonus * factor
             team.update_score(max(bonus, 1))
 
         handover_time = datetime.now(timezone.utc)
@@ -1091,10 +1098,18 @@ class TeamZoneOwnership(models.Model):
         score_time = (ref_time - self.timestamp_start).seconds
         # Accrue in the Session's effective scoring time unit; the
         # MINUTE default reproduces historical scores exactly.
-        return self.zone.get_score(
+        base = self.zone.get_score(
             seconds=score_time,
             time_unit=effective_time_unit(self.team.session),
         )
+        # score-multipliers: floating points are the base curve value
+        # times the zone's effective factor at the evaluation instant;
+        # a finalized (closed) window uses the factor at close time.
+        # With no multiplier the factor is exactly 1.0 (identity).
+        factor = effective_zone_factor(self.team.session, self.zone, at=ref_time)
+        if factor != 1.0:
+            return base * factor
+        return base
 
     def __str__(self):
         data = (self.team, self.get_score(), self.zone)
@@ -2097,3 +2112,226 @@ class TeamTowerFailCounter(models.Model):
         if self.locked_until is None:
             return False
         return self.locked_until > (now or _now())
+
+
+class ScoreMultiplier(models.Model):
+    """A time/place-based scoring modifier (score-multipliers capability).
+
+    Multiplies a tower's or zone's worth (or every target, for GLOBAL
+    scope) by `factor` while in effect. Owned by exactly one of a Game
+    (template-level — applies to every Session of that game) or a single
+    Session (run-level). Factors COMPOSE multiplicatively across scopes
+    (global x zone / global x tower); with no rows the effective factor
+    is exactly 1.0, preserving pre-change scoring byte-for-byte.
+
+    Windows are typed to the multiplier type: SCHEDULED uses
+    Session-relative offsets (resolved against `Session.start_time`, so
+    a template arc replays on every run); MANUAL / RANDOM_BONUS use
+    absolute `starts_at`/`ends_at` (unset bound = open on that side).
+    The factor is applied at the evaluation instant — no time
+    integration across windows (documented non-goal).
+    """
+
+    SCOPE_TOWER = 'TOWER'
+    SCOPE_ZONE = 'ZONE'
+    SCOPE_GLOBAL = 'GLOBAL'
+    SCOPE_CHOICES = [
+        (SCOPE_TOWER, 'One tower'),
+        (SCOPE_ZONE, 'One zone'),
+        (SCOPE_GLOBAL, 'Whole game'),
+    ]
+
+    TYPE_MANUAL = 'MANUAL'
+    TYPE_SCHEDULED = 'SCHEDULED'
+    TYPE_RANDOM_BONUS = 'RANDOM_BONUS'
+    TYPE_CHOICES = [
+        (TYPE_MANUAL, 'Manual — admin toggles is_active live'),
+        (TYPE_SCHEDULED, 'Scheduled — Session-relative offset window'),
+        (TYPE_RANDOM_BONUS, 'Random bonus — dropped live with an absolute window'),
+    ]
+
+    game = models.ForeignKey(
+        'organize.Game',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='score_multipliers',
+    )
+    session = models.ForeignKey(
+        'organize.Session',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='score_multipliers',
+    )
+    scope = models.CharField(max_length=8, choices=SCOPE_CHOICES, default=SCOPE_GLOBAL)
+    tower = models.ForeignKey(
+        Tower, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='score_multipliers',
+    )
+    zone = models.ForeignKey(
+        Zone, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='score_multipliers',
+    )
+    multiplier_type = models.CharField(
+        max_length=16, choices=TYPE_CHOICES, default=TYPE_MANUAL,
+    )
+    factor = models.FloatField(default=1.0)
+    is_active = models.BooleanField(default=True)
+    # SCHEDULED window: offsets from Session.start_time.
+    window_start_offset = models.DurationField(null=True, blank=True)
+    window_end_offset = models.DurationField(null=True, blank=True)
+    # MANUAL / RANDOM_BONUS window: absolute instants.
+    starts_at = models.DateTimeField(null=True, blank=True)
+    ends_at = models.DateTimeField(null=True, blank=True)
+    # Player-facing announcement, e.g. 'Double points at Old Tower'.
+    label = models.CharField(max_length=255, blank=True, default='')
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='score_multipliers_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['id']
+
+    def __str__(self):
+        owner = self.session or self.game
+        target = {
+            self.SCOPE_TOWER: self.tower,
+            self.SCOPE_ZONE: self.zone,
+        }.get(self.scope, 'global')
+        return f'x{self.factor} at {target} ({self.multiplier_type}, {owner})'
+
+    def clean(self):
+        super().clean()
+        if bool(self.game_id) == bool(self.session_id):
+            raise ValidationError(
+                'Exactly one of game or session must be set.',
+            )
+        if self.factor is None or self.factor <= 0:
+            raise ValidationError({'factor': 'factor must be greater than 0.'})
+        if self.scope == self.SCOPE_TOWER:
+            if self.tower_id is None or self.zone_id is not None:
+                raise ValidationError(
+                    'A TOWER-scoped multiplier needs a tower and no zone.',
+                )
+        elif self.scope == self.SCOPE_ZONE:
+            if self.zone_id is None or self.tower_id is not None:
+                raise ValidationError(
+                    'A ZONE-scoped multiplier needs a zone and no tower.',
+                )
+        elif self.tower_id is not None or self.zone_id is not None:
+            raise ValidationError(
+                'A GLOBAL multiplier may not reference a tower or zone.',
+            )
+        # Windows are typed to the multiplier type (design decision).
+        if self.multiplier_type == self.TYPE_SCHEDULED:
+            if self.starts_at is not None or self.ends_at is not None:
+                raise ValidationError(
+                    'SCHEDULED multipliers use Session-relative offsets, '
+                    'not absolute starts_at/ends_at.',
+                )
+        elif self.window_start_offset is not None or self.window_end_offset is not None:
+            raise ValidationError(
+                'Only SCHEDULED multipliers may use Session-relative offsets.',
+            )
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+    def resolved_window(self, session=None):
+        """(start, end) instants for `session`; None means open on that side.
+
+        SCHEDULED offsets resolve against the Session's `start_time`, so
+        a Game-owned template arc replays on every run. Returns
+        (None, None) never being in effect when a SCHEDULED multiplier
+        has no session context.
+        """
+        if self.multiplier_type != self.TYPE_SCHEDULED:
+            return self.starts_at, self.ends_at
+        session = session or self.session
+        if session is None:
+            return None, None
+        anchor = session.start_time
+        start = anchor + self.window_start_offset if self.window_start_offset is not None else None
+        end = anchor + self.window_end_offset if self.window_end_offset is not None else None
+        return start, end
+
+    def is_in_effect(self, at=None, session=None):
+        """Whether this multiplier applies at instant `at` for `session`.
+
+        In effect iff `is_active` AND `at` falls inside the resolved
+        window (half-open [start, end); an unset bound is open).
+        """
+        if not self.is_active:
+            return False
+        if self.multiplier_type == self.TYPE_SCHEDULED and (session or self.session) is None:
+            return False
+        at = at or _now()
+        start, end = self.resolved_window(session=session)
+        if start is not None and at < start:
+            return False
+        if end is not None and at >= end:
+            return False
+        return True
+
+
+def _effective_factor(session, scope, target_field, target, at=None):
+    """Product of in-effect multipliers matching GLOBAL or the target.
+
+    Draws from the union of the Session's own multipliers and its Game's
+    multipliers; returns exactly 1.0 when none apply so scoring without
+    multipliers is byte-for-byte identical to pre-change behavior.
+    """
+    if session is None:
+        return 1.0
+    at = at or _now()
+    factor = 1.0
+    candidates = ScoreMultiplier.objects.filter(
+        Q(session=session) | Q(game_id=session.game_id),
+        is_active=True,
+    ).filter(
+        Q(scope=ScoreMultiplier.SCOPE_GLOBAL)
+        | Q(scope=scope, **{target_field: target}),
+    )
+    for multiplier in candidates:
+        if multiplier.is_in_effect(at=at, session=session):
+            factor *= multiplier.factor
+    return factor
+
+
+def effective_tower_factor(session, tower, at=None):
+    """Effective score factor for `tower` in `session` at instant `at`."""
+    return _effective_factor(
+        session, ScoreMultiplier.SCOPE_TOWER, 'tower', tower, at=at,
+    )
+
+
+def effective_zone_factor(session, zone, at=None):
+    """Effective score factor for `zone` in `session` at instant `at`."""
+    return _effective_factor(
+        session, ScoreMultiplier.SCOPE_ZONE, 'zone', zone, at=at,
+    )
+
+
+def active_multipliers_for_session(session, at=None):
+    """Every multiplier in effect for `session` at instant `at`.
+
+    The read-only feed behind the active-multiplier endpoints: the union
+    of Session-owned and Game-owned rows, filtered to those currently in
+    effect, so the map and scoreboard can announce them.
+    """
+    if session is None:
+        return []
+    at = at or _now()
+    candidates = (
+        ScoreMultiplier.objects
+        .filter(Q(session=session) | Q(game_id=session.game_id), is_active=True)
+        .select_related('tower', 'zone')
+    )
+    return [m for m in candidates if m.is_in_effect(at=at, session=session)]

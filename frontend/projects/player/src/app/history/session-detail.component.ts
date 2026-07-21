@@ -11,6 +11,7 @@ import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { forkJoin } from 'rxjs';
 
 import {
+  ActiveMultiplier,
   GameApiService,
   REALTIME_EVENTS,
   RealtimeService,
@@ -57,6 +58,16 @@ const FALLBACK_POLL_MS = 30_000;
           </div>
 
           <h2 class="h5 mt-4 mb-2">Scoreboard</h2>
+          @if (sb.active_multipliers.length > 0) {
+            <div class="mb-2">
+              @for (b of sb.active_multipliers; track b.id) {
+                <span class="badge text-bg-warning me-1">
+                  <i class="bi bi-lightning-charge-fill"></i>
+                  &times;{{ b.factor }} points {{ boostTarget(b) }}
+                </span>
+              }
+            </div>
+          }
           <div class="table-responsive">
             <table class="table">
               <thead>
@@ -158,6 +169,13 @@ export class SessionDetailComponent {
 
   private readonly sessionId: number;
   private highlightHandle: ReturnType<typeof setTimeout> | null = null;
+
+  protected boostTarget(b: ActiveMultiplier): string {
+    if (b.label) return `— ${b.label}`;
+    if (b.scope === 'TOWER') return `at ${b.tower_name}`;
+    if (b.scope === 'ZONE') return `in ${b.zone_name}`;
+    return 'everywhere';
+  }
 
   constructor() {
     this.sessionId = Number(this.route.snapshot.paramMap.get('id'));

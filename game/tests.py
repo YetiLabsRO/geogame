@@ -30,6 +30,7 @@ from channels.db import database_sync_to_async
 from channels.testing import HttpCommunicator, WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
+from django.core.exceptions import ValidationError
 from django.core.management import call_command  # tower-locking
 from django.db import IntegrityError, connection, transaction  # tower-locking
 from django.db.migrations.executor import MigrationExecutor
@@ -51,7 +52,7 @@ from game.challenge_types import (
     TYPE_TEXT,
     get_handler,
 )
-from game.models import (  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links
+from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links
     KNOWLEDGE_ALL_KNOWN,
     KNOWLEDGE_NONE_KNOWN,
     KNOWLEDGE_ONE_KNOWN,
@@ -71,6 +72,7 @@ from game.models import (  # tower-locking  # mode-trail-discovery  # nfc-native
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    ScoreMultiplier,
     TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -85,6 +87,8 @@ from game.models import (  # tower-locking  # mode-trail-discovery  # nfc-native
     TrailEdge,
     TrailStep,
     Zone,
+    effective_tower_factor,
+    effective_zone_factor,
 )
 from geogame.asgi import application as asgi_application
 from organize.models import (  # mode-trail-discovery
@@ -8402,3 +8406,710 @@ class StaffTowerLockEndpointTest(TowerLockingBase):
         self.assertEqual(self._initiate(self.client2).status_code, 201)
 
 
+# ---------------------------------------------------------------------------
+# score-multipliers — model, resolver, scoring integration, clone, API
+# ---------------------------------------------------------------------------
+
+
+def _closed_zone_window(zone, team, minutes=10):
+    """A finalized TeamZoneOwnership held for exactly `minutes` minutes.
+
+    Deterministic evaluation: with timestamp_end set, get_score() (and
+    the multiplier factor) is evaluated at the close instant.
+    """
+    ownership = TeamZoneOwnership.objects.create(zone=zone, team=team)
+    start = timezone.now() - timedelta(minutes=minutes)
+    TeamZoneOwnership.objects.filter(pk=ownership.pk).update(
+        timestamp_start=start, timestamp_end=start + timedelta(minutes=minutes),
+    )
+    return TeamZoneOwnership.objects.get(pk=ownership.pk)
+
+
+class ScoreMultiplierValidationTest(TestCase):
+    """Task 1.2 — ownership, scope-target coherence, factor, window typing."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+
+    def _multiplier(self, **kwargs):
+        defaults = dict(session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+                        multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0)
+        defaults.update(kwargs)
+        return ScoreMultiplier(**defaults)
+
+    def test_valid_multiplier_saves(self):
+        self._multiplier().save()
+        self.assertEqual(ScoreMultiplier.objects.count(), 1)
+
+    def test_rejects_both_owners(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(game=self.game).save()
+
+    def test_rejects_no_owner(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(session=None).save()
+
+    def test_rejects_non_positive_factor(self):
+        for factor in (0, -1.5):
+            with self.assertRaises(ValidationError):
+                self._multiplier(factor=factor).save()
+        self.assertEqual(ScoreMultiplier.objects.count(), 0)
+
+    def test_tower_scope_needs_tower_and_no_zone(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(scope=ScoreMultiplier.SCOPE_TOWER).save()
+        with self.assertRaises(ValidationError):
+            self._multiplier(
+                scope=ScoreMultiplier.SCOPE_TOWER,
+                tower=self.tower, zone=self.zone,
+            ).save()
+        self._multiplier(scope=ScoreMultiplier.SCOPE_TOWER, tower=self.tower).save()
+
+    def test_zone_scope_needs_zone_and_no_tower(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(scope=ScoreMultiplier.SCOPE_ZONE).save()
+        with self.assertRaises(ValidationError):
+            self._multiplier(
+                scope=ScoreMultiplier.SCOPE_ZONE,
+                zone=self.zone, tower=self.tower,
+            ).save()
+        self._multiplier(scope=ScoreMultiplier.SCOPE_ZONE, zone=self.zone).save()
+
+    def test_global_scope_rejects_targets(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(tower=self.tower).save()
+        with self.assertRaises(ValidationError):
+            self._multiplier(zone=self.zone).save()
+
+    def test_scheduled_rejects_absolute_window(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(
+                multiplier_type=ScoreMultiplier.TYPE_SCHEDULED,
+                starts_at=timezone.now(),
+            ).save()
+
+    def test_non_scheduled_rejects_offsets(self):
+        with self.assertRaises(ValidationError):
+            self._multiplier(window_start_offset=timedelta(hours=1)).save()
+
+
+class ScoreMultiplierBackwardCompatTest(TestCase):
+    """Task 6.1 — zero multiplier rows reproduce pre-change scoring exactly."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=25)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+
+    def test_effective_factors_default_to_exactly_one(self):
+        self.assertEqual(effective_tower_factor(self.session, self.tower), 1.0)
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 1.0)
+
+    def test_floating_score_unchanged(self):
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        seconds = (ownership.timestamp_end - ownership.timestamp_start).seconds
+        self.assertEqual(ownership.get_score(), self.zone.get_score(seconds))
+        self.assertEqual(ownership.get_score(), 10.0)  # SCORE_LIN: mins
+
+    def test_initial_bonus_unchanged(self):
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 25)
+
+    def test_zero_bonus_floor_unchanged(self):
+        bare = _make_tower(self.game, name='bare', zone=self.zone, initial_bonus=0)
+        bare.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 1)
+
+    def test_locked_score_finalization_unchanged(self):
+        ownership = TeamZoneOwnership.objects.create(zone=self.zone, team=self.team)
+        TeamZoneOwnership.objects.filter(pk=ownership.pk).update(
+            timestamp_start=timezone.now() - timedelta(minutes=10),
+        )
+        self.session.close_ownerships()
+        self.assertAlmostEqual(
+            Team.objects.get(pk=self.team.pk).score, 10, delta=1,
+        )
+
+
+class ScoreMultiplierZoneFactorTest(TestCase):
+    """Task 6.2 — zone floating score scales and composes multiplicatively."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+
+    def _global(self, factor, **kwargs):
+        return ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=factor, **kwargs,
+        )
+
+    def _zone(self, factor, zone=None):
+        return ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_ZONE,
+            zone=zone or self.zone,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=factor,
+        )
+
+    def test_global_doubles_floating_points(self):
+        self._global(2.0)
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 20.0)
+
+    def test_zone_halves_floating_points(self):
+        self._zone(0.5)
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 5.0)
+
+    def test_global_and_zone_compose_to_four(self):
+        self._global(2.0)
+        self._zone(2.0)
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 40.0)
+        self.assertEqual(
+            effective_zone_factor(self.session, self.zone), 4.0,
+        )
+
+    def test_other_zone_multiplier_does_not_apply(self):
+        other = _make_zone(self.game, name='Other zone')
+        self._zone(3.0, zone=other)
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 10.0)
+
+    def test_inactive_multiplier_does_not_apply(self):
+        self._global(2.0, is_active=False)
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 10.0)
+
+    def test_floating_score_sum_reflects_factor(self):
+        self._global(2.0)
+        ownership = TeamZoneOwnership.objects.create(zone=self.zone, team=self.team)
+        TeamZoneOwnership.objects.filter(pk=ownership.pk).update(
+            timestamp_start=timezone.now() - timedelta(minutes=10),
+        )
+        self.assertAlmostEqual(self.team.floating_score(), 20, delta=1)
+
+
+class ScoreMultiplierInitialBonusTest(TestCase):
+    """Task 6.3 — tower factor scales the capture bonus; floor still holds."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=25)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+
+    def _tower_multiplier(self, factor, tower=None):
+        return ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_TOWER,
+            tower=tower or self.tower,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=factor,
+        )
+
+    def test_tower_factor_doubles_bonus(self):
+        self._tower_multiplier(2.0)
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 50)
+
+    def test_global_and_tower_compose(self):
+        ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        self._tower_multiplier(2.0)
+        self.assertEqual(effective_tower_factor(self.session, self.tower), 4.0)
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 100)
+
+    def test_floor_at_one_still_holds(self):
+        bare = _make_tower(self.game, name='bare', zone=self.zone, initial_bonus=0)
+        self._tower_multiplier(5.0, tower=bare)
+        bare.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 1)
+
+    def test_other_tower_multiplier_does_not_apply(self):
+        other = _make_tower(self.game, name='other', zone=self.zone, initial_bonus=10)
+        self._tower_multiplier(3.0, tower=other)
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 25)
+
+    def test_zone_scoped_multiplier_does_not_touch_bonus(self):
+        ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_ZONE,
+            zone=self.zone,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=3.0,
+        )
+        self.assertEqual(effective_tower_factor(self.session, self.tower), 1.0)
+
+
+class ScoreMultiplierWindowTest(TestCase):
+    """Task 6.4 — SCHEDULED offsets, MANUAL toggling, RANDOM_BONUS windows."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game, scoring=Zone.SCORE_LIN)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        # Pin the session clock 90 minutes into the run.
+        self.start = timezone.now() - timedelta(minutes=90)
+        Session.objects.filter(pk=self.session.pk).update(start_time=self.start)
+        self.session.refresh_from_db()
+
+    def test_scheduled_window_is_session_relative(self):
+        multiplier = ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+            window_start_offset=timedelta(hours=1),
+            window_end_offset=timedelta(hours=2),
+        )
+        inside = self.start + timedelta(minutes=90)
+        before = self.start + timedelta(minutes=30)
+        at_end = self.start + timedelta(hours=2)
+        self.assertTrue(multiplier.is_in_effect(at=inside, session=self.session))
+        self.assertFalse(multiplier.is_in_effect(at=before, session=self.session))
+        self.assertFalse(multiplier.is_in_effect(at=at_end, session=self.session))
+        self.assertEqual(
+            effective_zone_factor(self.session, self.zone, at=inside), 2.0,
+        )
+        self.assertEqual(
+            effective_zone_factor(self.session, self.zone, at=before), 1.0,
+        )
+
+    def test_scheduled_window_replays_per_session(self):
+        multiplier = ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+            window_start_offset=timedelta(hours=1),
+            window_end_offset=timedelta(hours=2),
+        )
+        later = Session.objects.create(
+            game=self.game, slug='later', name='Later run',
+            start_time=self.start + timedelta(days=7),
+            end_time=self.start + timedelta(days=7, hours=3),
+            state=Session.RUNNING,
+        )
+        at = later.start_time + timedelta(minutes=90)
+        self.assertTrue(multiplier.is_in_effect(at=at, session=later))
+        # The same wall-clock instant is outside the FIRST session's arc.
+        self.assertFalse(multiplier.is_in_effect(at=at, session=self.session))
+
+    def test_scheduled_factor_applies_to_floating_score(self):
+        ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+            window_start_offset=timedelta(hours=1),
+            window_end_offset=timedelta(hours=2),
+        )
+        # Window closes "now", 90 minutes into the session — inside the arc.
+        ownership = _closed_zone_window(self.zone, self.team, minutes=10)
+        self.assertEqual(ownership.get_score(), 20.0)
+
+    def test_manual_respects_live_toggle(self):
+        multiplier = ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        self.assertTrue(multiplier.is_in_effect())
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 2.0)
+        multiplier.is_active = False
+        multiplier.save()
+        self.assertFalse(multiplier.is_in_effect())
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 1.0)
+
+    def test_random_bonus_respects_absolute_window(self):
+        now = timezone.now()
+        multiplier = ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_RANDOM_BONUS, factor=3.0,
+            starts_at=now - timedelta(minutes=10),
+            ends_at=now + timedelta(minutes=10),
+        )
+        self.assertTrue(multiplier.is_in_effect(at=now))
+        self.assertFalse(multiplier.is_in_effect(at=now - timedelta(minutes=20)))
+        self.assertFalse(multiplier.is_in_effect(at=now + timedelta(minutes=20)))
+
+    def test_unset_bound_is_open(self):
+        now = timezone.now()
+        no_start = ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_RANDOM_BONUS, factor=2.0,
+            ends_at=now + timedelta(minutes=10),
+        )
+        self.assertTrue(no_start.is_in_effect(at=now - timedelta(days=365)))
+        no_end = ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+            starts_at=now - timedelta(minutes=10),
+        )
+        self.assertTrue(no_end.is_in_effect(at=now + timedelta(days=365)))
+        self.assertFalse(no_end.is_in_effect(at=now - timedelta(minutes=20)))
+
+
+class ScoreMultiplierScopingTest(TestCase):
+    """Task 6.5 — Game-owned rows reach every run; Session-owned just one."""
+
+    def setUp(self):
+        self.game = _make_game(name='Game A')
+        self.zone = _make_zone(self.game)
+        self.session_one = _default_session(self.game)
+        self.session_two = Session.objects.create(
+            game=self.game, slug='second', name='Second run',
+            start_time=timezone.now(),
+            end_time=timezone.now() + timedelta(hours=2),
+            state=Session.RUNNING,
+        )
+        self.other_game = _make_game(name='Game B')
+        # Game B shares the SAME zone through a shared collection.
+        _game_collection(self.other_game).zones.add(self.zone)
+        self.other_session = _default_session(self.other_game)
+
+    def test_game_owned_applies_to_every_session_of_that_game(self):
+        ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        self.assertEqual(effective_zone_factor(self.session_one, self.zone), 2.0)
+        self.assertEqual(effective_zone_factor(self.session_two, self.zone), 2.0)
+        # Shared geometry never leaks the boost into another game's runs.
+        self.assertEqual(effective_zone_factor(self.other_session, self.zone), 1.0)
+
+    def test_session_owned_applies_to_that_run_only(self):
+        ScoreMultiplier.objects.create(
+            session=self.session_one, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=3.0,
+        )
+        self.assertEqual(effective_zone_factor(self.session_one, self.zone), 3.0)
+        self.assertEqual(effective_zone_factor(self.session_two, self.zone), 1.0)
+        self.assertEqual(effective_zone_factor(self.other_session, self.zone), 1.0)
+
+    def test_game_and_session_rows_union(self):
+        ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        ScoreMultiplier.objects.create(
+            session=self.session_one, scope=ScoreMultiplier.SCOPE_ZONE,
+            zone=self.zone,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        self.assertEqual(effective_zone_factor(self.session_one, self.zone), 4.0)
+        self.assertEqual(effective_zone_factor(self.session_two, self.zone), 2.0)
+
+
+class ScoreMultiplierCloneTest(TestCase):
+    """Task 6.6 — cloning copies Game-owned rows, never Session-owned ones."""
+
+    def setUp(self):
+        self.game = _make_game(name='Original', slug='original')
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.session = _default_session(self.game)
+        self.scheduled = ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+            window_start_offset=timedelta(hours=1),
+            window_end_offset=timedelta(hours=2),
+            label='Happy hour',
+        )
+        self.tower_bonus = ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_TOWER,
+            tower=self.tower,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=1.5,
+            is_active=False,
+        )
+        self.live = ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_RANDOM_BONUS, factor=4.0,
+        )
+
+    def test_clone_copies_game_owned_only(self):
+        clone = self.game.clone('original-clone')
+        cloned = clone.score_multipliers.order_by('id')
+        self.assertEqual(cloned.count(), 2)
+        arc, bonus = cloned
+        self.assertEqual(arc.multiplier_type, ScoreMultiplier.TYPE_SCHEDULED)
+        self.assertEqual(arc.factor, 2.0)
+        self.assertEqual(arc.window_start_offset, timedelta(hours=1))
+        self.assertEqual(arc.window_end_offset, timedelta(hours=2))
+        self.assertEqual(arc.label, 'Happy hour')
+        self.assertIsNone(arc.session_id)
+        # Tower target shared by PK, like tower-bound challenges.
+        self.assertEqual(bonus.tower_id, self.tower.pk)
+        self.assertFalse(bonus.is_active)
+        # Session-owned rows stay with the original run.
+        self.assertEqual(
+            ScoreMultiplier.objects.filter(session__game=clone).count(), 0,
+        )
+        self.assertEqual(self.game.score_multipliers.count(), 2)
+        # New rows, not moved ones.
+        self.assertNotIn(
+            self.scheduled.pk, [m.pk for m in cloned],
+        )
+
+    def test_clone_arc_replays_on_clone_sessions(self):
+        clone = self.game.clone('original-clone')
+        run = Session.objects.create(
+            game=clone, slug='run', name='Clone run',
+            start_time=timezone.now() - timedelta(minutes=90),
+            end_time=timezone.now() + timedelta(hours=2),
+            state=Session.RUNNING,
+        )
+        self.assertEqual(effective_zone_factor(run, self.zone), 2.0)
+
+
+class ScoreMultiplierApiTest(TestCase):
+    """Task 6.7 — authoring, live control, and active-list endpoints."""
+
+    def setUp(self):
+        self.game = _make_game(name='API Game', slug='api-game')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=10)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+
+        self.creator_client, self.creator = _staff_client(
+            session=self.session, username='creator',
+        )
+        self.game.created_by = self.creator
+        self.game.save(update_fields=['created_by'])
+        self.runner_client, self.runner = _staff_client(
+            session=self.session, username='runner',
+        )
+        self.player_client, self.player = _authed_client(self.team)
+
+    def _game_url(self, pk=None):
+        base = f'/api/staff/games/{self.game.id}/score-multipliers/'
+        return base if pk is None else f'{base}{pk}/'
+
+    def _session_url(self, suffix=''):
+        return f'/api/staff/sessions/{self.session.id}/score-multipliers/{suffix}'
+
+    # ---- template authoring (tasks 3.1, 6.7) ------------------------------
+
+    def test_creator_authors_scheduled_multiplier(self):
+        resp = self.creator_client.post(
+            self._game_url(),
+            {
+                'scope': 'GLOBAL',
+                'multiplier_type': 'SCHEDULED',
+                'factor': 2.0,
+                'window_start_offset': '01:00:00',
+                'window_end_offset': '02:00:00',
+                'label': 'Happy hour',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['game'], self.game.id)
+        self.assertIsNone(body['session'])
+        self.assertEqual(body['created_by'], self.creator.id)
+
+        listed = self.creator_client.get(self._game_url()).json()
+        self.assertEqual(len(listed), 1)
+
+        resp = self.creator_client.patch(
+            self._game_url(body['id']), {'factor': 3.0}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertEqual(resp.json()['factor'], 3.0)
+
+        resp = self.creator_client.delete(self._game_url(body['id']))
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(ScoreMultiplier.objects.count(), 0)
+
+    def test_non_creator_staff_cannot_author_but_can_read(self):
+        multiplier = ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        resp = self.runner_client.get(self._game_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 1)
+        resp = self.runner_client.post(
+            self._game_url(), {'scope': 'GLOBAL', 'factor': 2.0}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.runner_client.patch(
+            self._game_url(multiplier.id), {'factor': 9.0}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        resp = self.runner_client.delete(self._game_url(multiplier.id))
+        self.assertEqual(resp.status_code, 403)
+
+    def test_authoring_validates_payload(self):
+        resp = self.creator_client.post(
+            self._game_url(), {'scope': 'GLOBAL', 'factor': 0}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.creator_client.post(
+            self._game_url(),
+            {
+                'scope': 'GLOBAL',
+                'multiplier_type': 'SCHEDULED',
+                'factor': 2.0,
+                'starts_at': timezone.now().isoformat(),
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        resp = self.creator_client.post(
+            self._game_url(),
+            {'scope': 'TOWER', 'factor': 2.0},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_player_cannot_touch_staff_endpoints(self):
+        resp = self.player_client.get(self._game_url())
+        self.assertEqual(resp.status_code, 403)
+        resp = self.player_client.post(
+            self._session_url(), {'scope': 'GLOBAL', 'factor': 2.0}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    # ---- live control (tasks 4.1, 4.2, 6.7) -------------------------------
+
+    def test_runner_fires_random_bonus_at_tower(self):
+        now = timezone.now()
+        resp = self.runner_client.post(
+            self._session_url(),
+            {
+                'scope': 'TOWER',
+                'tower': self.tower.id,
+                'multiplier_type': 'RANDOM_BONUS',
+                'factor': 2.0,
+                'starts_at': now.isoformat(),
+                'ends_at': (now + timedelta(minutes=15)).isoformat(),
+                'label': 'Bonus at Old Tower',
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['session'], self.session.id)
+        self.assertIsNone(body['game'])
+        self.assertEqual(body['tower_name'], self.tower.name)
+        # The bonus is live: capturing the tower now pays double.
+        self.assertEqual(effective_tower_factor(self.session, self.tower), 2.0)
+        self.tower.assign_to_team(self.team)
+        self.assertEqual(Team.objects.get(pk=self.team.pk).score, 20)
+
+    def test_activate_deactivate_toggle_manual_multiplier(self):
+        resp = self.runner_client.post(
+            self._session_url(),
+            {'scope': 'GLOBAL', 'multiplier_type': 'MANUAL', 'factor': 2.0},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        pk = resp.json()['id']
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 2.0)
+
+        resp = self.runner_client.post(self._session_url(f'{pk}/deactivate/'))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertFalse(resp.json()['is_active'])
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 1.0)
+
+        resp = self.runner_client.post(self._session_url(f'{pk}/activate/'))
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(resp.json()['is_active'])
+        self.assertEqual(effective_zone_factor(self.session, self.zone), 2.0)
+
+    def test_session_list_unions_game_and_session_rows(self):
+        ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+            window_start_offset=timedelta(hours=1),
+        )
+        ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=3.0,
+        )
+        resp = self.runner_client.get(self._session_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(len(resp.json()), 2)
+
+    def test_toggle_rejects_foreign_multiplier(self):
+        foreign_game = _make_game(name='Foreign', slug='foreign')
+        foreign = ScoreMultiplier.objects.create(
+            game=foreign_game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+        )
+        resp = self.runner_client.post(
+            self._session_url(f'{foreign.id}/deactivate/'),
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    # ---- active-multiplier list (tasks 4.3, 6.7) --------------------------
+
+    def _active_url(self):
+        return f'/api/sessions/{self.session.id}/score-multipliers/active/'
+
+    def test_active_list_for_player(self):
+        ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_TOWER,
+            tower=self.tower,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+            label='Double at Old Tower',
+        )
+        # Out-of-window SCHEDULED arc must NOT show up (session just started).
+        ScoreMultiplier.objects.create(
+            game=self.game, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=5.0,
+            window_start_offset=timedelta(hours=10),
+            window_end_offset=timedelta(hours=11),
+        )
+        resp = self.player_client.get(self._active_url())
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(len(body), 1)
+        entry = body[0]
+        self.assertEqual(entry['factor'], 2.0)
+        self.assertEqual(entry['scope'], 'TOWER')
+        self.assertEqual(entry['tower_name'], self.tower.name)
+        self.assertEqual(entry['label'], 'Double at Old Tower')
+        self.assertEqual(entry['owned_by'], 'session')
+
+    def test_active_list_denied_to_outsiders(self):
+        outsider = User.objects.create_user(
+            username='outsider', email='outsider@example.com',
+            password='password123',
+        )
+        token = Token.objects.create(user=outsider)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = client.get(self._active_url())
+        self.assertEqual(resp.status_code, 403)
+
+    def test_active_list_missing_session_is_404(self):
+        resp = self.runner_client.get(
+            '/api/sessions/999999/score-multipliers/active/',
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_scoreboard_carries_active_multipliers(self):
+        ScoreMultiplier.objects.create(
+            session=self.session, scope=ScoreMultiplier.SCOPE_GLOBAL,
+            multiplier_type=ScoreMultiplier.TYPE_MANUAL, factor=2.0,
+            label='Double points now',
+        )
+        resp = self.player_client.get(
+            f'/api/sessions/{self.session.id}/scoreboard/',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        boosts = resp.json()['active_multipliers']
+        self.assertEqual(len(boosts), 1)
+        self.assertEqual(boosts[0]['label'], 'Double points now')

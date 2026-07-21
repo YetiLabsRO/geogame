@@ -1,4 +1,4 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { DatePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
@@ -7,9 +7,13 @@ import { forkJoin } from 'rxjs';
 import { HttpErrorResponse } from '@angular/common/http';
 
 import {
+  ActiveMultiplier,
   AdminGame,
+  AdminScoreMultiplier,
   AdminSession,
   AdminSessionPayload,
+  AdminTower,
+  AdminZone,
   ConquestRule,
   FailCounterInfo,
   FailCounterReset,
@@ -17,6 +21,8 @@ import {
   PauseHistory,
   Phase10Overrides,
   PresenceRulesOverrides,
+  ScoreMultiplierScope,
+  ScoreMultiplierType,
   ScoreTimeUnit,
   SessionScoreboard,
   SessionState,
@@ -30,6 +36,7 @@ import {
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+import { durationToMinutes } from './score-multipliers-panel.component';
 
 const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
   'pause_freezes_floating_score',
@@ -231,6 +238,216 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
               </div>
             }
           }
+        </div>
+      </div>
+
+      <!-- Live score boosts (score-multipliers) ---------------------------- -->
+      <div class="card mb-4">
+        <div class="card-body">
+          <h2 class="h6 mb-2">
+            Score boosts
+            @for (b of activeBoosts(); track b.id) {
+              <span class="badge text-bg-warning ms-2">
+                <i class="bi bi-lightning-charge-fill"></i>
+                &times;{{ b.factor }} {{ boostTarget(b) }}
+              </span>
+            }
+            @if (activeBoosts().length === 0) {
+              <span class="badge text-bg-light border ms-2">none in effect</span>
+            }
+          </h2>
+          <p class="text-body-secondary small mb-2">
+            Factors multiply into floating zone points and tower capture
+            bonuses from this instant forward — locked history is never
+            rewritten. Overlapping boosts stack multiplicatively.
+          </p>
+
+          @if (multipliers().length > 0) {
+            <div class="table-responsive">
+              <table class="table table-sm align-middle mb-2">
+                <thead>
+                  <tr>
+                    <th>Type</th>
+                    <th>Scope</th>
+                    <th class="text-end">Factor</th>
+                    <th>Window</th>
+                    <th>Owner</th>
+                    <th>Enabled</th>
+                    <th></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (m of multipliers(); track m.id) {
+                    <tr>
+                      <td>
+                        <span class="badge" [class]="typeBadgeClass(m.multiplier_type)">
+                          {{ m.multiplier_type }}
+                        </span>
+                        @if (m.label) {
+                          <div class="small text-body-secondary">{{ m.label }}</div>
+                        }
+                      </td>
+                      <td class="small">{{ multiplierScope(m) }}</td>
+                      <td class="text-end fw-semibold">&times;{{ m.factor }}</td>
+                      <td class="small">{{ multiplierWindow(m) }}</td>
+                      <td class="small">
+                        @if (m.session !== null) {
+                          <span class="badge text-bg-info">this session</span>
+                        } @else {
+                          <span class="badge text-bg-light border">game template</span>
+                        }
+                      </td>
+                      <td>
+                        @if (m.is_active) {
+                          <span class="badge text-bg-success">on</span>
+                        } @else {
+                          <span class="badge text-bg-secondary">off</span>
+                        }
+                      </td>
+                      <td class="text-end">
+                        <button
+                          type="button"
+                          class="btn btn-sm"
+                          [class]="m.is_active ? 'btn-outline-warning' : 'btn-outline-success'"
+                          [disabled]="togglingId() === m.id"
+                          (click)="toggleMultiplier(m)"
+                        >
+                          @if (togglingId() === m.id) {
+                            <span class="spinner-border spinner-border-sm me-1"></span>
+                          }
+                          {{ m.is_active ? 'Deactivate' : 'Activate' }}
+                        </button>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            </div>
+          } @else {
+            <div class="small text-body-secondary mb-2">
+              No multipliers configured — scoring runs at the normal 1&times;.
+            </div>
+          }
+
+          <form class="row g-2 align-items-end" (ngSubmit)="dropBoost()">
+            <div class="col-md-2">
+              <label class="form-label small mb-0" for="boost-type">Type</label>
+              <select
+                id="boost-type"
+                class="form-select form-select-sm"
+                [ngModel]="boostType()"
+                (ngModelChange)="boostType.set($event)"
+                name="boost_type"
+              >
+                <option ngValue="RANDOM_BONUS">Random bonus</option>
+                <option ngValue="MANUAL">Manual toggle</option>
+              </select>
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small mb-0" for="boost-scope">Scope</label>
+              <select
+                id="boost-scope"
+                class="form-select form-select-sm"
+                [ngModel]="boostScope()"
+                (ngModelChange)="boostScope.set($event)"
+                name="boost_scope"
+              >
+                <option ngValue="GLOBAL">Everywhere</option>
+                <option ngValue="TOWER">One tower</option>
+                <option ngValue="ZONE">One zone</option>
+              </select>
+            </div>
+            @if (boostScope() === 'TOWER') {
+              <div class="col-md-2">
+                <label class="form-label small mb-0" for="boost-tower">Tower</label>
+                <select
+                  id="boost-tower"
+                  class="form-select form-select-sm"
+                  [ngModel]="boostTower()"
+                  (ngModelChange)="boostTower.set($event)"
+                  name="boost_tower"
+                >
+                  <option [ngValue]="null">—</option>
+                  @for (t of gameTowers(); track t.id) {
+                    <option [ngValue]="t.id">{{ t.name }}</option>
+                  }
+                </select>
+              </div>
+            }
+            @if (boostScope() === 'ZONE') {
+              <div class="col-md-2">
+                <label class="form-label small mb-0" for="boost-zone">Zone</label>
+                <select
+                  id="boost-zone"
+                  class="form-select form-select-sm"
+                  [ngModel]="boostZone()"
+                  (ngModelChange)="boostZone.set($event)"
+                  name="boost_zone"
+                >
+                  <option [ngValue]="null">—</option>
+                  @for (z of gameZones(); track z.id) {
+                    <option [ngValue]="z.id">{{ z.name }}</option>
+                  }
+                </select>
+              </div>
+            }
+            <div class="col-md-2">
+              <label class="form-label small mb-0" for="boost-factor">Factor (&gt; 0)</label>
+              <input
+                id="boost-factor"
+                class="form-control form-control-sm"
+                type="number"
+                min="0.1"
+                step="0.1"
+                [ngModel]="boostFactor()"
+                (ngModelChange)="boostFactor.set($event)"
+                name="boost_factor"
+                required
+              />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small mb-0" for="boost-minutes">
+                Duration (min)
+              </label>
+              <input
+                id="boost-minutes"
+                class="form-control form-control-sm"
+                type="number"
+                min="1"
+                placeholder="blank = until toggled"
+                [ngModel]="boostMinutes()"
+                (ngModelChange)="boostMinutes.set($event)"
+                name="boost_minutes"
+              />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small mb-0" for="boost-label">Label</label>
+              <input
+                id="boost-label"
+                class="form-control form-control-sm"
+                type="text"
+                placeholder="shown to players"
+                [ngModel]="boostLabel()"
+                (ngModelChange)="boostLabel.set($event)"
+                name="boost_label"
+              />
+            </div>
+            <div class="col-auto">
+              <button
+                type="submit"
+                class="btn btn-sm btn-warning"
+                [disabled]="boostBusy() || !canDropBoost()"
+              >
+                @if (boostBusy()) {
+                  <span class="spinner-border spinner-border-sm me-1"></span>
+                }
+                <i class="bi bi-lightning-charge"></i> Drop boost
+              </button>
+            </div>
+            @if (boostError(); as msg) {
+              <div class="col-12"><div class="small text-danger">{{ msg }}</div></div>
+            }
+          </form>
         </div>
       </div>
 
@@ -647,6 +864,43 @@ export class StaffSessionDetailComponent {
   protected readonly buildBusy = signal(false);
   protected readonly buildError = signal<string | null>(null);
   protected readonly buildResult = signal<TeamBuildResult | null>(null);
+
+  // ---- Score boosts (score-multipliers) -----------------------------------
+  protected readonly multipliers = signal<AdminScoreMultiplier[]>([]);
+  protected readonly activeBoosts = signal<ActiveMultiplier[]>([]);
+  protected readonly togglingId = signal<number | null>(null);
+  protected readonly boostType = signal<ScoreMultiplierType>('RANDOM_BONUS');
+  protected readonly boostScope = signal<ScoreMultiplierScope>('GLOBAL');
+  protected readonly boostTower = signal<number | null>(null);
+  protected readonly boostZone = signal<number | null>(null);
+  protected readonly boostFactor = signal<number | null>(2);
+  protected readonly boostMinutes = signal<number | null>(null);
+  protected readonly boostLabel = signal('');
+  protected readonly boostBusy = signal(false);
+  protected readonly boostError = signal<string | null>(null);
+
+  private readonly allTowers = signal<AdminTower[]>([]);
+  private readonly allZones = signal<AdminZone[]>([]);
+
+  /** Geometry usable by this session's game (repository usage refs). */
+  protected readonly gameTowers = computed(() => {
+    const gameId = this.session()?.game;
+    if (!gameId) return [];
+    return this.allTowers().filter((t) => t.games.some((g) => g.id === gameId));
+  });
+  protected readonly gameZones = computed(() => {
+    const gameId = this.session()?.game;
+    if (!gameId) return [];
+    return this.allZones().filter((z) => z.games.some((g) => g.id === gameId));
+  });
+
+  protected readonly canDropBoost = computed(() => {
+    const factor = this.boostFactor();
+    if (factor === null || factor <= 0) return false;
+    if (this.boostScope() === 'TOWER' && this.boostTower() === null) return false;
+    if (this.boostScope() === 'ZONE' && this.boostZone() === null) return false;
+    return true;
+  });
   protected readonly overrideDirty = signal(false);
   protected readonly overrideSaving = signal(false);
   protected readonly overrideError = signal<string | null>(null);
@@ -719,6 +973,113 @@ export class StaffSessionDetailComponent {
       },
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
+    this.refreshMultipliers();
+    forkJoin({
+      towers: this.staff.listTowers(),
+      zones: this.staff.listZones(),
+    }).subscribe({
+      next: ({ towers, zones }) => {
+        this.allTowers.set(towers);
+        this.allZones.set(zones);
+      },
+      error: () => {},
+    });
+  }
+
+  // ---- Score boosts (score-multipliers) -----------------------------------
+
+  private refreshMultipliers(): void {
+    this.staff.listSessionMultipliers(this.sessionId).subscribe({
+      next: (list) => this.multipliers.set(list),
+      error: () => {},
+    });
+    this.api.sessionActiveMultipliers(this.sessionId).subscribe({
+      next: (list) => this.activeBoosts.set(list),
+      error: () => {},
+    });
+  }
+
+  protected boostTarget(b: ActiveMultiplier): string {
+    if (b.label) return b.label;
+    if (b.scope === 'TOWER') return `at ${b.tower_name}`;
+    if (b.scope === 'ZONE') return `in ${b.zone_name}`;
+    return 'everywhere';
+  }
+
+  protected multiplierScope(m: AdminScoreMultiplier): string {
+    if (m.scope === 'TOWER') return `Tower: ${m.tower_name ?? m.tower}`;
+    if (m.scope === 'ZONE') return `Zone: ${m.zone_name ?? m.zone}`;
+    return 'Everywhere';
+  }
+
+  protected multiplierWindow(m: AdminScoreMultiplier): string {
+    if (m.multiplier_type === 'SCHEDULED') {
+      const start = durationToMinutes(m.window_start_offset);
+      const end = durationToMinutes(m.window_end_offset);
+      if (start === null && end === null) return 'whole session';
+      return `min ${start ?? 0} → ${end ?? 'open'} after start`;
+    }
+    const fmt = (iso: string | null) =>
+      iso ? new Date(iso).toLocaleTimeString() : null;
+    const start = fmt(m.starts_at);
+    const end = fmt(m.ends_at);
+    if (!start && !end) return 'open (gated by the toggle)';
+    return `${start ?? 'now'} → ${end ?? 'open'}`;
+  }
+
+  protected typeBadgeClass(t: ScoreMultiplierType): string {
+    if (t === 'SCHEDULED') return 'text-bg-secondary';
+    if (t === 'RANDOM_BONUS') return 'text-bg-warning';
+    return 'text-bg-primary';
+  }
+
+  protected toggleMultiplier(m: AdminScoreMultiplier): void {
+    if (this.togglingId() !== null) return;
+    this.togglingId.set(m.id);
+    this.boostError.set(null);
+    this.staff.setMultiplierActive(this.sessionId, m.id, !m.is_active).subscribe({
+      next: () => {
+        this.togglingId.set(null);
+        this.refreshMultipliers();
+      },
+      error: (err) => {
+        this.togglingId.set(null);
+        this.boostError.set(extractErrorMessage(err));
+      },
+    });
+  }
+
+  protected dropBoost(): void {
+    if (this.boostBusy() || !this.canDropBoost()) return;
+    this.boostBusy.set(true);
+    this.boostError.set(null);
+    const scope = this.boostScope();
+    const minutes = this.boostMinutes();
+    this.staff
+      .createSessionMultiplier(this.sessionId, {
+        scope,
+        multiplier_type: this.boostType(),
+        factor: this.boostFactor() ?? 1,
+        tower: scope === 'TOWER' ? this.boostTower() : null,
+        zone: scope === 'ZONE' ? this.boostZone() : null,
+        ends_at:
+          minutes !== null && minutes > 0
+            ? new Date(Date.now() + minutes * 60_000).toISOString()
+            : null,
+        label: this.boostLabel(),
+      })
+      .subscribe({
+        next: () => {
+          this.boostBusy.set(false);
+          this.boostLabel.set('');
+          this.boostMinutes.set(null);
+          this.refreshMultipliers();
+        },
+        error: (err) => {
+          this.boostBusy.set(false);
+          this.boostError.set(extractErrorMessage(err));
+        },
+      });
   }
 
   private setSession(s: AdminSession): void {
@@ -855,6 +1216,7 @@ export class StaffSessionDetailComponent {
   }
 
   private reloadState(): void {
+    this.refreshMultipliers();
     forkJoin({
       scoreboard: this.api.sessionScoreboard(this.sessionId),
       timeline: this.api.sessionTimeline(this.sessionId),

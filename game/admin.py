@@ -20,6 +20,7 @@ from game.models import (
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    ScoreMultiplier,
     TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -447,6 +448,18 @@ class TeamTrailProgressAdmin(admin.ModelAdmin):
 admin.site.register(Trail, TrailAdmin)
 admin.site.register(TeamTrailRoute, TeamTrailRouteAdmin)
 admin.site.register(TeamTrailProgress, TeamTrailProgressAdmin)
+
+
+class ScoreMultiplierAdmin(admin.ModelAdmin):
+    list_display = (
+        '__str__', 'game', 'session', 'scope', 'tower', 'zone',
+        'multiplier_type', 'factor', 'is_active',
+    )
+    list_filter = ('multiplier_type', 'scope', 'is_active')
+    readonly_fields = ('created_at',)
+
+
+admin.site.register(ScoreMultiplier, ScoreMultiplierAdmin)
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
