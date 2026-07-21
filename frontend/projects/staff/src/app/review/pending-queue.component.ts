@@ -56,6 +56,9 @@ import { extractErrorMessage } from '../auth/form-error';
                   </div>
                 </div>
 
+                @if (s.challenge_type; as type) {
+                  <span class="badge text-bg-light border mt-2">{{ typeLabel(type) }}</span>
+                }
                 @if (s.challenge_text; as text) {
                   <p class="mt-2 mb-1 fst-italic" style="white-space: pre-line">{{ text }}</p>
                   @if (s.challenge_difficulty !== null) {
@@ -65,6 +68,12 @@ import { extractErrorMessage } from '../auth/form-error';
                   }
                 } @else {
                   <p class="mt-2 mb-1 text-body-secondary">RFID capture (no challenge text)</p>
+                }
+
+                @if (s.submitted_code; as code) {
+                  <div class="small mt-1">
+                    Scanned code: <code>{{ code }}</code>
+                  </div>
                 }
 
                 @if (s.photo_url; as photo) {
@@ -147,6 +156,66 @@ import { extractErrorMessage } from '../auth/form-error';
         }
       </div>
     }
+
+    <!-- challenge-type-system: auto-resolved outcomes as read-only audit -->
+    <div class="mt-4">
+      <button
+        type="button"
+        class="btn btn-sm btn-outline-secondary"
+        (click)="toggleAudit()"
+      >
+        <i class="bi bi-clipboard-data"></i>
+        {{ auditVisible() ? 'Hide' : 'Show' }} auto-validated audit
+      </button>
+
+      @if (auditVisible()) {
+        @if (auditLoading()) {
+          <div class="d-flex align-items-center text-body-secondary mt-3">
+            <span class="spinner-border spinner-border-sm me-2"></span>
+            Loading audit…
+          </div>
+        } @else if (auditRows().length === 0) {
+          <div class="alert alert-info mt-3">No auto-validated submissions yet.</div>
+        } @else {
+          <div class="table-responsive mt-3">
+            <table class="table table-sm align-middle">
+              <thead>
+                <tr>
+                  <th>When</th>
+                  <th>Team</th>
+                  <th>Tower</th>
+                  <th>Type</th>
+                  <th>Scanned code</th>
+                  <th>Outcome</th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (s of auditRows(); track s.id) {
+                  <tr>
+                    <td class="small">{{ s.timestamp_verified | date: 'short' }}</td>
+                    <td>
+                      <span class="badge" [style.background-color]="s.team_color">
+                        {{ s.team_name }}
+                      </span>
+                    </td>
+                    <td>{{ s.tower_name }}</td>
+                    <td>{{ typeLabel(s.challenge_type) }}</td>
+                    <td><code>{{ s.submitted_code ?? '—' }}</code></td>
+                    <td>
+                      @if (s.outcome === 1) {
+                        <span class="badge text-bg-success">Confirmed</span>
+                      } @else {
+                        <span class="badge text-bg-danger">Rejected</span>
+                      }
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+      }
+    </div>
   `,
 })
 export class PendingQueueComponent {
@@ -160,8 +229,44 @@ export class PendingQueueComponent {
   protected readonly rejectingId = signal<number | null>(null);
   protected rejectReason = '';
 
+  // challenge-type-system: read-only audit of auto-resolved outcomes.
+  protected readonly auditVisible = signal(false);
+  protected readonly auditLoading = signal(false);
+  protected readonly auditRows = signal<StaffSubmission[]>([]);
+
   constructor() {
     this.refresh();
+  }
+
+  protected typeLabel(type: string | null): string {
+    switch (type) {
+      case 'TEXT':
+        return 'Text';
+      case 'PHOTO':
+        return 'Photo';
+      case 'NFC_QR':
+        return 'NFC/QR code';
+      case 'RFID':
+        return 'RFID tag';
+      default:
+        return type ?? '—';
+    }
+  }
+
+  protected toggleAudit(): void {
+    this.auditVisible.update((v) => !v);
+    if (!this.auditVisible()) return;
+    this.auditLoading.set(true);
+    this.api.listSubmissions('all').subscribe({
+      next: (list) => {
+        this.auditRows.set(list.filter((s) => s.auto_resolved));
+        this.auditLoading.set(false);
+      },
+      error: () => {
+        this.auditRows.set([]);
+        this.auditLoading.set(false);
+      },
+    });
   }
 
   protected refresh(): void {

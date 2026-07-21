@@ -103,6 +103,10 @@ interface Position {
               <div class="card-body">
                 <div class="small text-body-secondary mb-1">
                   Next challenge · difficulty {{ c.difficulty }}
+                  <span class="badge text-bg-light border ms-1">{{ typeLabel() }}</span>
+                  @if (isAuto()) {
+                    <span class="badge text-bg-info ms-1">Instant validation</span>
+                  }
                 </div>
                 <div class="fs-5" style="white-space: pre-line">{{ c.text }}</div>
                 @if (c.role_requirement; as req) {
@@ -141,25 +145,65 @@ interface Position {
               </div>
             </div>
 
-            <div class="mb-3">
-              <label class="form-label" for="photo">Photo (optional)</label>
-              <input
-                id="photo"
-                type="file"
-                class="form-control"
-                accept="image/*"
-                capture="environment"
-                (change)="onPhotoSelected($event)"
-              />
-              @if (photoName(); as n) {
-                <div class="small text-body-secondary mt-1">Selected: {{ n }}</div>
-              }
-            </div>
+            <!-- challenge-type-system: per-type submission inputs -->
+            @if (needsCode()) {
+              <div class="mb-3">
+                <label class="form-label" for="scan-code">
+                  <i class="bi bi-qr-code-scan"></i>
+                  Code from the venue / tag
+                </label>
+                <input
+                  id="scan-code"
+                  type="text"
+                  class="form-control"
+                  placeholder="Scan or paste the code"
+                  autocomplete="off"
+                  [value]="codeValue()"
+                  (input)="onCodeInput($event)"
+                />
+                <div class="form-text">
+                  Get the code at the location (QR / NFC handout), then paste
+                  or type it here. It is checked instantly.
+                </div>
+              </div>
+            } @else {
+              <div class="mb-3">
+                <label class="form-label" for="photo">
+                  Photo {{ needsPhoto() ? '(required)' : '(optional)' }}
+                </label>
+                <input
+                  id="photo"
+                  type="file"
+                  class="form-control"
+                  accept="image/*"
+                  capture="environment"
+                  (change)="onPhotoSelected($event)"
+                />
+                @if (photoName(); as n) {
+                  <div class="small text-body-secondary mt-1">Selected: {{ n }}</div>
+                }
+                @if (needsPhoto() && !photoName()) {
+                  <div class="form-text">
+                    This challenge is validated with a photo — take one to submit.
+                  </div>
+                }
+              </div>
+            }
 
             @if (submitError(); as msg) {
               <div class="alert alert-danger py-2">{{ msg }}</div>
             }
-            @if (submitSuccess()) {
+            @if (submitOutcome() === 1) {
+              <div class="alert alert-success py-2">
+                <i class="bi bi-check-circle"></i>
+                Code accepted — tower captured!
+              </div>
+            } @else if (submitOutcome() === 2) {
+              <div class="alert alert-danger py-2">
+                <i class="bi bi-x-circle"></i>
+                Code rejected. Check the code and try again after the cooloff.
+              </div>
+            } @else if (submitOutcome() === 0) {
               <div class="alert alert-success py-2">
                 Submission received. Staff will review it shortly.
               </div>
@@ -174,7 +218,7 @@ interface Position {
               @if (submitting()) {
                 <span class="spinner-border spinner-border-sm me-2"></span>
               }
-              Submit challenge
+              {{ needsCode() ? 'Validate code' : 'Submit challenge' }}
             </button>
           } @else {
             <div class="alert alert-secondary">No challenges available for this tower.</div>
@@ -202,9 +246,37 @@ export class TowerDetailComponent implements OnInit {
   protected readonly now = signal<number>(Date.now());
   protected readonly photoDataUrl = signal<string | null>(null);
   protected readonly photoName = signal<string | null>(null);
+  protected readonly codeValue = signal('');
   protected readonly submitting = signal(false);
   protected readonly submitError = signal<string | null>(null);
-  protected readonly submitSuccess = signal(false);
+  /** Outcome of the last submission (0 pending / 1 confirmed / 2 rejected). */
+  protected readonly submitOutcome = signal<number | null>(null);
+
+  // challenge-type-system: what the current challenge's type requires.
+  protected readonly requiredPayload = computed(
+    () => this.state()?.next_challenge?.required_payload ?? [],
+  );
+  protected readonly needsCode = computed(() =>
+    this.requiredPayload().includes('submitted_code'),
+  );
+  protected readonly needsPhoto = computed(() =>
+    this.requiredPayload().includes('photo'),
+  );
+  protected readonly isAuto = computed(
+    () => this.state()?.next_challenge?.effective_review_mode === 'AUTO',
+  );
+  protected readonly typeLabel = computed(() => {
+    switch (this.state()?.next_challenge?.type) {
+      case 'PHOTO':
+        return 'Photo';
+      case 'NFC_QR':
+        return 'QR / NFC code';
+      case 'RFID':
+        return 'RFID tag';
+      default:
+        return 'Question';
+    }
+  });
 
   protected readonly distanceMeters = computed(() => {
     const pos = this.position();
@@ -235,7 +307,10 @@ export class TowerDetailComponent implements OnInit {
       !s.pending_submission &&
       this.cooloffRemaining() === 0 &&
       this.withinRange() &&
-      !this.submitting()
+      !this.submitting() &&
+      // Per-type payload requirements (challenge-type-system).
+      (!this.needsCode() || this.codeValue().trim().length > 0) &&
+      (!this.needsPhoto() || this.photoDataUrl() !== null)
     );
   });
 
@@ -309,6 +384,10 @@ export class TowerDetailComponent implements OnInit {
     reader.readAsDataURL(file);
   }
 
+  protected onCodeInput(event: Event): void {
+    this.codeValue.set((event.target as HTMLInputElement).value);
+  }
+
   protected submit(): void {
     const s = this.state();
     const pos = this.position();
@@ -317,7 +396,7 @@ export class TowerDetailComponent implements OnInit {
     }
     this.submitting.set(true);
     this.submitError.set(null);
-    this.submitSuccess.set(false);
+    this.submitOutcome.set(null);
 
     this.api
       .submitChallenge({
@@ -326,13 +405,19 @@ export class TowerDetailComponent implements OnInit {
         lat: pos.lat,
         lng: pos.lng,
         photo: this.photoDataUrl() ?? undefined,
+        submitted_code: this.needsCode()
+          ? this.codeValue().trim()
+          : undefined,
       })
       .subscribe({
-        next: () => {
+        next: (created) => {
           this.submitting.set(false);
-          this.submitSuccess.set(true);
+          // AUTO types resolve immediately — surface the outcome now;
+          // MANUAL types come back PENDING (0) as before.
+          this.submitOutcome.set(created.outcome);
           this.photoDataUrl.set(null);
           this.photoName.set(null);
+          this.codeValue.set('');
           this.fetchState(s.id);
         },
         error: (err) => {
