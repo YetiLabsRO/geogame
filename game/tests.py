@@ -33,18 +33,31 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from game.admin import unassign_all
+from game.badges import (
+    CURRENT_FIRMWARE_VERSION,
+    GATEWAY_PROTOCOL_VERSION,
+    RING_PATTERN_ENERGY_FILL,
+    RING_PATTERN_IDLE,
+    RING_PATTERN_OUT,
+)
 from game.dementors import assign_initial_roles, economy_tick, run_tick
 from game.models import (
     FLIP_CAUSE_CONVERSION,
     FLIP_CAUSE_DIED,
     FLIP_CAUSE_DRAINED,
     FLIP_CAUSE_REVERSE_GAME,
+    PROXIMITY_SOURCE_BADGE,
+    PROXIMITY_SOURCE_PHONE,
     ROLE_REQUIREMENT_ALL,
     ROLE_REQUIREMENT_ANY,
     ROLE_REQUIREMENT_NONE,
+    BadgeAssignment,
+    BadgeDevice,
+    BadgeTelemetry,
     Challenge,
     DementorFlip,
     DementorState,
+    GatewayNode,
     PauseWindow,
     ProximityEvent,
     ProximityIdentity,
@@ -4073,3 +4086,669 @@ class DementorSwarmTest(TestCase):
             self.assertLess(state.energy, 100.0)
         # Loose CI-safe performance bound for one full tick at 100 phones.
         self.assertLess(elapsed, 10.0)
+
+
+# ---------------------------------------------------------------------------
+# Wearable badge hardware (wearable-badge-hardware)
+# ---------------------------------------------------------------------------
+
+
+def _badge(badge_id, **kwargs):
+    return BadgeDevice.objects.create(badge_id=badge_id, **kwargs)
+
+
+def _gateway(name='gw-north', **kwargs):
+    return GatewayNode.objects.create(name=name, **kwargs)
+
+
+def _assign_badge(badge, session, player=None, team=None):
+    assignment = BadgeAssignment.objects.create(
+        badge=badge, session=session, player=player, team=team,
+    )
+    BadgeDevice.objects.filter(pk=badge.pk).update(status='ASSIGNED')
+    badge.refresh_from_db()
+    return assignment
+
+
+def _ingest(gateway, observations=None, telemetry=None, version=GATEWAY_PROTOCOL_VERSION,
+            token=None):
+    client = APIClient()
+    payload = {
+        'protocol_version': version,
+        'observations': observations or [],
+        'telemetry': telemetry or [],
+    }
+    return client.post(
+        '/api/gateway/ingest/',
+        payload,
+        format='json',
+        HTTP_X_GATEWAY_TOKEN=gateway.token if token is None else token,
+    )
+
+
+def _obs(badge_id, seen_badge_id, rssi=-60, counter=1):
+    return {
+        'badge_id': badge_id,
+        'seen_badge_id': seen_badge_id,
+        'rssi': rssi,
+        'counter': counter,
+    }
+
+
+class GatewayIngestAuthTest(TestCase):
+    """T7.1 — gateway auth is required; protocol version is validated."""
+
+    def setUp(self):
+        self.gateway = _gateway()
+
+    def test_missing_token_is_unauthorized(self):
+        resp = _ingest(self.gateway, token='')
+        self.assertEqual(resp.status_code, 401)
+
+    def test_invalid_token_is_unauthorized(self):
+        resp = _ingest(self.gateway, token='not-a-real-token')
+        self.assertEqual(resp.status_code, 401)
+
+    def test_inactive_gateway_is_refused(self):
+        self.gateway.active = False
+        self.gateway.save(update_fields=['active'])
+        resp = _ingest(self.gateway)
+        self.assertEqual(resp.status_code, 401)
+
+    def test_wrong_protocol_version_is_rejected(self):
+        resp = _ingest(self.gateway, version=99)
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.json()['protocol_version'], GATEWAY_PROTOCOL_VERSION)
+
+    def test_valid_ingest_touches_gateway_last_seen(self):
+        self.assertIsNone(self.gateway.last_seen_at)
+        resp = _ingest(self.gateway)
+        self.assertEqual(resp.status_code, 200)
+        self.gateway.refresh_from_db()
+        self.assertIsNotNone(self.gateway.last_seen_at)
+        self.assertEqual(resp.json()['protocol_version'], GATEWAY_PROTOCOL_VERSION)
+
+    def test_player_token_is_not_a_gateway_credential(self):
+        game, session, team, players = _proximity_setup(1, name='Auth Game')
+        player_token = Token.objects.create(user=players[0].user)
+        resp = _ingest(self.gateway, token=player_token.key)
+        self.assertEqual(resp.status_code, 401)
+
+
+class GatewayIngestDedupTest(TestCase):
+    """T7.1 — dedupe by badge id + rolling counter across gateways."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            2, name='Dedup Game',
+        )
+        self.alice, self.bob = self.players
+        self.badge_a = _badge('aa110001')
+        self.badge_b = _badge('bb220002')
+        _assign_badge(self.badge_a, self.session, player=self.alice)
+        _assign_badge(self.badge_b, self.session, player=self.bob)
+        self.gw1 = _gateway('gw-1')
+        self.gw2 = _gateway('gw-2')
+
+    def test_second_gateway_relay_is_deduplicated(self):
+        first = _ingest(self.gw1, [_obs('aa110001', 'bb220002', counter=7)])
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()['accepted']['observations'], 1)
+        second = _ingest(self.gw2, [_obs('aa110001', 'bb220002', counter=7)])
+        self.assertEqual(second.json()['accepted']['observations'], 0)
+        self.assertEqual(second.json()['discarded']['duplicates'], 1)
+        self.assertEqual(
+            ProximityReport.objects.filter(session=self.session).count(), 1,
+        )
+
+    def test_in_batch_duplicate_is_deduplicated(self):
+        resp = _ingest(self.gw1, [
+            _obs('aa110001', 'bb220002', counter=3),
+            _obs('aa110001', 'bb220002', counter=3),
+        ])
+        self.assertEqual(resp.json()['accepted']['observations'], 1)
+        self.assertEqual(resp.json()['discarded']['duplicates'], 1)
+
+    def test_new_counter_is_a_new_observation(self):
+        _ingest(self.gw1, [_obs('aa110001', 'bb220002', counter=1)])
+        resp = _ingest(self.gw1, [_obs('aa110001', 'bb220002', counter=2)])
+        self.assertEqual(resp.json()['accepted']['observations'], 1)
+        self.assertEqual(resp.json()['discarded']['duplicates'], 0)
+
+
+class GatewayIngestTranslationTest(TestCase):
+    """T7.2 — badge observations feed the SAME substrate as phone BLE."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            2, name='Translation Game',
+        )
+        self.alice, self.bob = self.players
+        self.badge_a = _badge('aa110001')
+        self.badge_b = _badge('bb220002')
+        _assign_badge(self.badge_a, self.session, player=self.alice)
+        _assign_badge(self.badge_b, self.session, player=self.bob)
+        self.gateway = _gateway()
+
+    def test_translation_writes_badge_tagged_reports_in_identity_space(self):
+        resp = _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-60)])
+        self.assertEqual(resp.status_code, 200)
+        report = ProximityReport.objects.get(session=self.session)
+        self.assertEqual(report.player, self.alice)
+        self.assertEqual(report.source, PROXIMITY_SOURCE_BADGE)
+        # The seen badge resolved to bob's ProximityIdentity token — the
+        # exact same identity space the phone path uses.
+        bob_identity = ProximityIdentity.current_for(self.session, self.bob)
+        self.assertIsNotNone(bob_identity)
+        self.assertEqual(
+            report.observations, [{'token': bob_identity.token, 'rssi': -60}],
+        )
+
+    def test_two_directions_fuse_into_one_corroborated_badge_event(self):
+        resp = _ingest(self.gateway, [
+            _obs('aa110001', 'bb220002', rssi=-60, counter=1),
+            _obs('bb220002', 'aa110001', rssi=-58, counter=1),
+        ])
+        self.assertEqual(resp.json()['accepted']['observations'], 2)
+        self.assertGreaterEqual(resp.json()['events_derived'], 1)
+        event = ProximityEvent.objects.filter(session=self.session).latest('derived_at')
+        self.assertTrue(event.corroborated)
+        self.assertEqual(event.confidence, CONFIDENCE_CORROBORATED)
+        self.assertEqual(event.distance_bucket, PROXIMITY_BUCKET_NEAR)
+        self.assertEqual(event.source, PROXIMITY_SOURCE_BADGE)
+
+    def test_parity_with_the_phone_path(self):
+        """A badge observation derives the same nearness as a phone report."""
+        # Badge transport in this session.
+        _ingest(self.gateway, [
+            _obs('aa110001', 'bb220002', rssi=-60, counter=1),
+            _obs('bb220002', 'aa110001', rssi=-58, counter=1),
+        ])
+        badge_event = ProximityEvent.objects.filter(
+            session=self.session,
+        ).latest('derived_at')
+
+        # Equivalent phone transport, separate session, same RSSI.
+        game2 = _make_game('Phone Twin Game')
+        team2 = _make_team(game2, _make_group(game2), name='twin-team')
+        session2 = team2.session
+        carol = _make_player(team2, 'carol')
+        dave = _make_player(team2, 'dave')
+        _identity_for(session2, carol, token='cccc0001')
+        _identity_for(session2, dave, token='dddd0001')
+        _client_for(carol).post(
+            '/api/proximity/reports/',
+            {'observations': [{'token': 'dddd0001', 'rssi': -60}]},
+            format='json',
+        )
+        _client_for(dave).post(
+            '/api/proximity/reports/',
+            {'observations': [{'token': 'cccc0001', 'rssi': -58}]},
+            format='json',
+        )
+        phone_event = ProximityEvent.objects.filter(
+            session=session2,
+        ).latest('derived_at')
+
+        self.assertEqual(badge_event.distance_bucket, phone_event.distance_bucket)
+        self.assertEqual(badge_event.confidence, phone_event.confidence)
+        self.assertEqual(badge_event.corroborated, phone_event.corroborated)
+        self.assertEqual(phone_event.source, PROXIMITY_SOURCE_PHONE)
+        self.assertEqual(badge_event.source, PROXIMITY_SOURCE_BADGE)
+
+    def test_unknown_or_unassigned_badges_are_discarded(self):
+        _badge('ee550005')  # registered but never handed out
+        resp = _ingest(self.gateway, [
+            _obs('ffffffff', 'bb220002', counter=1),   # unknown observer
+            _obs('aa110001', 'ffffffff', counter=2),   # unknown seen badge
+            _obs('ee550005', 'bb220002', counter=3),   # unassigned observer
+        ])
+        self.assertEqual(resp.json()['accepted']['observations'], 0)
+        self.assertEqual(resp.json()['discarded']['observations'], 3)
+        self.assertEqual(ProximityReport.objects.count(), 0)
+
+    def test_cross_session_sighting_is_discarded(self):
+        other_game = _make_game('Other Park')
+        other_team = _make_team(other_game, _make_group(other_game), name='other-team')
+        eve = _make_player(other_team, 'eve')
+        badge_c = _badge('cc330003')
+        _assign_badge(badge_c, other_team.session, player=eve)
+        resp = _ingest(self.gateway, [_obs('aa110001', 'cc330003')])
+        self.assertEqual(resp.json()['accepted']['observations'], 0)
+        self.assertEqual(resp.json()['discarded']['observations'], 1)
+
+    def test_badge_proximity_drives_the_energy_economy(self):
+        """Transport parity where it matters: the drain is identical."""
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        past = timezone.now() - timedelta(seconds=10)
+        wizard = _state(self.session, self.alice, DementorState.WIZARD, 100.0,
+                        last_tick_at=past)
+        _state(self.session, self.bob, DementorState.DEMENTOR, 0.0,
+               last_tick_at=past)
+
+        resp = _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-60)])
+        self.assertGreaterEqual(resp.json()['events_derived'], 1)
+        wizard.refresh_from_db()
+        # ~10s of drain at the default 1.0/s (single wizard, no cluster).
+        self.assertLess(wizard.energy, 100.0)
+        self.assertAlmostEqual(wizard.energy, 90.0, delta=1.5)
+        self.assertLess(wizard.last_delta, 0.0)
+
+    def test_badge_asserted_outcomes_are_ignored(self):
+        """T2.6 — outcome-shaped fields never reach the game state."""
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        state = _state(self.session, self.alice, DementorState.WIZARD, 100.0,
+                       last_tick_at=timezone.now())
+        resp = _ingest(
+            self.gateway,
+            observations=[{
+                'badge_id': 'aa110001',
+                'seen_badge_id': 'bb220002',
+                'rssi': -90,
+                'counter': 1,
+                # Asserted outcomes a compromised badge might inject:
+                'role': 'DEMENTOR',
+                'energy': 0,
+                'outcome': 'wizard-is-now-dementor',
+            }],
+            telemetry=[{
+                'badge_id': 'aa110001',
+                'battery_pct': 55,
+                'role': 'DEMENTOR',
+                'energy': 0,
+            }],
+        )
+        self.assertEqual(resp.status_code, 200)
+        state.refresh_from_db()
+        self.assertEqual(state.role, DementorState.WIZARD)
+        self.assertGreater(state.energy, 99.0)  # -90 dBm is FAR: no drain
+        self.assertTrue(state.alive)
+        # The underlying observations WERE accepted (battery included).
+        self.badge_a.refresh_from_db()
+        self.assertEqual(self.badge_a.battery_pct, 55)
+
+
+class GatewayRangingTest(TestCase):
+    """T7.4 — RSSI→bucket policy lives server-side, per Session config."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            2, name='Ranging Game',
+        )
+        self.alice, self.bob = self.players
+        self.badge_a = _badge('aa110001')
+        self.badge_b = _badge('bb220002')
+        _assign_badge(self.badge_a, self.session, player=self.alice)
+        _assign_badge(self.badge_b, self.session, player=self.bob)
+        self.gateway = _gateway()
+
+    def _latest_bucket(self):
+        return ProximityEvent.objects.filter(
+            session=self.session,
+        ).latest('derived_at').distance_bucket
+
+    def test_session_override_changes_the_bucket_for_the_same_rssi(self):
+        _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-60, counter=1)])
+        self.assertEqual(self._latest_bucket(), PROXIMITY_BUCKET_NEAR)
+
+        # Same -60 dBm reading, but this Session widens VERY_CLOSE.
+        Session.objects.filter(pk=self.session.pk).update(
+            ble_rssi_very_close_dbm=-70,
+        )
+        ProximityEvent.objects.all().delete()  # no hysteresis carryover
+        _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-60, counter=2)])
+        self.assertEqual(self._latest_bucket(), PROXIMITY_BUCKET_VERY_CLOSE)
+
+    def test_noisy_rssi_is_smoothed_not_metric(self):
+        # A pair hovering at the NEAR/FAR boundary: FAR first, then a
+        # slightly stronger wobble stays FAR thanks to hysteresis.
+        _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-76, counter=1)])
+        self.assertEqual(self._latest_bucket(), PROXIMITY_BUCKET_FAR)
+        _ingest(self.gateway, [_obs('aa110001', 'bb220002', rssi=-73, counter=2)])
+        self.assertEqual(self._latest_bucket(), PROXIMITY_BUCKET_FAR)
+        # Buckets are ordinal labels — no metres anywhere in the event.
+        event = ProximityEvent.objects.filter(session=self.session).first()
+        self.assertIn(
+            event.distance_bucket,
+            {PROXIMITY_BUCKET_VERY_CLOSE, PROXIMITY_BUCKET_NEAR, PROXIMITY_BUCKET_FAR},
+        )
+
+    def test_out_of_range_rssi_is_discarded(self):
+        resp = _ingest(self.gateway, [
+            _obs('aa110001', 'bb220002', rssi=-300, counter=1),
+            _obs('aa110001', 'bb220002', rssi=50, counter=2),
+        ])
+        self.assertEqual(resp.json()['accepted']['observations'], 0)
+        self.assertEqual(resp.json()['discarded']['observations'], 2)
+
+
+class BadgeProvisioningApiTest(TestCase):
+    """T7.3 — register / hand-out / collect, and identity opacity."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            2, name='Provisioning Game',
+        )
+        self.alice, self.bob = self.players
+        self.staff, self.staff_user = _staff_client(session=self.session)
+
+    def test_register_creates_a_durable_opaque_asset(self):
+        resp = self.staff.post(
+            '/api/staff/badges/',
+            {'hardware_mac': 'AA:BB:CC:DD:EE:01', 'firmware_version': '0.1.0'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(len(body['badge_id']), 8)
+        self.assertEqual(body['status'], 'AVAILABLE')
+        # Opaque: the on-air id carries no player identity.
+        self.assertNotIn(self.alice.user.username, body['badge_id'])
+
+    def test_register_duplicate_badge_id_conflicts(self):
+        _badge('aa110001')
+        resp = self.staff.post(
+            '/api/staff/badges/', {'badge_id': 'aa110001'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_staff_only(self):
+        player_client = _client_for(self.alice)
+        badge = _badge('aa110001')
+        for method, url, payload in [
+            ('get', '/api/staff/badges/', None),
+            ('post', '/api/staff/badges/', {}),
+            ('post', f'/api/staff/badges/{badge.pk}/assign/', {}),
+            ('post', f'/api/staff/badges/{badge.pk}/collect/', {}),
+            ('get', '/api/staff/gateways/', None),
+            ('post', '/api/staff/gateways/', {'name': 'x'}),
+        ]:
+            resp = getattr(player_client, method)(url, payload, format='json')
+            self.assertEqual(resp.status_code, 403, url)
+
+    def test_hand_out_binds_badge_to_player_team_session(self):
+        badge = _badge('aa110001')
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/',
+            {'player_id': self.alice.pk, 'team_id': self.team.pk},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        badge.refresh_from_db()
+        self.assertEqual(badge.status, 'ASSIGNED')
+        assignment = badge.active_assignment()
+        self.assertEqual(assignment.player, self.alice)
+        self.assertEqual(assignment.team, self.team)
+        self.assertEqual(assignment.session, self.session)
+        body = resp.json()
+        self.assertEqual(body['assignment']['player_id'], self.alice.pk)
+
+    def test_hand_out_resolves_session_from_player(self):
+        badge = _badge('aa110001')
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/',
+            {'player_id': self.alice.pk},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(badge.active_assignment().session, self.session)
+
+    def test_hand_out_requires_a_holder(self):
+        badge = _badge('aa110001')
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/', {}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_double_hand_out_conflicts(self):
+        badge = _badge('aa110001')
+        _assign_badge(badge, self.session, player=self.alice)
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/',
+            {'player_id': self.bob.pk},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_collect_releases_for_reuse(self):
+        badge = _badge('aa110001')
+        assignment = _assign_badge(badge, self.session, player=self.alice)
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/collect/', {}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        assignment.refresh_from_db()
+        self.assertIsNotNone(assignment.released_at)
+        badge.refresh_from_db()
+        self.assertEqual(badge.status, 'AVAILABLE')
+        # And the badge can now be handed out again.
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/',
+            {'player_id': self.bob.pk},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+
+    def test_collect_without_assignment_conflicts(self):
+        badge = _badge('aa110001')
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/collect/', {}, format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_collect_can_mark_lost_and_lost_badges_cannot_be_handed_out(self):
+        badge = _badge('aa110001')
+        _assign_badge(badge, self.session, player=self.alice)
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/collect/',
+            {'mark_lost': True},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        badge.refresh_from_db()
+        self.assertEqual(badge.status, 'LOST')
+        resp = self.staff.post(
+            f'/api/staff/badges/{badge.pk}/assign/',
+            {'player_id': self.bob.pk},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_unreturned_flag_after_session_finish(self):
+        badge = _badge('aa110001')
+        _assign_badge(badge, self.session, player=self.alice)
+        Session.objects.filter(pk=self.session.pk).update(state=Session.FINISHED)
+        rows = self.staff.get('/api/staff/badges/').json()
+        row = {r['badge_id']: r for r in rows}['aa110001']
+        self.assertTrue(row['unreturned'])
+
+    def test_gateway_register_and_health_row(self):
+        resp = self.staff.post(
+            '/api/staff/gateways/',
+            {'name': 'North gate', 'transport': 'TABLET', 'coverage_note': 'main lawn'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(body['transport'], 'TABLET')
+        self.assertTrue(body['token'])
+        self.assertTrue(body['stale'])  # never seen yet
+        # After an ingest the health row goes fresh.
+        gateway = GatewayNode.objects.get(pk=body['id'])
+        _ingest(gateway)
+        rows = self.staff.get('/api/staff/gateways/').json()
+        self.assertFalse(rows[0]['stale'])
+
+    def test_on_air_downlink_payload_is_identity_free(self):
+        """T7.3 — nothing broadcast on the mesh names a real player."""
+        badge = _badge('aa110001')
+        _assign_badge(badge, self.session, player=self.alice)
+        gateway = _gateway()
+        body = _ingest(gateway).json()
+        self.assertEqual(len(body['badge_states']), 1)
+        entry = body['badge_states'][0]
+        self.assertEqual(
+            set(entry), {'badge_id', 'role', 'energy', 'alive', 'ring'},
+        )
+        self.assertNotIn(self.alice.user.username, str(body['badge_states']))
+
+
+class BadgeTelemetryApiTest(TestCase):
+    """T7.5 — telemetry persistence + fleet health flags."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            1, name='Telemetry Game',
+        )
+        self.alice = self.players[0]
+        self.badge = _badge('aa110001')
+        _assign_badge(self.badge, self.session, player=self.alice)
+        self.gateway = _gateway()
+        self.staff, _ = _staff_client(session=self.session)
+
+    def test_telemetry_is_persisted_and_registry_refreshed(self):
+        resp = _ingest(self.gateway, telemetry=[{
+            'badge_id': 'aa110001',
+            'battery_pct': 42,
+            'activity': 'RUNNING',
+            'gesture': 'CAST',
+            'imu': {'ax': 0.1, 'ay': 0.2, 'az': 9.8, 'dead_reckoning': [1.5, -0.5]},
+            'firmware_version': '0.1.0',
+        }])
+        self.assertEqual(resp.json()['accepted']['telemetry'], 1)
+        sample = BadgeTelemetry.objects.get(badge=self.badge)
+        self.assertEqual(sample.session, self.session)
+        self.assertEqual(sample.battery_pct, 42)
+        self.assertEqual(sample.activity, 'RUNNING')
+        self.assertEqual(sample.gesture, 'CAST')
+        self.assertEqual(sample.imu['dead_reckoning'], [1.5, -0.5])
+        self.badge.refresh_from_db()
+        self.assertEqual(self.badge.battery_pct, 42)
+        self.assertEqual(self.badge.firmware_version, '0.1.0')
+        self.assertIsNotNone(self.badge.last_seen_at)
+
+    def test_malformed_and_unknown_telemetry_is_discarded(self):
+        resp = _ingest(self.gateway, telemetry=[
+            'not-a-dict',
+            {'battery_pct': 50},                      # no badge_id
+            {'badge_id': 'ffffffff', 'battery_pct': 50},  # unknown badge
+        ])
+        self.assertEqual(resp.json()['accepted']['telemetry'], 0)
+        self.assertEqual(resp.json()['discarded']['telemetry'], 3)
+        self.assertEqual(BadgeTelemetry.objects.count(), 0)
+
+    def test_garbage_device_timestamp_is_dropped_not_fatal(self):
+        resp = _ingest(self.gateway, telemetry=[
+            {'badge_id': 'aa110001', 'battery_pct': 60, 'ts': 'not-a-time'},
+        ])
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['accepted']['telemetry'], 1)
+        sample = BadgeTelemetry.objects.get(badge=self.badge)
+        self.assertIsNone(sample.reported_at)
+
+    def test_valid_device_timestamp_is_recorded(self):
+        resp = _ingest(self.gateway, telemetry=[
+            {'badge_id': 'aa110001', 'ts': '2026-07-21T10:00:00Z'},
+        ])
+        self.assertEqual(resp.json()['accepted']['telemetry'], 1)
+        sample = BadgeTelemetry.objects.get(badge=self.badge)
+        self.assertIsNotNone(sample.reported_at)
+
+    def test_implausible_battery_is_dropped_but_sample_kept(self):
+        _ingest(self.gateway, telemetry=[{'badge_id': 'aa110001', 'battery_pct': 150}])
+        sample = BadgeTelemetry.objects.get(badge=self.badge)
+        self.assertIsNone(sample.battery_pct)
+        self.badge.refresh_from_db()
+        self.assertIsNone(self.badge.battery_pct)
+
+    def test_low_battery_flag_in_inventory(self):
+        _ingest(self.gateway, telemetry=[{'badge_id': 'aa110001', 'battery_pct': 12}])
+        rows = self.staff.get('/api/staff/badges/').json()
+        row = {r['badge_id']: r for r in rows}['aa110001']
+        self.assertTrue(row['battery_low'])
+        self.assertEqual(row['battery_pct'], 12)
+
+    def test_stale_and_firmware_flags_in_inventory(self):
+        BadgeDevice.objects.filter(pk=self.badge.pk).update(
+            last_seen_at=timezone.now() - timedelta(hours=1),
+            firmware_version='0.0.1',
+        )
+        fresh = _badge('bb220002', firmware_version=CURRENT_FIRMWARE_VERSION)
+        BadgeDevice.objects.filter(pk=fresh.pk).update(last_seen_at=timezone.now())
+        rows = {r['badge_id']: r for r in self.staff.get('/api/staff/badges/').json()}
+        self.assertTrue(rows['aa110001']['stale'])
+        self.assertTrue(rows['aa110001']['firmware_stale'])
+        self.assertFalse(rows['bb220002']['stale'])
+        self.assertFalse(rows['bb220002']['firmware_stale'])
+
+
+class GatewayDisplayStateTest(TestCase):
+    """T2.5 — per-badge authoritative display state in the ingest response."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(
+            2, name='Display Game',
+        )
+        self.alice, self.bob = self.players
+        self.badge_a = _badge('aa110001')
+        self.badge_b = _badge('bb220002')
+        _assign_badge(self.badge_a, self.session, player=self.alice)
+        _assign_badge(self.badge_b, self.session, player=self.bob)
+        self.gateway = _gateway()
+
+    def _states(self):
+        body = _ingest(self.gateway).json()
+        return {entry['badge_id']: entry for entry in body['badge_states']}
+
+    def test_idle_ring_when_dementors_mode_is_off(self):
+        states = self._states()
+        self.assertEqual(states['aa110001']['ring']['pattern'], RING_PATTERN_IDLE)
+        self.assertIsNone(states['aa110001']['role'])
+
+    def test_energy_and_role_map_to_ring_fill(self):
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        _state(self.session, self.alice, DementorState.WIZARD, 75.0)
+        _state(self.session, self.bob, DementorState.DEMENTOR, 25.0)
+        states = self._states()
+        wizard = states['aa110001']
+        self.assertEqual(wizard['role'], 'WIZARD')
+        self.assertEqual(wizard['energy'], 75.0)
+        self.assertEqual(wizard['ring']['pattern'], RING_PATTERN_ENERGY_FILL)
+        self.assertEqual(wizard['ring']['fill_pct'], 75)
+        self.assertEqual(wizard['ring']['color'], 'WARM')
+        dementor = states['bb220002']
+        self.assertEqual(dementor['ring']['color'], 'COLD')
+        self.assertEqual(dementor['ring']['fill_pct'], 25)
+
+    def test_out_of_play_ring_pattern(self):
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        _state(self.session, self.alice, DementorState.WIZARD, 0.0, alive=False)
+        states = self._states()
+        self.assertEqual(states['aa110001']['ring']['pattern'], RING_PATTERN_OUT)
+        self.assertFalse(states['aa110001']['alive'])
+
+    def test_released_badges_drop_out_of_the_downlink(self):
+        self.badge_b.active_assignment().release()
+        states = self._states()
+        self.assertIn('aa110001', states)
+        self.assertNotIn('bb220002', states)
+
+    def test_ingest_with_observations_returns_post_tick_state(self):
+        """The downlink reflects the energy AFTER this batch's tick."""
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        past = timezone.now() - timedelta(seconds=10)
+        _state(self.session, self.alice, DementorState.WIZARD, 100.0,
+               last_tick_at=past)
+        _state(self.session, self.bob, DementorState.DEMENTOR, 0.0,
+               last_tick_at=past)
+        body = _ingest(
+            self.gateway, [_obs('aa110001', 'bb220002', rssi=-60)],
+        ).json()
+        states = {entry['badge_id']: entry for entry in body['badge_states']}
+        self.assertLess(states['aa110001']['energy'], 100.0)
+        self.assertLess(states['aa110001']['ring']['fill_pct'], 100)

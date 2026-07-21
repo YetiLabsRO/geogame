@@ -690,6 +690,19 @@ class TeamTowerFailCounter(models.Model):
 # BLE proximity substrate (ble-proximity capability)
 # ---------------------------------------------------------------------------
 
+# Transport that produced a proximity report / derived event
+# (wearable-badge capability). PHONE is the pre-existing phone-BLE path
+# and stays the default so the substrate is unchanged without badges;
+# MIXED marks a pair corroborated across both transports.
+PROXIMITY_SOURCE_PHONE = 'PHONE'
+PROXIMITY_SOURCE_BADGE = 'BADGE'
+PROXIMITY_SOURCE_MIXED = 'MIXED'
+PROXIMITY_SOURCE_CHOICES = [
+    (PROXIMITY_SOURCE_PHONE, 'Phone BLE'),
+    (PROXIMITY_SOURCE_BADGE, 'Wearable badge (ESP-NOW via gateway)'),
+    (PROXIMITY_SOURCE_MIXED, 'Corroborated across phone and badge'),
+]
+
 # Flip/convert causes recorded on DementorFlip (mode-dementors).
 FLIP_CAUSE_DRAINED = 'DRAINED'
 FLIP_CAUSE_DIED = 'DIED'
@@ -794,6 +807,14 @@ class ProximityReport(models.Model):
         'organize.UserProfile', on_delete=models.CASCADE, related_name='proximity_reports',
     )
     observations = models.JSONField(default=list, blank=True)
+    # Transport that produced this report: the phone-BLE endpoint writes
+    # PHONE (default), the gateway ingest path writes BADGE. Derivation
+    # treats both identically (transport-agnostic economy).
+    source = models.CharField(
+        max_length=8,
+        choices=PROXIMITY_SOURCE_CHOICES,
+        default=PROXIMITY_SOURCE_PHONE,
+    )
     # Device-clock timestamp as claimed by the phone; untrusted, kept for
     # diagnostics only. `received_at` (server clock) drives freshness.
     reported_at = models.DateTimeField(null=True, blank=True)
@@ -830,6 +851,14 @@ class ProximityEvent(models.Model):
     distance_bucket = models.CharField(max_length=16)
     confidence = models.FloatField(default=0.5)
     corroborated = models.BooleanField(default=False)
+    # Which transport(s) evidenced this pair: PHONE, BADGE, or MIXED when
+    # the contributing reports span both. Purely informational — the
+    # energy economy treats all sources uniformly (wearable-badge spec).
+    source = models.CharField(
+        max_length=8,
+        choices=PROXIMITY_SOURCE_CHOICES,
+        default=PROXIMITY_SOURCE_PHONE,
+    )
     derived_at = models.DateTimeField()
 
     class Meta:
@@ -929,4 +958,279 @@ class DementorFlip(models.Model):
         return (
             f'DementorFlip({self.state.player}: {self.from_role} → '
             f'{self.to_role}, {self.cause})'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Wearable badge hardware (wearable-badge capability)
+# ---------------------------------------------------------------------------
+
+# Fleet status of a physical badge. AVAILABLE/ASSIGNED are the normal
+# hand-out/collect cycle; the rest are staff-managed exception states.
+BADGE_STATUS_AVAILABLE = 'AVAILABLE'
+BADGE_STATUS_ASSIGNED = 'ASSIGNED'
+BADGE_STATUS_MAINTENANCE = 'MAINTENANCE'
+BADGE_STATUS_LOST = 'LOST'
+BADGE_STATUS_RETIRED = 'RETIRED'
+BADGE_STATUS_CHOICES = [
+    (BADGE_STATUS_AVAILABLE, 'Available'),
+    (BADGE_STATUS_ASSIGNED, 'Assigned'),
+    (BADGE_STATUS_MAINTENANCE, 'Maintenance / charging'),
+    (BADGE_STATUS_LOST, 'Lost / not returned'),
+    (BADGE_STATUS_RETIRED, 'Retired'),
+]
+
+# Gateway uplink transports.
+GATEWAY_TRANSPORT_WIFI = 'WIFI'
+GATEWAY_TRANSPORT_CELLULAR = 'CELLULAR'
+GATEWAY_TRANSPORT_TABLET = 'TABLET'
+GATEWAY_TRANSPORT_CHOICES = [
+    (GATEWAY_TRANSPORT_WIFI, 'ESP32 + WiFi'),
+    (GATEWAY_TRANSPORT_CELLULAR, 'ESP32 + 4G/cellular'),
+    (GATEWAY_TRANSPORT_TABLET, 'Organizer tablet relay app'),
+]
+
+# IMU activity classes a badge may report (advisory telemetry).
+BADGE_ACTIVITY_RUNNING = 'RUNNING'
+BADGE_ACTIVITY_STANDING = 'STANDING'
+BADGE_ACTIVITY_STILL = 'STILL'
+BADGE_ACTIVITY_CHOICES = [
+    (BADGE_ACTIVITY_RUNNING, 'Running'),
+    (BADGE_ACTIVITY_STANDING, 'Standing'),
+    (BADGE_ACTIVITY_STILL, 'Still'),
+]
+
+# IMU gesture events a badge may report. The server decides any effect;
+# currently gestures are recorded as telemetry only (no game rule
+# consumes them yet).
+BADGE_GESTURE_CAST = 'CAST'
+BADGE_GESTURE_DRAIN = 'DRAIN'
+BADGE_GESTURE_CHOICES = [
+    (BADGE_GESTURE_CAST, 'Cast flick'),
+    (BADGE_GESTURE_DRAIN, 'Drain flick'),
+]
+
+
+def _generate_badge_id():
+    """Short opaque on-air badge id (8 hex chars, like proximity tokens).
+
+    Carries no player identity — resolution to a player/team happens
+    only server-side through the badge's active BadgeAssignment.
+    """
+    import secrets
+    return secrets.token_hex(4)
+
+
+def _generate_gateway_token():
+    """Per-gateway API credential (not a player token)."""
+    import secrets
+    return secrets.token_hex(20)
+
+
+class BadgeDevice(models.Model):
+    """A physical ESP32-C3 wearable badge — a durable fleet asset.
+
+    `badge_id` is the opaque identifier the badge broadcasts over
+    ESP-NOW; a lost or borrowed badge never exposes a real identity on
+    the air. Battery/firmware/last-seen are updated from gateway-relayed
+    telemetry so staff can manage the fleet.
+    """
+
+    badge_id = models.CharField(max_length=16, unique=True, default=_generate_badge_id)
+    hardware_mac = models.CharField(max_length=17, unique=True, null=True, blank=True)
+    firmware_version = models.CharField(max_length=32, blank=True, default='')
+    battery_pct = models.PositiveSmallIntegerField(null=True, blank=True)
+    status = models.CharField(
+        max_length=16,
+        choices=BADGE_STATUS_CHOICES,
+        default=BADGE_STATUS_AVAILABLE,
+    )
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    note = models.TextField(blank=True, default='')
+    registered_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['badge_id']
+
+    def __str__(self):
+        return f'Badge {self.badge_id} ({self.status})'
+
+    def active_assignment(self):
+        """The open BadgeAssignment for this badge, or None."""
+        return self.assignments.filter(released_at__isnull=True).select_related(
+            'session', 'player__user', 'team',
+        ).first()
+
+
+class GatewayNode(models.Model):
+    """A gateway relay node (ESP32 + WiFi/4G, or an organizer tablet).
+
+    Gateways are thin: they batch what badges observed and POST it to
+    the ingest endpoint, authenticated by their own per-gateway `token`
+    (never a player token). The server resolves badge ids and decides
+    everything.
+    """
+
+    name = models.CharField(max_length=255)
+    transport = models.CharField(
+        max_length=16,
+        choices=GATEWAY_TRANSPORT_CHOICES,
+        default=GATEWAY_TRANSPORT_WIFI,
+    )
+    token = models.CharField(max_length=64, unique=True, default=_generate_gateway_token)
+    active = models.BooleanField(default=True)
+    last_seen_at = models.DateTimeField(null=True, blank=True)
+    coverage_note = models.TextField(blank=True, default='')
+    registered_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['name']
+
+    def __str__(self):
+        return f'Gateway {self.name} ({self.transport})'
+
+
+class BadgeAssignment(models.Model):
+    """Hand-out binding of a BadgeDevice to a player/team for a Session.
+
+    Created at hand-out, released at collection so the same physical
+    badge is reused across events. While active, observations of the
+    badge's on-air id resolve to this assignment; a team-only binding
+    (no player) still records telemetry but cannot feed the per-player
+    proximity economy.
+    """
+
+    badge = models.ForeignKey(
+        BadgeDevice, on_delete=models.CASCADE, related_name='assignments',
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='badge_assignments',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='badge_assignments',
+    )
+    team = models.ForeignKey(
+        'organize.Team',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='badge_assignments',
+    )
+    assigned_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='badge_assignments_made',
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+    released_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-assigned_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['badge'],
+                condition=models.Q(released_at__isnull=True),
+                name='unique_active_badge_assignment',
+            ),
+        ]
+
+    def __str__(self):
+        holder = self.player or self.team or 'unbound'
+        state = 'active' if self.released_at is None else 'released'
+        return f'BadgeAssignment({self.badge.badge_id} → {holder}, {state})'
+
+    def release(self, when=None):
+        """Collect: close this assignment and free the badge for reuse."""
+        self.released_at = when or _now()
+        self.save(update_fields=['released_at'])
+        BadgeDevice.objects.filter(pk=self.badge_id).update(
+            status=BADGE_STATUS_AVAILABLE,
+        )
+        return self
+
+    def is_unreturned(self):
+        """Still assigned although its session has finished — flag it."""
+        from organize.models import Session
+        return self.released_at is None and self.session.state == Session.FINISHED
+
+
+class BadgeTelemetry(models.Model):
+    """One badge health/IMU sample relayed by a gateway.
+
+    Battery, activity class, gesture events, raw IMU payloads and
+    dead-reckoned positions are all advisory telemetry: the server
+    records them and MAY apply rules to them, but never treats them as
+    an asserted game outcome.
+    """
+
+    badge = models.ForeignKey(
+        BadgeDevice, on_delete=models.CASCADE, related_name='telemetry',
+    )
+    session = models.ForeignKey(
+        'organize.Session',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='badge_telemetry',
+    )
+    battery_pct = models.PositiveSmallIntegerField(null=True, blank=True)
+    activity = models.CharField(
+        max_length=16, choices=BADGE_ACTIVITY_CHOICES, null=True, blank=True,
+    )
+    gesture = models.CharField(
+        max_length=16, choices=BADGE_GESTURE_CHOICES, null=True, blank=True,
+    )
+    # Raw IMU sample / dead-reckoning payload as relayed (advisory).
+    imu = models.JSONField(default=dict, blank=True)
+    # Device-clock timestamp as claimed by the badge; untrusted.
+    reported_at = models.DateTimeField(null=True, blank=True)
+    recorded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-recorded_at']
+        indexes = [
+            models.Index(fields=['badge', 'recorded_at']),
+        ]
+
+    def __str__(self):
+        return f'BadgeTelemetry({self.badge.badge_id} @ {self.recorded_at})'
+
+
+class BadgeObservationSeen(models.Model):
+    """Ingest dedup marker: (observer, seen, beacon counter) already relayed.
+
+    Overlapping gateway coverage means two gateways can relay the same
+    badge observation; the unique constraint here is what makes the
+    second copy a no-op (dedupe by badge id + rolling counter, per the
+    wearable-badge spec). Rows are pruned after a retention horizon —
+    beacon counters roll over far more slowly than that.
+    """
+
+    badge = models.ForeignKey(
+        BadgeDevice, on_delete=models.CASCADE, related_name='observation_markers',
+    )
+    seen_badge = models.ForeignKey(
+        BadgeDevice, on_delete=models.CASCADE, related_name='+',
+    )
+    counter = models.PositiveIntegerField()
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['badge', 'seen_badge', 'counter'],
+                name='unique_badge_observation_counter',
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f'BadgeObservationSeen({self.badge.badge_id} heard '
+            f'{self.seen_badge.badge_id} #{self.counter})'
         )
