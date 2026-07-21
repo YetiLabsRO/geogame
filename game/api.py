@@ -13,9 +13,11 @@ from game.models import (
     Challenge,
     TeamTowerChallenge,
     Tower,
+    TowerLock,
     effective_proximity,
 )
 from game.scoping import SessionScopedViewSetMixin
+from organize.models import TOWER_LOCK_ON_INITIATE
 
 
 class ChallengeSummarySerializer(serializers.ModelSerializer):
@@ -70,6 +72,37 @@ def _role_requirement_payload(challenge, team):
     }
 
 
+def _active_membership(request):
+    """The caller's active TeamMembership (with team), or None."""
+    return (
+        request.user.profile.memberships
+        .filter(is_active=True)
+        .select_related('team')
+        .first()
+    )
+
+
+def _lock_payload(lock, team, now=None):
+    """Player-facing view of an active lock (tower-locking § visibility).
+
+    None when there is no active lock. `held_by_us` drives the
+    locked-by-us / locked-by-others distinction; `expires_at` +
+    `remaining_seconds` drive the finish-deadline countdown.
+    """
+    if lock is None:
+        return None
+    now = now or timezone.now()
+    return {
+        'held_by_us': lock.team_id == team.id,
+        'team_id': lock.team_id,
+        'team_name': lock.team.name,
+        'team_color': lock.team.color,
+        'started_at': lock.started_at.isoformat(),
+        'expires_at': lock.expires_at.isoformat(),
+        'remaining_seconds': lock.remaining_seconds(now),
+    }
+
+
 class TowerStateView(APIView):
     """Player-facing state for a specific tower.
 
@@ -82,12 +115,7 @@ class TowerStateView(APIView):
 
     def get(self, request, pk):
         tower = get_object_or_404(Tower, pk=pk, is_active=True)
-        membership = (
-            request.user.profile.memberships
-            .filter(is_active=True)
-            .select_related('team')
-            .first()
-        )
+        membership = _active_membership(request)
         if membership is None:
             return Response(
                 {'detail': 'You are not a member of any team.'},
@@ -141,6 +169,12 @@ class TowerStateView(APIView):
                 'team_color': ownership.color,
             }
 
+        # tower-locking: effective mode + the group's active lock (if
+        # any) so the client can render locked-by-us / locked-by-others /
+        # free and the finish-deadline countdown.
+        lock_mode = team.session.effective('tower_lock_mode')
+        lock = tower.active_lock(team.group)
+
         return Response({
             'id': tower.id,
             'name': tower.name,
@@ -160,7 +194,127 @@ class TowerStateView(APIView):
             # Effective capture radius: the tower's own override when
             # set, else the Game default (zone-conquest-and-scoring-config).
             'proximity_meters': effective_proximity(tower, team.session.game),
+            'tower_lock_mode': lock_mode,
+            'lock': _lock_payload(lock, team),
         })
+
+
+# ---------------------------------------------------------------------------
+# tower-locking: identify → initiate lifecycle endpoints
+# ---------------------------------------------------------------------------
+
+
+class TowerIdentifyView(APIView):
+    """POST /api/towers/{id}/identify/ — the IDENTIFY lifecycle phase.
+
+    Serves the caller team's next challenge via `get_next_challenge`
+    with no side effects: identifying never commits the team, never
+    touches any lock, and is safe to repeat.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        tower = get_object_or_404(Tower, pk=pk, is_active=True)
+        membership = _active_membership(request)
+        if membership is None:
+            return Response(
+                {'detail': 'You are not a member of any team.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        team = membership.team
+        challenge = tower.get_next_challenge(team)
+        payload = None
+        if challenge is not None:
+            payload = ChallengeSummarySerializer(challenge).data
+            payload['role_requirement'] = _role_requirement_payload(challenge, team)
+        return Response({
+            'id': tower.id,
+            'tower_lock_mode': team.session.effective('tower_lock_mode'),
+            'next_challenge': payload,
+            'lock': _lock_payload(tower.active_lock(team.group), team),
+        })
+
+
+class TowerInitiateView(APIView):
+    """POST /api/towers/{id}/initiate/ — the INITIATE lifecycle phase.
+
+    Under LOCK_ON_INITIATE this is the commitment point: it acquires a
+    TowerLock for the caller team's group (409 when another team in the
+    group holds the active lock). Under FREE_FOR_ALL it is a side-effect
+    -free acknowledgement so pre-locking clients keep working unchanged.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        tower = get_object_or_404(Tower, pk=pk, is_active=True)
+        membership = _active_membership(request)
+        if membership is None:
+            return Response(
+                {'detail': 'You are not a member of any team.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        team = membership.team
+        mode = team.session.effective('tower_lock_mode')
+        if mode != TOWER_LOCK_ON_INITIATE:
+            return Response({
+                'tower_lock_mode': mode,
+                'locked': False,
+                'lock': None,
+            })
+        if team.group_id is None:
+            return Response(
+                {'detail': 'Your team has no group; locks are scoped per team group.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        minutes = team.session.effective('tower_lock_finish_minutes')
+        lock, created = TowerLock.acquire(tower, team, minutes)
+        if lock is None:
+            holder = tower.active_lock(team.group)
+            return Response(
+                {
+                    'detail': 'Turnul este blocat de altă echipă.',
+                    'lock': _lock_payload(holder, team),
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        return Response(
+            {
+                'tower_lock_mode': mode,
+                'locked': True,
+                'lock': _lock_payload(lock, team),
+            },
+            status=status.HTTP_201_CREATED if created else status.HTTP_200_OK,
+        )
+
+
+class TowerLockReleaseView(APIView):
+    """POST /api/towers/{id}/release_lock/ — voluntary CANCELLED release.
+
+    The lock-holding team may give up its own active lock early, freeing
+    the tower for the rest of its group before the deadline (§3.5).
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request, pk):
+        tower = get_object_or_404(Tower, pk=pk, is_active=True)
+        membership = _active_membership(request)
+        if membership is None:
+            return Response(
+                {'detail': 'You are not a member of any team.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
+        team = membership.team
+        lock = tower.active_lock(team.group)
+        if lock is None or lock.team_id != team.id:
+            return Response(
+                {'detail': 'Your team holds no active lock on this tower.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        lock.release(TowerLock.CANCELLED)
+        return Response({'released': True})
 
 
 # ---------------------------------------------------------------------------
@@ -292,6 +446,23 @@ class StaffSubmissionReview(APIView):
             )
         outcome_str = request.data.get('outcome')
         if outcome_str == 'confirm':
+            # tower-locking: defense against a stale attempt — while an
+            # active lock is held by ANOTHER team in the submitter's
+            # group under LOCK_ON_INITIATE, that team's finish cannot be
+            # confirmed (the capture belongs to the lock holder).
+            team = submission.team
+            if team.session.effective('tower_lock_mode') == TOWER_LOCK_ON_INITIATE:
+                lock = submission.tower.active_lock(team.group)
+                if lock is not None and lock.team_id != team.id:
+                    return Response(
+                        {
+                            'detail': (
+                                'The tower is locked to another team; '
+                                'this finish cannot be confirmed while the lock is active.'
+                            ),
+                        },
+                        status=status.HTTP_409_CONFLICT,
+                    )
             submission.outcome = TeamTowerChallenge.CONFIRMED
         elif outcome_str == 'reject':
             submission.outcome = TeamTowerChallenge.REJECTED

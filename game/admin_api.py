@@ -28,6 +28,7 @@ from game.models import (
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
+    TowerLock,  # tower-locking
     TowerPhoto,
     Zone,
 )
@@ -1236,6 +1237,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'realtime_enabled', 'push_notifications_enabled',
             # NFC capture-mode knobs (defaults preserve legacy URLs).
             'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
+            # Tower-locking knobs (default FREE_FOR_ALL = today's behavior).
+            'tower_lock_mode', 'tower_lock_finish_minutes',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -1410,6 +1413,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'realtime_enabled', 'push_notifications_enabled',
             # NFC capture-mode overrides (null = inherit Game default).
             'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
+            # Tower-locking overrides (null = inherit Game default).
+            'tower_lock_mode', 'tower_lock_finish_minutes',
             # Game-mode override (mode-trail-discovery; null = inherit).
             'mode',
             'created_at',
@@ -1723,3 +1728,66 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
                 )
                 cursor += 1
         return Response(self._assignment_payload(teams), status=status.HTTP_200_OK)
+
+
+# ---------------------------------------------------------------------------
+# tower-locking: staff visibility of active locks + cancel
+# ---------------------------------------------------------------------------
+
+
+class StaffTowerLockSerializer(serializers.ModelSerializer):
+    tower_name = serializers.CharField(source='tower.name', read_only=True)
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    team_color = serializers.CharField(source='team.color', read_only=True)
+    group_name = serializers.CharField(
+        source='group.name', read_only=True, default=None,
+    )
+    remaining_seconds = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TowerLock
+        fields = (
+            'id', 'tower', 'tower_name', 'team', 'team_name', 'team_color',
+            'group', 'group_name', 'started_at', 'expires_at',
+            'released_at', 'release_reason', 'remaining_seconds',
+        )
+
+    def get_remaining_seconds(self, lock):
+        return lock.remaining_seconds()
+
+
+class StaffTowerLockViewSet(SessionScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
+    """Staff-only view of the current session's ACTIVE tower locks.
+
+    `GET /api/staff/tower_locks/` lists active locks (released and
+    lapsed locks are excluded — lazy expiry); `POST {id}/cancel/`
+    force-releases one with `release_reason=CANCELLED`.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = (
+        TowerLock.objects
+        .select_related('tower', 'team', 'group')
+        .order_by('expires_at')
+    )
+    serializer_class = StaffTowerLockSerializer
+    session_scope_field = 'team__session'
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, 'action', None) == 'list':
+            return qs.filter(
+                released_at__isnull=True, expires_at__gt=timezone.now(),
+            )
+        return qs
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        lock = self.get_object()
+        if not lock.is_active():
+            return Response(
+                {'detail': 'Lock is no longer active.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        lock.release(TowerLock.CANCELLED)
+        return Response(self.get_serializer(lock).data)

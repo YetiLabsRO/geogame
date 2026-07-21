@@ -56,6 +56,16 @@ TIME_UNIT_SECONDS = {
     TIME_UNIT_HOUR: 3600,
 }
 
+
+# Tower locking modes (tower-locking capability). FREE_FOR_ALL preserves
+# today's race-to-finish contention exactly; LOCK_ON_INITIATE grants the
+# initiating team an exclusive finish window per TeamGroup.
+TOWER_LOCK_FREE_FOR_ALL = 'FREE_FOR_ALL'
+TOWER_LOCK_ON_INITIATE = 'LOCK_ON_INITIATE'
+TOWER_LOCK_MODE_CHOICES = [
+    (TOWER_LOCK_FREE_FOR_ALL, 'Free for all — last confirmed finish owns the tower'),
+    (TOWER_LOCK_ON_INITIATE, 'Lock on initiate — the initiating team gets an exclusive finish window'),
+]
 # Team-join confirmation policies (player-team-formation).
 JOIN_CONFIRM_AUTO_APPROVE = 'AUTO_APPROVE'
 JOIN_CONFIRM_CAPTAIN = 'CAPTAIN'
@@ -148,6 +158,9 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'nfc_secure_mode',
     'nfc_require_app',
     'nfc_replay_hardening',
+    # Tower-locking knobs (tower-locking capability).
+    'tower_lock_mode',
+    'tower_lock_finish_minutes',
 )
 
 
@@ -234,6 +247,17 @@ class Game(models.Model):
     max_teams = models.PositiveSmallIntegerField(default=0)
     min_members_per_team = models.PositiveSmallIntegerField(default=1)
     max_members_per_team = models.PositiveSmallIntegerField(default=0)
+
+    # --- Tower-locking knobs (tower-locking capability). The default
+    # FREE_FOR_ALL preserves today's contention behavior exactly;
+    # tower_lock_finish_minutes is only consulted in LOCK_ON_INITIATE.
+    # Overridable per Session (see Session.effective). ---
+    tower_lock_mode = models.CharField(
+        max_length=16,
+        choices=TOWER_LOCK_MODE_CHOICES,
+        default=TOWER_LOCK_FREE_FOR_ALL,
+    )
+    tower_lock_finish_minutes = models.PositiveSmallIntegerField(default=15)
 
     # --- Player team-formation knobs. Defaults preserve today's
     # staff-only roster building; overridable per Session
@@ -658,6 +682,15 @@ class Session(models.Model):
     nfc_secure_mode = models.BooleanField(null=True, blank=True)
     nfc_require_app = models.BooleanField(null=True, blank=True)
     nfc_replay_hardening = models.BooleanField(null=True, blank=True)
+
+    # --- Tower-locking overrides. NULL means "inherit the Game
+    # default"; resolve with Session.effective(field). ---
+    tower_lock_mode = models.CharField(
+        max_length=16, choices=TOWER_LOCK_MODE_CHOICES, null=True, blank=True,
+    )
+    tower_lock_finish_minutes = models.PositiveSmallIntegerField(
+        null=True, blank=True,
+    )
 
     # --- Team-composition overrides. NULL means "inherit the Game
     # default"; a 0 maximum means "explicitly no cap". ---

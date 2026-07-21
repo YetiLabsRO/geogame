@@ -30,7 +30,8 @@ from channels.db import database_sync_to_async
 from channels.testing import HttpCommunicator, WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
-from django.db import connection
+from django.core.management import call_command  # tower-locking
+from django.db import IntegrityError, connection, transaction  # tower-locking
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
@@ -50,7 +51,7 @@ from game.challenge_types import (
     TYPE_TEXT,
     get_handler,
 )
-from game.models import (  # mode-trail-discovery  # nfc-native-and-secure-links
+from game.models import (  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links
     KNOWLEDGE_ALL_KNOWN,
     KNOWLEDGE_NONE_KNOWN,
     KNOWLEDGE_ONE_KNOWN,
@@ -78,6 +79,7 @@ from game.models import (  # mode-trail-discovery  # nfc-native-and-secure-links
     TeamTrailRoute,
     TeamZoneOwnership,
     Tower,
+    TowerLock,
     TowerPhoto,
     Trail,
     TrailEdge,
@@ -88,6 +90,8 @@ from geogame.asgi import application as asgi_application
 from organize.models import (  # mode-trail-discovery
     MODE_DOMINATION,
     MODE_TRAIL,
+    TOWER_LOCK_FREE_FOR_ALL,
+    TOWER_LOCK_ON_INITIATE,
     Game,
     GameCollaborator,
     GameRole,
@@ -7789,3 +7793,612 @@ class TrailCompletionRankingTest(TestCase):
         validate = staff.get(f'/api/staff/trails/{trail_id}/validate/')
         self.assertEqual(validate.status_code, 200)
         self.assertTrue(validate.data['valid'])
+# ---------------------------------------------------------------------------
+# tower-locking — identify → initiate → finish + locking modes
+# ---------------------------------------------------------------------------
+
+
+class TowerLockingBase(TestCase):
+    """Shared fixture for the tower-locking scenarios.
+
+    Game in LOCK_ON_INITIATE with a 15-minute finish window, one zone,
+    one tower, two teams in the same group plus one team in a second
+    group — enough to exercise contention and per-group isolation.
+    """
+
+    LOCK_MODE = TOWER_LOCK_ON_INITIATE
+
+    def setUp(self):
+        self.game = _make_game(name='Lock Game')
+        self.game.tower_lock_mode = self.LOCK_MODE
+        self.game.save(update_fields=['tower_lock_mode'])
+        self.group = _make_group(self.game)
+        self.other_group = _make_group(self.game, name='Temerari', slug='temerari')
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone, initial_bonus=10)
+        self.session = _default_session(self.game)
+        self.team1 = _make_team(self.game, self.group, name='alpha')
+        self.team2 = _make_team(self.game, self.group, name='bravo', color='#663300')
+        self.team3 = _make_team(
+            self.game, self.other_group, name='charlie', color='#336600',
+        )
+        self.challenge = Challenge.objects.create(
+            text='c1', tower=self.tower, difficulty=1, game=self.game,
+        )
+        self.client1, self.user1 = _authed_client(self.team1, username='p1')
+        self.client2, self.user2 = _authed_client(self.team2, username='p2')
+        self.client3, self.user3 = _authed_client(self.team3, username='p3')
+
+    def _initiate(self, client, tower=None):
+        tower = tower or self.tower
+        return client.post(f'/api/towers/{tower.pk}/initiate/')
+
+    def _submit(self, client, tower=None, challenge=None):
+        tower = tower or self.tower
+        return client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': tower.pk,
+                'challenge': (challenge or self.challenge).pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+
+    def _confirm(self, ttc_id):
+        staff_client, _ = _staff_client(self.session, username=f'staff{ttc_id}')
+        return staff_client.post(
+            f'/api/staff/submissions/{ttc_id}/review/',
+            {'outcome': 'confirm'},
+            format='json',
+        )
+
+    def _expire_lock(self, lock):
+        """Push a lock's deadline into the past without releasing it."""
+        TowerLock.objects.filter(pk=lock.pk).update(
+            expires_at=timezone.now() - timedelta(seconds=1),
+        )
+        lock.refresh_from_db()
+        return lock
+
+
+class TowerLockConfigTest(TestCase):
+    """Task 7.1 — Session.effective resolves the two new knobs."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+
+    def test_defaults_preserve_current_behavior(self):
+        self.assertEqual(self.game.tower_lock_mode, TOWER_LOCK_FREE_FOR_ALL)
+        self.assertEqual(self.game.tower_lock_finish_minutes, 15)
+        self.assertEqual(
+            self.session.effective('tower_lock_mode'), TOWER_LOCK_FREE_FOR_ALL,
+        )
+        self.assertEqual(self.session.effective('tower_lock_finish_minutes'), 15)
+
+    def test_game_default_used_when_override_null(self):
+        self.game.tower_lock_mode = TOWER_LOCK_ON_INITIATE
+        self.game.tower_lock_finish_minutes = 30
+        self.game.save()
+        self.assertIsNone(self.session.tower_lock_mode)
+        self.assertEqual(
+            self.session.effective('tower_lock_mode'), TOWER_LOCK_ON_INITIATE,
+        )
+        self.assertEqual(self.session.effective('tower_lock_finish_minutes'), 30)
+
+    def test_session_override_wins(self):
+        self.session.tower_lock_mode = TOWER_LOCK_ON_INITIATE
+        self.session.tower_lock_finish_minutes = 5
+        self.session.save()
+        self.assertEqual(
+            self.session.effective('tower_lock_mode'), TOWER_LOCK_ON_INITIATE,
+        )
+        self.assertEqual(self.session.effective('tower_lock_finish_minutes'), 5)
+        # The Game default is untouched.
+        self.assertEqual(self.game.tower_lock_mode, TOWER_LOCK_FREE_FOR_ALL)
+
+
+class TowerLockInitiateTest(TowerLockingBase):
+    """Task 7.2 — initiate acquires a lock; contention within a group."""
+
+    def test_initiate_creates_active_lock(self):
+        resp = self._initiate(self.client1)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['tower_lock_mode'], TOWER_LOCK_ON_INITIATE)
+        self.assertTrue(body['locked'])
+        self.assertTrue(body['lock']['held_by_us'])
+        self.assertEqual(body['lock']['team_id'], self.team1.id)
+
+        lock = TowerLock.objects.get()
+        self.assertEqual(lock.tower, self.tower)
+        self.assertEqual(lock.team, self.team1)
+        self.assertEqual(lock.group, self.group)
+        self.assertTrue(lock.is_active())
+        # expires_at = started_at + effective finish window (15 min).
+        self.assertEqual(
+            (lock.expires_at - lock.started_at), timedelta(minutes=15),
+        )
+
+    def test_initiate_uses_effective_finish_minutes(self):
+        Session.objects.filter(pk=self.session.pk).update(
+            tower_lock_finish_minutes=5,
+        )
+        self._initiate(self.client1)
+        lock = TowerLock.objects.get()
+        self.assertEqual(
+            (lock.expires_at - lock.started_at), timedelta(minutes=5),
+        )
+
+    def test_second_team_same_group_blocked_from_initiating(self):
+        self._initiate(self.client1)
+        resp = self._initiate(self.client2)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        body = resp.json()
+        self.assertFalse(body['lock']['held_by_us'])
+        self.assertEqual(body['lock']['team_id'], self.team1.id)
+        self.assertEqual(TowerLock.objects.count(), 1)
+
+    def test_second_team_same_group_blocked_from_finishing(self):
+        self._initiate(self.client1)
+        resp = self._submit(self.client2)
+        self.assertEqual(resp.status_code, 409, resp.content)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_holder_reinitiate_is_idempotent(self):
+        first = self._initiate(self.client1)
+        again = self._initiate(self.client1)
+        self.assertEqual(again.status_code, 200, again.content)
+        self.assertEqual(TowerLock.objects.count(), 1)
+        self.assertEqual(
+            again.json()['lock']['expires_at'],
+            first.json()['lock']['expires_at'],
+        )
+
+    def test_initiate_requires_team_group(self):
+        loner_team = _make_team(self.game, None, name='groupless', color='#111111')
+        client, _ = _authed_client(loner_team, username='p4')
+        resp = self._initiate(client)
+        self.assertEqual(resp.status_code, 400)
+
+    def test_submission_without_any_lock_is_accepted(self):
+        # Initiating is the lock-acquisition point, but a finish is only
+        # refused while ANOTHER team holds the active lock — a free tower
+        # accepts a direct submission.
+        resp = self._submit(self.client1)
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_voluntary_release_frees_the_tower(self):
+        self._initiate(self.client1)
+        resp = self.client1.post(f'/api/towers/{self.tower.pk}/release_lock/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        lock = TowerLock.objects.get()
+        self.assertEqual(lock.release_reason, TowerLock.CANCELLED)
+        self.assertIsNotNone(lock.released_at)
+        # The other team may initiate immediately.
+        resp = self._initiate(self.client2)
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_release_without_lock_conflicts(self):
+        resp = self.client1.post(f'/api/towers/{self.tower.pk}/release_lock/')
+        self.assertEqual(resp.status_code, 409)
+        # A non-holder cannot release the holder's lock either.
+        self._initiate(self.client1)
+        resp = self.client2.post(f'/api/towers/{self.tower.pk}/release_lock/')
+        self.assertEqual(resp.status_code, 409)
+        self.assertTrue(TowerLock.objects.get().is_active())
+
+
+class TowerLockFinishTest(TowerLockingBase):
+    """Task 7.3 — a finish within the window captures + releases FINISHED."""
+
+    def test_confirmed_finish_captures_and_releases(self):
+        self._initiate(self.client1)
+        submit = self._submit(self.client1)
+        self.assertEqual(submit.status_code, 201, submit.content)
+        ttc_id = submit.json()['id']
+
+        confirm = self._confirm(ttc_id)
+        self.assertEqual(confirm.status_code, 200, confirm.content)
+
+        # Captured through assign_to_team: ownership window + bonus.
+        ownership = TeamTowerOwnership.objects.get(
+            tower=self.tower, timestamp_end__isnull=True,
+        )
+        self.assertEqual(ownership.team, self.team1)
+        self.team1.refresh_from_db()
+        self.assertEqual(self.team1.score, 10)
+
+        lock = TowerLock.objects.get()
+        self.assertEqual(lock.release_reason, TowerLock.FINISHED)
+        self.assertIsNotNone(lock.released_at)
+        self.assertFalse(lock.is_active())
+
+        # Tower is lockable again by anyone in the group.
+        resp = self._initiate(self.client2)
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_stale_finish_from_non_holder_cannot_be_confirmed(self):
+        # team2 submits while the tower is free, then team1 locks it —
+        # the pending (stale) finish from team2 must not confirm while
+        # team1's lock is active.
+        submit = self._submit(self.client2)
+        self.assertEqual(submit.status_code, 201, submit.content)
+        self._initiate(self.client1)
+
+        confirm = self._confirm(submit.json()['id'])
+        self.assertEqual(confirm.status_code, 409, confirm.content)
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+        # The holder's own finish still confirms fine.
+        own = self._submit(self.client1)
+        self.assertEqual(self._confirm(own.json()['id']).status_code, 200)
+
+
+class TowerLockExpiryTest(TowerLockingBase):
+    """Task 7.4 — expiry frees the tower lazily and via the sweep."""
+
+    def test_expired_lock_frees_initiation_lazily(self):
+        self._initiate(self.client1)
+        self._expire_lock(TowerLock.objects.get())
+
+        # Lazy expiry: active_lock reads it as free…
+        self.assertIsNone(self.tower.active_lock(self.group))
+        # …and another team's initiate succeeds, stamping EXPIRED.
+        resp = self._initiate(self.client2)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        old = TowerLock.objects.get(team=self.team1)
+        self.assertEqual(old.release_reason, TowerLock.EXPIRED)
+        self.assertIsNotNone(old.released_at)
+
+    def test_expired_lock_frees_submission_lazily(self):
+        self._initiate(self.client1)
+        self._expire_lock(TowerLock.objects.get())
+        resp = self._submit(self.client2)
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_sweep_command_releases_expired_locks(self):
+        self._initiate(self.client1)
+        lock = self._expire_lock(TowerLock.objects.get())
+        call_command('release_expired_locks')
+        lock.refresh_from_db()
+        self.assertEqual(lock.release_reason, TowerLock.EXPIRED)
+        self.assertEqual(lock.released_at, lock.expires_at)
+        # Idempotent: a second sweep changes nothing.
+        self.assertEqual(TowerLock.sweep_expired(), 0)
+        lock.refresh_from_db()
+        self.assertEqual(lock.release_reason, TowerLock.EXPIRED)
+
+    def test_expired_lock_opens_no_window_and_awards_nothing(self):
+        self._initiate(self.client1)
+        self._expire_lock(TowerLock.objects.get())
+        call_command('release_expired_locks')
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+        self.assertFalse(TeamZoneOwnership.objects.exists())
+        self.team1.refresh_from_db()
+        self.assertEqual(self.team1.score, 0)
+
+
+class TowerLockGroupIsolationTest(TowerLockingBase):
+    """Task 7.5 — a lock in one group never blocks another group."""
+
+    def test_lock_does_not_block_other_group_initiate(self):
+        self._initiate(self.client1)
+        resp = self._initiate(self.client3)
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(TowerLock.objects.count(), 2)
+        self.assertEqual(
+            set(TowerLock.objects.values_list('group_id', flat=True)),
+            {self.group.id, self.other_group.id},
+        )
+
+    def test_lock_does_not_block_other_group_finish(self):
+        self._initiate(self.client1)
+        submit = self._submit(self.client3)
+        self.assertEqual(submit.status_code, 201, submit.content)
+        confirm = self._confirm(submit.json()['id'])
+        self.assertEqual(confirm.status_code, 200, confirm.content)
+        # team3 owns the tower for ITS group; team1's lock is untouched.
+        self.assertEqual(self.tower.tower_control(self.other_group), self.team3)
+        self.assertTrue(TowerLock.objects.get(team=self.team1).is_active())
+
+    def test_lock_state_reported_per_group(self):
+        self._initiate(self.client1)
+        # Same group: locked by another team.
+        state2 = self.client2.get(f'/api/towers/{self.tower.pk}/state/').json()
+        self.assertFalse(state2['lock']['held_by_us'])
+        # Other group: free.
+        state3 = self.client3.get(f'/api/towers/{self.tower.pk}/state/').json()
+        self.assertIsNone(state3['lock'])
+
+
+class FreeForAllModeTest(TowerLockingBase):
+    """Task 7.6 — FREE_FOR_ALL preserves today's behavior exactly."""
+
+    LOCK_MODE = TOWER_LOCK_FREE_FOR_ALL
+
+    def test_initiate_is_a_noop_acknowledgement(self):
+        resp = self._initiate(self.client1)
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body['tower_lock_mode'], TOWER_LOCK_FREE_FOR_ALL)
+        self.assertFalse(body['locked'])
+        self.assertFalse(TowerLock.objects.exists())
+
+    def test_simultaneous_attempts_allowed(self):
+        self._initiate(self.client1)
+        self._initiate(self.client2)
+        resp1 = self._submit(self.client1)
+        resp2 = self._submit(self.client2)
+        self.assertEqual(resp1.status_code, 201, resp1.content)
+        self.assertEqual(resp2.status_code, 201, resp2.content)
+        self.assertFalse(TowerLock.objects.exists())
+
+    def test_last_confirmed_finish_owns_the_tower(self):
+        first = self._submit(self.client1)
+        self.assertEqual(self._confirm(first.json()['id']).status_code, 200)
+        self.assertEqual(self.tower.tower_control(self.group), self.team1)
+
+        challenge2 = Challenge.objects.create(
+            text='c2', tower=self.tower, difficulty=2, game=self.game,
+        )
+        second = self._submit(self.client2, challenge=challenge2)
+        self.assertEqual(self._confirm(second.json()['id']).status_code, 200)
+
+        # Ownership passed to the later finisher; the first team's
+        # window is closed (accrual for exactly its hold interval).
+        self.assertEqual(self.tower.tower_control(self.group), self.team2)
+        first_window = TeamTowerOwnership.objects.get(team=self.team1)
+        self.assertIsNotNone(first_window.timestamp_end)
+
+    def test_rejection_cooldown_still_applies(self):
+        submit = self._submit(self.client1)
+        staff_client, _ = _staff_client(self.session, username='staffr')
+        resp = staff_client.post(
+            f'/api/staff/submissions/{submit.json()["id"]}/review/',
+            {'outcome': 'reject'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(self.tower.team_in_cooloff(self.team1))
+        self.assertFalse(self.tower.team_in_cooloff(self.team2))
+
+
+class TowerLockScoringReconciliationTest(TowerLockingBase):
+    """Task 7.7 — hold intervals accrue identically under LOCK_ON_INITIATE."""
+
+    def test_hold_interval_runs_from_capture_to_next_capture(self):
+        self._initiate(self.client1)
+        first = self._submit(self.client1)
+        self.assertEqual(self._confirm(first.json()['id']).status_code, 200)
+        # team1 holds the tower (open window feeding zone control).
+        window1 = TeamTowerOwnership.objects.get(team=self.team1)
+        self.assertIsNone(window1.timestamp_end)
+        self.assertEqual(
+            list(self.zone.zone_control(self.group)), [self.team1.id],
+        )
+
+        # team2 locks and finishes the same tower.
+        self._initiate(self.client2)
+        challenge2 = Challenge.objects.create(
+            text='c2', tower=self.tower, difficulty=2, game=self.game,
+        )
+        second = self._submit(self.client2, challenge=challenge2)
+        self.assertEqual(self._confirm(second.json()['id']).status_code, 200)
+
+        # team1's window closed at team2's capture; team2's window open.
+        window1.refresh_from_db()
+        window2 = TeamTowerOwnership.objects.get(team=self.team2)
+        self.assertIsNotNone(window1.timestamp_end)
+        self.assertIsNone(window2.timestamp_end)
+        # timestamp_start is auto_now_add, so the handover close and the
+        # new open differ by a few ms; the intervals are contiguous.
+        self.assertLessEqual(window1.timestamp_end, window2.timestamp_start)
+        self.assertLess(
+            (window2.timestamp_start - window1.timestamp_end).total_seconds(), 1,
+        )
+        # Zone control follows the ownership windows.
+        self.assertEqual(
+            list(self.zone.zone_control(self.group)), [self.team2.id],
+        )
+        # Both locks released FINISHED.
+        self.assertEqual(
+            list(
+                TowerLock.objects.order_by('started_at')
+                .values_list('release_reason', flat=True),
+            ),
+            [TowerLock.FINISHED, TowerLock.FINISHED],
+        )
+
+
+class TowerLockConstraintTest(TestCase):
+    """Task 7.8 — partial-unique active lock + idempotent release."""
+
+    def setUp(self):
+        self.game = _make_game(name='Constraint Game')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team1 = _make_team(self.game, self.group, name='alpha')
+        self.team2 = _make_team(self.game, self.group, name='bravo', color='#663300')
+
+    def _lock(self, team, **overrides):
+        now = timezone.now()
+        fields = dict(
+            tower=self.tower, team=team, group=team.group,
+            started_at=now, expires_at=now + timedelta(minutes=15),
+        )
+        fields.update(overrides)
+        return TowerLock.objects.create(**fields)
+
+    def test_second_active_lock_same_group_violates_constraint(self):
+        self._lock(self.team1)
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                self._lock(self.team2)
+        # A released first lock frees the constraint slot.
+        TowerLock.objects.get().release(TowerLock.CANCELLED)
+        self._lock(self.team2)
+        self.assertEqual(TowerLock.objects.count(), 2)
+
+    def test_concurrent_acquire_yields_exactly_one_lock(self):
+        lock1, created1 = TowerLock.acquire(self.tower, self.team1, 15)
+        lock2, created2 = TowerLock.acquire(self.tower, self.team2, 15)
+        self.assertTrue(created1)
+        self.assertIsNotNone(lock1)
+        self.assertIsNone(lock2)
+        self.assertFalse(created2)
+        self.assertEqual(TowerLock.objects.count(), 1)
+
+    def test_release_is_idempotent(self):
+        lock = self._lock(self.team1)
+        self.assertTrue(lock.release(TowerLock.CANCELLED))
+        first_release_at = lock.released_at
+        # A second release (any reason) is a no-op: first writer wins.
+        self.assertFalse(lock.release(TowerLock.EXPIRED))
+        lock.refresh_from_db()
+        self.assertEqual(lock.release_reason, TowerLock.CANCELLED)
+        self.assertEqual(lock.released_at, first_release_at)
+
+    def test_sweep_does_not_touch_released_locks(self):
+        lock = self._lock(
+            self.team1, expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        lock.release(TowerLock.CANCELLED)
+        self.assertEqual(TowerLock.sweep_expired(), 0)
+        lock.refresh_from_db()
+        self.assertEqual(lock.release_reason, TowerLock.CANCELLED)
+
+
+class TowerIdentifyEndpointTest(TowerLockingBase):
+    """Task 3.1 — identify serves the next challenge with no side effects."""
+
+    def test_identify_returns_next_challenge(self):
+        resp = self.client1.post(f'/api/towers/{self.tower.pk}/identify/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(body['next_challenge']['id'], self.challenge.pk)
+        self.assertEqual(body['tower_lock_mode'], TOWER_LOCK_ON_INITIATE)
+        self.assertIsNone(body['lock'])
+
+    def test_identify_is_repeatable_and_side_effect_free(self):
+        first = self.client1.post(f'/api/towers/{self.tower.pk}/identify/')
+        second = self.client1.post(f'/api/towers/{self.tower.pk}/identify/')
+        self.assertEqual(first.json(), second.json())
+        self.assertFalse(TowerLock.objects.exists())
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_identify_reports_foreign_lock(self):
+        self._initiate(self.client1)
+        resp = self.client2.post(f'/api/towers/{self.tower.pk}/identify/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()['lock']['held_by_us'])
+
+    def test_identify_requires_team(self):
+        user = User.objects.create_user(
+            username='lone-identify', email='li@x.com', password='password123',
+        )
+        token = Token.objects.create(user=user)
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+        resp = client.post(f'/api/towers/{self.tower.pk}/identify/')
+        self.assertEqual(resp.status_code, 404)
+
+
+class TowerStateLockPayloadTest(TowerLockingBase):
+    """Task 6.2 backend — tower state exposes lock mode + countdown data."""
+
+    def test_state_reports_free_tower(self):
+        body = self.client1.get(f'/api/towers/{self.tower.pk}/state/').json()
+        self.assertEqual(body['tower_lock_mode'], TOWER_LOCK_ON_INITIATE)
+        self.assertIsNone(body['lock'])
+
+    def test_state_reports_lock_held_by_us_with_deadline(self):
+        self._initiate(self.client1)
+        body = self.client1.get(f'/api/towers/{self.tower.pk}/state/').json()
+        lock = body['lock']
+        self.assertTrue(lock['held_by_us'])
+        self.assertEqual(lock['team_id'], self.team1.id)
+        self.assertGreater(lock['remaining_seconds'], 14 * 60)
+        self.assertLessEqual(lock['remaining_seconds'], 15 * 60)
+
+    def test_state_reports_lock_held_by_other(self):
+        self._initiate(self.client1)
+        body = self.client2.get(f'/api/towers/{self.tower.pk}/state/').json()
+        self.assertFalse(body['lock']['held_by_us'])
+        self.assertEqual(body['lock']['team_name'], 'alpha')
+
+    def test_state_hides_expired_lock(self):
+        self._initiate(self.client1)
+        self._expire_lock(TowerLock.objects.get())
+        body = self.client1.get(f'/api/towers/{self.tower.pk}/state/').json()
+        self.assertIsNone(body['lock'])
+
+
+class StaffTowerLockEndpointTest(TowerLockingBase):
+    """Task 6.1 / 3.5 — staff active-lock list + cancel."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff_client, self.staff = _staff_client(
+            self.session, username='lockstaff',
+        )
+
+    def test_lists_only_active_locks(self):
+        self._initiate(self.client1)
+        # A released lock and an expired lock must not be listed.
+        cancelled = TowerLock.objects.create(
+            tower=self.tower, team=self.team3, group=self.other_group,
+            started_at=timezone.now(),
+            expires_at=timezone.now() + timedelta(minutes=15),
+        )
+        cancelled.release(TowerLock.CANCELLED)
+        other_tower = _make_tower(self.game, zone=self.zone, name='T2', lng=23.6)
+        expired = TowerLock.objects.create(
+            tower=other_tower, team=self.team2, group=self.group,
+            started_at=timezone.now() - timedelta(minutes=30),
+            expires_at=timezone.now() - timedelta(minutes=15),
+        )
+
+        resp = self.staff_client.get('/api/staff/tower_locks/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        body = resp.json()
+        self.assertEqual(len(body), 1)
+        entry = body[0]
+        self.assertEqual(entry['tower'], self.tower.pk)
+        self.assertEqual(entry['tower_name'], self.tower.name)
+        self.assertEqual(entry['team'], self.team1.pk)
+        self.assertEqual(entry['team_name'], 'alpha')
+        self.assertEqual(entry['group'], self.group.pk)
+        self.assertGreater(entry['remaining_seconds'], 0)
+        self.assertNotIn(expired.pk, [e['id'] for e in body])
+
+    def test_requires_staff(self):
+        resp = self.client1.get('/api/staff/tower_locks/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_scoped_to_current_session(self):
+        self._initiate(self.client1)
+        other_game = _make_game(name='Other Lock Game')
+        other_session = _default_session(other_game)
+        foreign_staff, _ = _staff_client(other_session, username='otherstaff')
+        resp = foreign_staff.get('/api/staff/tower_locks/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json(), [])
+
+    def test_staff_cancel_releases_lock(self):
+        self._initiate(self.client1)
+        lock = TowerLock.objects.get()
+        resp = self.staff_client.post(f'/api/staff/tower_locks/{lock.pk}/cancel/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        lock.refresh_from_db()
+        self.assertEqual(lock.release_reason, TowerLock.CANCELLED)
+        self.assertIsNotNone(lock.released_at)
+        # Cancelling again conflicts (no longer active).
+        resp = self.staff_client.post(f'/api/staff/tower_locks/{lock.pk}/cancel/')
+        self.assertEqual(resp.status_code, 409)
+        # And the tower is free for the group again.
+        self.assertEqual(self._initiate(self.client2).status_code, 201)
+
+

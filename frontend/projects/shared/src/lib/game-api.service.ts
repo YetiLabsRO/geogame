@@ -25,6 +25,19 @@ export interface PresenceStatus {
 export type ChallengeType = 'TEXT' | 'PHOTO' | 'NFC_QR' | 'RFID';
 export type ReviewMode = 'AUTO' | 'MANUAL';
 
+/** Tower contention modes (tower-locking capability). */
+export type TowerLockMode = 'FREE_FOR_ALL' | 'LOCK_ON_INITIATE';
+
+/** Player-facing view of a tower's active lock (null when free). */
+export interface TowerLockInfo {
+  held_by_us: boolean;
+  team_id: number;
+  team_name: string;
+  team_color: string;
+  started_at: string;
+  expires_at: string;
+  remaining_seconds: number;
+}
 export interface TowerState {
   id: number;
   name: string;
@@ -49,6 +62,14 @@ export interface TowerState {
   pending_submission: boolean;
   cooloff_until: string | null;
   proximity_meters: number;
+  tower_lock_mode: TowerLockMode;
+  lock: TowerLockInfo | null;
+}
+
+export interface TowerInitiateResponse {
+  tower_lock_mode: TowerLockMode;
+  locked: boolean;
+  lock: TowerLockInfo | null;
 }
 
 export interface ChallengeSubmitPayload {
@@ -226,6 +247,23 @@ export class GameApiService {
 
   towerState(id: number): Observable<TowerState> {
     return this.http.get<TowerState>(`/api/towers/${id}/state/`);
+  }
+
+  /**
+   * INITIATE lifecycle phase (tower-locking): under LOCK_ON_INITIATE this
+   * acquires the tower lock for the caller's team group (409 when another
+   * team in the group holds it); under FREE_FOR_ALL it is a no-op ack.
+   */
+  initiateTower(id: number): Observable<TowerInitiateResponse> {
+    return this.http.post<TowerInitiateResponse>(`/api/towers/${id}/initiate/`, {});
+  }
+
+  /** Voluntarily give up our team's active lock on this tower (CANCELLED). */
+  releaseTowerLock(id: number): Observable<{ released: boolean }> {
+    return this.http.post<{ released: boolean }>(
+      `/api/towers/${id}/release_lock/`,
+      {},
+    );
   }
 
   submitChallenge(payload: ChallengeSubmitPayload): Observable<ChallengeSubmitResponse> {

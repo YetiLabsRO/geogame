@@ -33,10 +33,14 @@ from game.admin_api import (
     AdminTowerViewSet,
     AdminZoneViewSet,
     ResetScoresView,
+    StaffTowerLockViewSet,
 )
 from game.api import (
     StaffSubmissionList,
     StaffSubmissionReview,
+    TowerIdentifyView,
+    TowerInitiateView,
+    TowerLockReleaseView,
     TowerStateView,
 )
 from game.location_api import (
@@ -113,6 +117,9 @@ admin_router.register(
 admin_router.register(
     r'trail-edges', AdminTrailEdgeViewSet, basename='admin-trail-edge',
 )
+admin_router.register(
+    r'tower_locks', StaffTowerLockViewSet, basename='admin-tower-lock',
+)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -135,6 +142,21 @@ urlpatterns = [
         'api/staff/sessions/<int:pk>/location-history/',
         StaffLocationHistoryView.as_view(),
         name='api-staff-location-history',
+    ),
+    path(
+        'api/towers/<int:pk>/identify/',
+        TowerIdentifyView.as_view(),
+        name='api-tower-identify',
+    ),
+    path(
+        'api/towers/<int:pk>/initiate/',
+        TowerInitiateView.as_view(),
+        name='api-tower-initiate',
+    ),
+    path(
+        'api/towers/<int:pk>/release_lock/',
+        TowerLockReleaseView.as_view(),
+        name='api-tower-release-lock',
     ),
     path(
         'api/staff/submissions/',

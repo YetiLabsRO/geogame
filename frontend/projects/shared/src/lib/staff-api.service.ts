@@ -47,6 +47,23 @@ export interface PresenceCheckInfo {
   reason_code: string;
 }
 
+/** An active tower lock as listed on /api/staff/tower_locks/ (tower-locking). */
+export interface StaffTowerLock {
+  id: number;
+  tower: number;
+  tower_name: string;
+  team: number;
+  team_name: string;
+  team_color: string;
+  group: number | null;
+  group_name: string | null;
+  started_at: string;
+  expires_at: string;
+  released_at: string | null;
+  release_reason: 'FINISHED' | 'EXPIRED' | 'CANCELLED' | null;
+  remaining_seconds: number;
+}
+
 /** A Collection or Game referencing a repository asset (usage reporting). */
 export interface UsageRef {
   id: number;
@@ -495,6 +512,21 @@ export class StaffApiService {
     return this.http.post<StaffSubmission>(
       `/api/staff/submissions/${id}/review/`,
       { outcome: 'reject', response_text: responseText },
+    );
+  }
+
+  // ---- Tower locks (tower-locking) ----------------------------------------
+
+  /** Active locks in the current session, soonest deadline first. */
+  listTowerLocks(): Observable<StaffTowerLock[]> {
+    return this.http.get<StaffTowerLock[]>('/api/staff/tower_locks/');
+  }
+
+  /** Force-release an active lock (release_reason=CANCELLED). */
+  cancelTowerLock(id: number): Observable<StaffTowerLock> {
+    return this.http.post<StaffTowerLock>(
+      `/api/staff/tower_locks/${id}/cancel/`,
+      {},
     );
   }
 

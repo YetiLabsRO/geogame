@@ -20,7 +20,7 @@ from game.models import (
     effective_proximity,
 )
 from game.trail import read_only_gate_step
-from organize.models import Team
+from organize.models import TOWER_LOCK_ON_INITIATE, Team
 
 
 class SessionPausedError(APIException):
@@ -33,6 +33,14 @@ class TowerLockedError(APIException):
     status_code = 409
     default_detail = 'Turn blocat temporar după eșecuri consecutive.'
     default_code = 'tower_locked'
+
+
+class TowerLockHeldError(APIException):
+    """tower-locking: another team holds this tower's active lock."""
+
+    status_code = 409
+    default_detail = 'Turnul este blocat de altă echipă; așteaptă expirarea blocării.'
+    default_code = 'tower_lock_held'
 
 
 class ZoneSerializer(serializers.HyperlinkedModelSerializer):
@@ -390,6 +398,18 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
         ).first()
         if counter and counter.is_locked():
             raise TowerLockedError()
+
+        # tower-locking: under LOCK_ON_INITIATE the finish phase is only
+        # accepted while no OTHER team in the submitter's group holds the
+        # tower's active lock (lazy expiry — a lapsed lock never blocks).
+        # Placed after the pause/lockout checks and before outcome
+        # resolution so a lock rejection wins over any auto-resolved
+        # outcome; under FREE_FOR_ALL this is a no-op and simultaneous
+        # submissions stay permitted.
+        if session.effective('tower_lock_mode') == TOWER_LOCK_ON_INITIATE:
+            lock = tower.active_lock(attrs['_team'].group)
+            if lock is not None and lock.team_id != attrs['_team'].id:
+                raise TowerLockHeldError()
 
         # mode-trail-discovery: a challenge-less submission at the
         # party's current gate-less trail step is the read-only
