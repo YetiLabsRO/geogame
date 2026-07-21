@@ -1,4 +1,5 @@
 import math
+import secrets
 from datetime import datetime, timedelta, timezone
 
 from colorfield.fields import ColorField
@@ -759,6 +760,203 @@ class PauseWindow(models.Model):
         row = model.objects.create(team_id=team_id, **{target_field: target_id})
         # timestamp_start is auto_now_add; pin it to the resume instant.
         model.objects.filter(pk=row.pk).update(timestamp_start=when)
+
+
+# --- nfc-native-and-secure-links: provisioned tags + scan audit ----------
+
+NFC_MODE_LEGACY_URL = 'LEGACY_URL'
+NFC_MODE_SECURE_TOKEN = 'SECURE_TOKEN'
+NFC_MODE_CHOICES = [
+    (NFC_MODE_LEGACY_URL, 'Legacy forwardable URL (mirrors /tower/rfid/<code>/)'),
+    (NFC_MODE_SECURE_TOKEN, 'Secure app-only token'),
+]
+
+
+def _generate_nfc_token():
+    """Opaque URL-safe token (32 chars). Meaningless outside the capture API."""
+    return secrets.token_urlsafe(24)
+
+
+class NfcTag(models.Model):
+    """A provisioned physical tag (NTAG sticker / printed QR).
+
+    Threat model (see the change's design.md): the tag's contents are
+    EXTRACTABLE AND FORGEABLE — a motivated attacker with a reader can
+    dump the NDEF and replay the token. Integrity relies on app-gating
+    + proximity + the TagScan audit, never on tag secrecy. SECURE_TOKEN
+    tags are only actionable through the authenticated capture endpoint;
+    LEGACY_URL tags mirror the forwardable /tower/rfid/<code>/ URL.
+    """
+
+    token = models.CharField(
+        max_length=64, unique=True, default=_generate_nfc_token, editable=False,
+    )
+    mode = models.CharField(
+        max_length=16, choices=NFC_MODE_CHOICES, default=NFC_MODE_SECURE_TOKEN,
+    )
+    # Exactly one target: a Tower (capture) or a tower-bound Challenge
+    # (routes into the challenge-submission flow). Enforced in clean().
+    tower = models.ForeignKey(
+        Tower, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='nfc_tags',
+    )
+    challenge = models.ForeignKey(
+        Challenge, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='nfc_tags',
+    )
+    is_active = models.BooleanField(default=True)
+    label = models.CharField(max_length=255, blank=True, default='')
+    # Where the physical tag is concealed (inside a tree, behind wall
+    # plaster, …) — staff-only provisioning note, never sent to players.
+    hidden_hint = models.TextField(blank=True, default='')
+    # Replay hardening (optional, NTAG 424 DNA-style rolling counter):
+    # the highest counter accepted so far. Used only when the session's
+    # effective nfc_replay_hardening is on.
+    expected_counter = models.PositiveIntegerField(null=True, blank=True)
+    last_counter = models.PositiveIntegerField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='nfc_tags_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f'NfcTag({self.mode}, {self.label or self.token[:8]})'
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.mode == NFC_MODE_SECURE_TOKEN:
+            if bool(self.tower_id) == bool(self.challenge_id):
+                raise ValidationError(
+                    'A SECURE_TOKEN tag must target exactly one of a Tower '
+                    'or a Challenge.',
+                )
+            if self.challenge_id and self.challenge.tower_id is None:
+                raise ValidationError(
+                    'A challenge-targeted tag needs a tower-bound challenge '
+                    '(submissions record the tower the scan happened at).',
+                )
+        else:  # LEGACY_URL mirrors an RFID tower's public URL.
+            if self.challenge_id or not self.tower_id:
+                raise ValidationError(
+                    'A LEGACY_URL tag must target a Tower (not a Challenge).',
+                )
+            if self.tower.category != Tower.CATEGORY_RFID or not self.tower.rfid_code:
+                raise ValidationError(
+                    'A LEGACY_URL tag mirrors an RFID-category tower and '
+                    'needs that tower to carry an rfid_code.',
+                )
+
+    def save(self, *args, **kwargs):
+        self.clean()
+        super().save(*args, **kwargs)
+
+    @property
+    def target(self):
+        return self.tower or self.challenge
+
+    def capture_tower(self):
+        """The Tower a confirmed scan captures / is measured against."""
+        if self.tower_id:
+            return self.tower
+        return self.challenge.tower if self.challenge_id else None
+
+    def app_link(self):
+        """The app-link (Android App Link / iOS Universal Link) URL."""
+        return f'{settings.BASE_URL}/nfc/{self.token}/'
+
+    def ndef_payload(self):
+        """The writable NDEF records for provisioning this tag.
+
+        SECURE_TOKEN: an app-triggering URI record (the app-link, which
+        doubles as the custom-scheme deep link target) plus an Android
+        Application Record so Android routes the tap to the app; the
+        token rides in the URI. LEGACY_URL: the existing public RFID URL.
+        """
+        package = getattr(settings, 'NFC_ANDROID_PACKAGE', 'ro.cercetador.app')
+        if self.mode == NFC_MODE_SECURE_TOKEN:
+            return {
+                'mode': self.mode,
+                'token': self.token,
+                'records': [
+                    {'type': 'uri', 'uri': self.app_link()},
+                    {'type': 'android_application_record', 'package': package},
+                ],
+            }
+        return {
+            'mode': self.mode,
+            'token': self.token,
+            'records': [
+                {
+                    'type': 'uri',
+                    'uri': f'{settings.BASE_URL}/tower/rfid/{self.tower.rfid_code}',
+                },
+            ],
+        }
+
+
+class TagScan(models.Model):
+    """Audit record for every capture attempt reaching the NFC endpoint.
+
+    Written for CONFIRMED, PENDING and every rejection flavor, so a
+    runner can spot anomalies (forwarded tokens failing proximity,
+    replayed counters) after the fact — audit is one leg of the
+    accepted threat model.
+    """
+
+    OUTCOME_CONFIRMED = 'CONFIRMED'
+    OUTCOME_PENDING = 'PENDING'
+    OUTCOME_REJECTED_NO_TEAM = 'REJECTED_NO_TEAM'
+    OUTCOME_REJECTED_INACTIVE = 'REJECTED_INACTIVE'
+    OUTCOME_REJECTED_DISABLED = 'REJECTED_DISABLED'
+    OUTCOME_REJECTED_APP = 'REJECTED_APP'
+    OUTCOME_REJECTED_SCOPE = 'REJECTED_SCOPE'
+    OUTCOME_REJECTED_REPLAY = 'REJECTED_REPLAY'
+    OUTCOME_REJECTED_PROXIMITY = 'REJECTED_PROXIMITY'
+    OUTCOME_REJECTED_STATE = 'REJECTED_STATE'
+    OUTCOME_REJECTED_CODE = 'REJECTED_CODE'
+    OUTCOME_CHOICES = [
+        (OUTCOME_CONFIRMED, 'Confirmed capture'),
+        (OUTCOME_PENDING, 'Pending (held / manual review)'),
+        (OUTCOME_REJECTED_NO_TEAM, 'Rejected: no active team'),
+        (OUTCOME_REJECTED_INACTIVE, 'Rejected: tag inactive'),
+        (OUTCOME_REJECTED_DISABLED, 'Rejected: secure mode disabled'),
+        (OUTCOME_REJECTED_APP, 'Rejected: app-origin marker missing'),
+        (OUTCOME_REJECTED_SCOPE, 'Rejected: target outside session scope'),
+        (OUTCOME_REJECTED_REPLAY, 'Rejected: replay counter'),
+        (OUTCOME_REJECTED_PROXIMITY, 'Rejected: out of proximity'),
+        (OUTCOME_REJECTED_STATE, 'Rejected: paused / locked out'),
+        (OUTCOME_REJECTED_CODE, 'Rejected: challenge code validation'),
+    ]
+
+    tag = models.ForeignKey(NfcTag, on_delete=models.CASCADE, related_name='scans')
+    player = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='tag_scans',
+    )
+    membership = models.ForeignKey(
+        'organize.TeamMembership', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='tag_scans',
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='tag_scans',
+    )
+    timestamp = models.DateTimeField(auto_now_add=True)
+    outcome = models.CharField(max_length=32, choices=OUTCOME_CHOICES)
+    lat = models.FloatField(null=True, blank=True)
+    lng = models.FloatField(null=True, blank=True)
+    accuracy = models.FloatField(null=True, blank=True)
+    counter = models.PositiveIntegerField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-timestamp']
+
+    def __str__(self):
+        return f'TagScan({self.tag_id}, {self.outcome}, {self.player})'
 
 
 class TeamTowerFailCounter(models.Model):

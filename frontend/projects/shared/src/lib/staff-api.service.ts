@@ -613,4 +613,72 @@ export class StaffApiService {
       `/api/staff/sessions/${id}/start_blockers/`,
     );
   }
+
+  // ---- nfc-native-and-secure-links: tag provisioning + scan audit ----------
+
+  nfcTags(params?: { tower?: number; mode?: string }): Observable<NfcTagInfo[]> {
+    const parts: string[] = [];
+    if (params?.tower) parts.push(`tower=${params.tower}`);
+    if (params?.mode) parts.push(`mode=${params.mode}`);
+    const query = parts.length ? `?${parts.join('&')}` : '';
+    return this.http.get<NfcTagInfo[]>(`/api/staff/nfc-tags/${query}`);
+  }
+
+  createNfcTag(payload: Partial<NfcTagInfo>): Observable<NfcTagInfo> {
+    return this.http.post<NfcTagInfo>('/api/staff/nfc-tags/', payload);
+  }
+
+  updateNfcTag(id: number, payload: Partial<NfcTagInfo>): Observable<NfcTagInfo> {
+    return this.http.patch<NfcTagInfo>(`/api/staff/nfc-tags/${id}/`, payload);
+  }
+
+  deleteNfcTag(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/nfc-tags/${id}/`);
+  }
+
+  nfcTagNdef(id: number): Observable<NfcNdefPayload> {
+    return this.http.get<NfcNdefPayload>(`/api/staff/nfc-tags/${id}/ndef/`);
+  }
+
+  nfcScanAudit(params?: { tag?: number }): Observable<TagScanInfo[]> {
+    const query = params?.tag ? `?tag=${params.tag}` : '';
+    return this.http.get<TagScanInfo[]>(`/api/staff/nfc-tags/scan-audit/${query}`);
+  }
+}
+
+export interface NfcTagInfo {
+  id: number;
+  token: string;
+  mode: 'LEGACY_URL' | 'SECURE_TOKEN';
+  tower: number | null;
+  challenge: number | null;
+  label: string;
+  hidden_hint: string;
+  is_active: boolean;
+  expected_counter: number | null;
+  last_counter: number | null;
+  app_link: string;
+  target_summary: { kind: string; id: number; name: string } | null;
+  scan_count: number;
+  created_at: string;
+}
+
+export interface NfcNdefPayload {
+  mode: string;
+  token: string;
+  records: { type: string; uri?: string; package?: string }[];
+}
+
+export interface TagScanInfo {
+  id: number;
+  tag: number;
+  tag_label: string;
+  player_username: string | null;
+  session: number | null;
+  timestamp: string;
+  outcome: string;
+  lat: number | null;
+  lng: number | null;
+  accuracy: number | null;
+  counter: number | null;
 }

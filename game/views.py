@@ -6,10 +6,24 @@ from django.contrib.gis.measure import Distance
 from django.db import OperationalError, connection, transaction
 from django.db.models import Count, Q
 from django.http import JsonResponse
+from django.shortcuts import render
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.views import APIView
 
-from game.models import Challenge, TeamTowerChallenge, Tower, Zone
+from game.challenge_types import REVIEW_AUTO, get_handler
+from game.models import (
+    NFC_MODE_SECURE_TOKEN,
+    Challenge,
+    NfcTag,
+    TagScan,
+    TeamTowerChallenge,
+    TeamTowerFailCounter,
+    Tower,
+    Zone,
+)
 from game.scoping import (
     GameGeometryScopedViewSetMixin,
     GameScopedViewSetMixin,
@@ -187,6 +201,236 @@ class TeamTowerChallengeViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet
         ttc = serializer.save()
         if ttc.outcome == TeamTowerChallenge.CONFIRMED:
             ttc.tower.assign_to_team(ttc.team)
+
+
+# ---------------------------------------------------------------------------
+# nfc-native-and-secure-links
+# ---------------------------------------------------------------------------
+
+
+def nfc_landing(request, token):
+    """GET /nfc/<token>/ — the app-link target for a secure tag.
+
+    Opened by anything other than the installed app this renders a
+    plain "open this in the app to scan" page and performs NO capture,
+    no tag lookup, no side effect of any kind — a forwarded link is
+    inert by construction, and an invalid token is indistinguishable
+    from a valid one (no validity oracle).
+
+    App-link wiring notes (deployment, not code):
+    - Android App Links: serve /.well-known/assetlinks.json listing the
+      app package (settings.NFC_ANDROID_PACKAGE) + its signing cert
+      SHA-256 so Android routes https://<host>/nfc/* to the app.
+    - iOS Universal Links: serve /.well-known/apple-app-site-association
+      with an applinks entry for /nfc/*.
+    Both files belong to the reverse-proxy / static layer; the installed
+    app deep-links straight into the scan flow and never loads this page.
+    """
+    return render(request, 'game/nfc_landing.html', {
+        'token': token,
+        'deep_link': f'cercetador://nfc/{token}',
+    })
+
+
+class NfcCaptureView(APIView):
+    """POST /api/nfc/capture/ — the real security boundary for tag scans.
+
+    Accepts {token, lat, lng, accuracy, counter} from the authenticated
+    app. Check order mirrors the submission serializer: membership →
+    tag resolution → secure-mode/app gates → session scope → replay
+    counter → GPS proximity → pause → failure lockout → outcome. Every
+    attempt that resolves to a known tag writes a TagScan audit row.
+
+    The "open in the app" page is a UX guard only; this endpoint
+    independently enforces auth, session scope, proximity and (when
+    enabled) the rolling counter — per the documented threat model, tag
+    contents are treated as extractable and forgeable.
+    """
+
+    permission_classes = [IsAuthenticated]
+
+    def post(self, request):
+        data = request.data
+        token = data.get('token')
+        if not token:
+            return Response({'detail': 'token is required.'}, status=400)
+        tag = (
+            NfcTag.objects
+            .select_related('tower', 'challenge', 'challenge__tower')
+            .filter(token=token)
+            .first()
+        )
+        if tag is None:
+            # No FK target to audit against; same shape as an unknown
+            # RFID code (the legacy path's 400).
+            return Response({'detail': 'Cod necunoscut.'}, status=404)
+
+        def _float(key):
+            try:
+                return float(data.get(key)) if data.get(key) is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        lat, lng, accuracy = _float('lat'), _float('lng'), _float('accuracy')
+        try:
+            counter = int(data['counter']) if data.get('counter') is not None else None
+        except (TypeError, ValueError):
+            counter = None
+
+        membership = (
+            request.user.profile.memberships
+            .filter(is_active=True)
+            .select_related('team__session__game')
+            .first()
+        )
+        session = membership.team.session if membership else None
+
+        def audit(outcome):
+            TagScan.objects.create(
+                tag=tag, player=request.user, membership=membership,
+                session=session, outcome=outcome,
+                lat=lat, lng=lng, accuracy=accuracy, counter=counter,
+            )
+
+        def reject(outcome, detail, http_status=400):
+            audit(outcome)
+            return Response({'outcome': 'REJECTED', 'detail': detail}, status=http_status)
+
+        if membership is None:
+            return reject(
+                TagScan.OUTCOME_REJECTED_NO_TEAM,
+                'Nu ești membru al unei echipe active.', 403,
+            )
+        team = membership.team
+
+        if not tag.is_active:
+            return reject(TagScan.OUTCOME_REJECTED_INACTIVE, 'Tag inactiv.')
+
+        # Secure-token captures are opt-in per Game/Session; with the
+        # knob off nothing changes for existing games (legacy behavior).
+        if tag.mode == NFC_MODE_SECURE_TOKEN and not session.effective('nfc_secure_mode'):
+            return reject(
+                TagScan.OUTCOME_REJECTED_DISABLED,
+                'Modul securizat NFC nu este activ pentru această sesiune.',
+            )
+
+        # App-origin marker: a deterrent for raw-browser hits; auth +
+        # proximity below stay the real boundary.
+        if session.effective('nfc_require_app') and not request.headers.get('X-Cercetador-App'):
+            return reject(
+                TagScan.OUTCOME_REJECTED_APP,
+                'Scanarea funcționează doar din aplicație.', 403,
+            )
+
+        challenge = tag.challenge
+        tower = tag.capture_tower()
+        in_scope = tower is not None and session.game.towers().filter(pk=tower.pk).exists()
+        if challenge is not None and challenge.game_id != session.game_id:
+            in_scope = False
+        if not in_scope:
+            return reject(
+                TagScan.OUTCOME_REJECTED_SCOPE,
+                'Acest tag nu aparține jocului tău.', 404,
+            )
+
+        if session.effective('nfc_replay_hardening'):
+            if counter is None:
+                return reject(
+                    TagScan.OUTCOME_REJECTED_REPLAY,
+                    'Acest joc cere un contor de scanare (tag cu counter).',
+                )
+            if tag.last_counter is not None and counter <= tag.last_counter:
+                return reject(
+                    TagScan.OUTCOME_REJECTED_REPLAY,
+                    'Scanare respinsă: contor repetat sau mai mic (replay).',
+                )
+            tag.last_counter = counter
+            tag.save(update_fields=['last_counter'])
+
+        proximity = session.game.proximity_meters
+        if lat is None or lng is None or not Tower.objects.filter(
+            pk=tower.pk,
+            location__distance_lte=(Point(lng, lat), Distance(m=proximity)),
+        ).exists():
+            return reject(
+                TagScan.OUTCOME_REJECTED_PROXIMITY,
+                f'Trebuie să fii la maxim {proximity} metri de tag.',
+            )
+
+        paused_hold = False
+        if session.is_paused():
+            if session.effective('pause_rejects_submissions'):
+                return reject(
+                    TagScan.OUTCOME_REJECTED_STATE,
+                    'Sesiunea este în pauză; trimiterile sunt oprite.', 409,
+                )
+            paused_hold = True
+
+        fail_counter = TeamTowerFailCounter.objects.filter(team=team, tower=tower).first()
+        if fail_counter and fail_counter.is_locked():
+            return reject(
+                TagScan.OUTCOME_REJECTED_STATE,
+                'Turn blocat temporar după eșecuri consecutive.', 409,
+            )
+
+        # Outcome resolution LAST (parity with the submission pipeline):
+        # a paused hold always wins; a tower target auto-confirms exactly
+        # like an RFID capture; a challenge target routes through its
+        # type handler / review-mode override.
+        if paused_hold:
+            outcome = TeamTowerChallenge.PENDING
+        elif challenge is None:
+            outcome = TeamTowerChallenge.CONFIRMED
+        else:
+            handler = get_handler(challenge.type)
+            if handler is None:
+                return reject(
+                    TagScan.OUTCOME_REJECTED_SCOPE,
+                    f'Tip de provocare necunoscut: {challenge.type}.',
+                )
+            if challenge.effective_review_mode() == REVIEW_AUTO:
+                # The physical tag IS the credential: it supplies the
+                # expected code by binding, so the handler decides on
+                # consumption (single_use) rather than string matching.
+                expected = handler.expected_code(challenge, tower)
+                outcome = handler.validate(
+                    challenge, tower, team, submitted_code=expected,
+                )
+            else:
+                outcome = TeamTowerChallenge.PENDING
+
+        extra = {}
+        if outcome != TeamTowerChallenge.PENDING:
+            extra['timestamp_verified'] = timezone.now()
+        ttc = TeamTowerChallenge(
+            team=team,
+            tower=tower,
+            challenge=challenge,
+            submitted_by=request.user,
+            outcome=outcome,
+            submitted_code=tag.token[:64],
+            **extra,
+        )
+        if outcome == TeamTowerChallenge.REJECTED:
+            # e.g. a consumed single_use challenge code: feed the same
+            # failure consequences as the typed-code path.
+            ttc._system_resolved = True
+        ttc.save()
+        if outcome == TeamTowerChallenge.CONFIRMED:
+            tower.assign_to_team(team)
+
+        outcome_label = {
+            TeamTowerChallenge.CONFIRMED: TagScan.OUTCOME_CONFIRMED,
+            TeamTowerChallenge.PENDING: TagScan.OUTCOME_PENDING,
+            TeamTowerChallenge.REJECTED: TagScan.OUTCOME_REJECTED_CODE,
+        }[outcome]
+        audit(outcome_label)
+        return Response({
+            'outcome': outcome_label,
+            'submission_id': ttc.id,
+            'tower': {'id': tower.id, 'name': tower.name},
+            'challenge': challenge.id if challenge else None,
+        }, status=status.HTTP_201_CREATED)
 
 
 def health(request):

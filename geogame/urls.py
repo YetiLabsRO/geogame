@@ -24,6 +24,7 @@ from game.admin_api import (
     AdminCollectionViewSet,
     AdminGameRoleViewSet,
     AdminGameViewSet,
+    AdminNfcTagViewSet,
     AdminSessionViewSet,
     AdminTeamGroupList,
     AdminTeamMembershipViewSet,
@@ -39,11 +40,13 @@ from game.api import (
 )
 from game.views import (
     ChallengeViewSet,
+    NfcCaptureView,
     TeamTowerChallengeViewSet,
     TeamViewSet,
     TowerViewSet,
     ZoneViewSet,
     health,
+    nfc_landing,
 )
 
 router = routers.DefaultRouter()
@@ -76,10 +79,17 @@ admin_router.register(
 admin_router.register(
     r'sessions', AdminSessionViewSet, basename='admin-session',
 )
+admin_router.register(
+    r'nfc-tags', AdminNfcTagViewSet, basename='admin-nfc-tag',
+)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('health/', health, name="health"),
+    # nfc-native-and-secure-links: browser fallback page (no capture side
+    # effect) + the authenticated in-app capture boundary.
+    path('nfc/<str:token>/', nfc_landing, name='nfc-landing'),
+    path('api/nfc/capture/', NfcCaptureView.as_view(), name='api-nfc-capture'),
     path('api/', include(router.urls)),
     path('api/towers/<int:pk>/state/', TowerStateView.as_view(), name='api-tower-state'),
     path(

@@ -55,6 +55,9 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'min_members_per_team',
     'max_members_per_team',
     'allow_player_team_creation',
+    'nfc_secure_mode',
+    'nfc_require_app',
+    'nfc_replay_hardening',
 )
 
 
@@ -124,6 +127,13 @@ class Game(models.Model):
         choices=JOIN_CONFIRM_CHOICES,
         default=JOIN_CONFIRM_AUTO_APPROVE,
     )
+
+    # --- nfc-native-and-secure-links knobs. All default off so the
+    # legacy forwardable RFID URL behavior is unchanged until a creator
+    # opts in; overridable per Session (see Session.effective). ---
+    nfc_secure_mode = models.BooleanField(default=False)
+    nfc_require_app = models.BooleanField(default=False)
+    nfc_replay_hardening = models.BooleanField(default=False)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -474,6 +484,11 @@ class Session(models.Model):
         max_length=32, choices=FAIL_RESET_CHOICES, null=True, blank=True,
     )
     allow_player_team_creation = models.BooleanField(null=True, blank=True)
+
+    # --- NFC capture-mode overrides (null = inherit Game default). ---
+    nfc_secure_mode = models.BooleanField(null=True, blank=True)
+    nfc_require_app = models.BooleanField(null=True, blank=True)
+    nfc_replay_hardening = models.BooleanField(null=True, blank=True)
 
     # --- Team-composition overrides. NULL means "inherit the Game
     # default"; a 0 maximum means "explicitly no cap". ---

@@ -53,6 +53,13 @@ export const routes: Routes = [
       import('./admin/collections.component').then((m) => m.CollectionsComponent),
   },
   {
+    // nfc-native-and-secure-links: tag provisioning + scan audit.
+    path: 'nfc-tags',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/nfc-tags.component').then((m) => m.NfcTagsComponent),
+  },
+  {
     path: 'games',
     canActivate: [staffGuard],
     loadComponent: () =>
