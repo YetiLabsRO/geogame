@@ -105,6 +105,48 @@ interface Position {
                   Next challenge · difficulty {{ c.difficulty }}
                 </div>
                 <div class="fs-5" style="white-space: pre-line">{{ c.text }}</div>
+                @if (s.presence; as p) {
+                  <hr class="my-2" />
+                  <div class="small text-body-secondary mb-1">
+                    Presence requirement (updates as teammates arrive)
+                  </div>
+                  <div class="mb-1">
+                    @if (p.method === 'PHOTO') {
+                      <span class="badge text-bg-warning">
+                        Photo of {{ p.required_members }} member(s) required
+                      </span>
+                    } @else {
+                      <span
+                        class="badge"
+                        [class.text-bg-success]="p.present_members >= p.required_members"
+                        [class.text-bg-danger]="p.present_members < p.required_members"
+                      >
+                        {{ p.present_members }} / {{ p.required_members }} members present
+                      </span>
+                      @if (p.window_seconds > 0) {
+                        <span class="badge text-bg-info ms-1">
+                          hold {{ p.window_seconds }}s inside {{ p.geofence_radius_meters }} m
+                        </span>
+                      }
+                    }
+                  </div>
+                  @if (p.method !== 'PHOTO' && p.present_members < p.required_members) {
+                    <div class="small text-danger">
+                      <i class="bi bi-exclamation-triangle"></i>
+                      Gather {{ p.required_members - p.present_members }} more
+                      teammate(s) within {{ p.geofence_radius_meters }} m of the
+                      tower (live location must be on).
+                    </div>
+                  }
+                  @if (p.photo_fallback_offered) {
+                    <div class="small text-body-secondary">
+                      <i class="bi bi-camera"></i>
+                      Alternatively, attach a photo showing the
+                      {{ p.required_members }} required member(s) — staff will
+                      review it manually.
+                    </div>
+                  }
+                }
                 @if (c.role_requirement; as req) {
                   <hr class="my-2" />
                   <div class="small text-body-secondary mb-1">
@@ -241,6 +283,7 @@ export class TowerDetailComponent implements OnInit {
 
   private watchId: number | null = null;
   private tickHandle: ReturnType<typeof setInterval> | null = null;
+  private presenceHandle: ReturnType<typeof setInterval> | null = null;
 
   ngOnInit(): void {
     const id = Number(this.route.snapshot.paramMap.get('id'));
@@ -251,12 +294,23 @@ export class TowerDetailComponent implements OnInit {
     this.fetchState(id);
     this.startGeolocation();
     this.tickHandle = setInterval(() => this.now.set(Date.now()), 1000);
+    // presence-rules: the required-vs-present count updates as
+    // teammates enter/leave the geofence — refresh the state
+    // periodically while a presence requirement applies.
+    this.presenceHandle = setInterval(() => {
+      if (this.state()?.presence) {
+        this.fetchState(id);
+      }
+    }, 10_000);
     this.destroyRef.onDestroy(() => {
       if (this.watchId !== null) {
         navigator.geolocation.clearWatch(this.watchId);
       }
       if (this.tickHandle) {
         clearInterval(this.tickHandle);
+      }
+      if (this.presenceHandle) {
+        clearInterval(this.presenceHandle);
       }
     });
   }

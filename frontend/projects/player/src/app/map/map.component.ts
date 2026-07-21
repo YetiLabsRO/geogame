@@ -14,10 +14,13 @@ import { HttpErrorResponse } from '@angular/common/http';
 import { forkJoin } from 'rxjs';
 import * as L from 'leaflet';
 
-import { GameApiService, TowerFeature, ZoneFeature } from 'shared';
+import { CurrentSession, GameApiService, LivePlayer, TowerFeature, ZoneFeature } from 'shared';
+
+import { LocationStreamService } from '../location/location-stream.service';
 
 const FALLBACK_CENTER: [number, number] = [46.068374, 23.571797];
 const FALLBACK_ZOOM = 17;
+const LIVE_POLL_MIN_SECONDS = 10;
 
 @Component({
   selector: 'app-map',
@@ -76,6 +79,7 @@ const FALLBACK_ZOOM = 17;
 })
 export class MapComponent {
   private readonly api = inject(GameApiService);
+  private readonly stream = inject(LocationStreamService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
@@ -87,10 +91,17 @@ export class MapComponent {
   );
 
   private map: L.Map | null = null;
+  private liveLayer: L.LayerGroup | null = null;
+  private livePollHandle: ReturnType<typeof setInterval> | null = null;
 
   constructor() {
     afterNextRender(() => this.init());
-    this.destroyRef.onDestroy(() => this.map?.remove());
+    this.destroyRef.onDestroy(() => {
+      if (this.livePollHandle) {
+        clearInterval(this.livePollHandle);
+      }
+      this.map?.remove();
+    });
   }
 
   private init(): void {
@@ -115,6 +126,7 @@ export class MapComponent {
         }
         this.renderZones(zones, slug !== null);
         this.renderTowers(towers);
+        this.setupLocation(session);
       },
       error: (err) => {
         // 404 (no session) and 409 (multiple candidates) mean the
@@ -129,6 +141,69 @@ export class MapComponent {
         this.errorMessage.set('Could not load map data. Check your connection and refresh.');
       },
     });
+  }
+
+  /**
+   * live-location wiring: gate on consent, then stream + overlay.
+   *
+   * A location-enabled session without standing consent redirects to
+   * the consent screen (playing is blocked server-side anyway). With
+   * consent, the geolocation stream starts at the game-configured
+   * interval and the live overlay polls `/api/location/live/` —
+   * whose visibility filtering (location_visibility + the
+   * presence-rules teammate refinement) happens server-side.
+   */
+  private setupLocation(session: CurrentSession): void {
+    this.stream.configure(session.location);
+    if (!session.location.tracking_enabled) {
+      return;
+    }
+    this.api.locationConsent().subscribe({
+      next: (consent) => {
+        if (!consent.has_consent) {
+          this.router.navigateByUrl('/location-consent');
+          return;
+        }
+        this.stream.markConsented();
+        this.startLivePolling(session.location.ping_interval_seconds);
+      },
+      error: () => {},
+    });
+  }
+
+  private startLivePolling(intervalSeconds: number): void {
+    const seconds = Math.max(LIVE_POLL_MIN_SECONDS, intervalSeconds || 0);
+    this.refreshLive();
+    this.livePollHandle = setInterval(() => this.refreshLive(), seconds * 1000);
+  }
+
+  private refreshLive(): void {
+    this.api.liveLocations().subscribe({
+      next: (live) => this.renderLive(live.players),
+      error: () => {},
+    });
+  }
+
+  private renderLive(players: LivePlayer[]): void {
+    if (!this.map) return;
+    if (this.liveLayer === null) {
+      this.liveLayer = L.layerGroup().addTo(this.map);
+    }
+    this.liveLayer.clearLayers();
+    for (const player of players) {
+      const color = player.team_color || '#0d6efd';
+      L.circleMarker([player.lat, player.lng], {
+        radius: 6,
+        color: '#fff',
+        weight: 1.5,
+        fillColor: color,
+        fillOpacity: 0.95,
+      })
+        .bindTooltip(
+          player.team_name ? `${player.username} · ${player.team_name}` : player.username,
+        )
+        .addTo(this.liveLayer);
+    }
   }
 
   private renderZones(zones: ZoneFeature[], scoreMode: boolean): void {

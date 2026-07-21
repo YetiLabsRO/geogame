@@ -31,6 +31,26 @@ ROLE_REQUIREMENT_CHOICES = [
 ]
 
 
+# Presence verification methods (presence-rules capability). Geofencing
+# (optionally strengthened by a continuous-tracking window) is the
+# primary method; a photo of the required people is a deliberately
+# weaker fallback (easily AI-edited) that always goes to staff review.
+PRESENCE_METHOD_GEOFENCE = 'GEOFENCE'
+PRESENCE_METHOD_PHOTO = 'PHOTO'
+PRESENCE_METHOD_GEOFENCE_OR_PHOTO = 'GEOFENCE_OR_PHOTO'
+PRESENCE_METHOD_CHOICES = [
+    (PRESENCE_METHOD_GEOFENCE, 'Geofence (live-location pings)'),
+    (PRESENCE_METHOD_PHOTO, 'Photo of the required people (staff-reviewed)'),
+    (PRESENCE_METHOD_GEOFENCE_OR_PHOTO, 'Geofence, with photo fallback'),
+]
+
+# Presence evaluation reason codes (presence-rules capability).
+PRESENCE_REASON_INSUFFICIENT_MEMBERS = 'INSUFFICIENT_MEMBERS_PRESENT'
+PRESENCE_REASON_MEMBER_OUTSIDE = 'MEMBER_OUTSIDE_GEOFENCE'
+PRESENCE_REASON_WINDOW_NOT_SATISFIED = 'PRESENCE_WINDOW_NOT_SATISFIED'
+PRESENCE_REASON_PHOTO_REVIEW = 'PHOTO_REVIEW_REQUIRED'
+
+
 class Zone(models.Model):
     SCORE_LOG = 1
     SCORE_EXP = 2
@@ -363,6 +383,40 @@ class Collection(models.Model):
         return self.name
 
 
+class PresenceRequirement(models.Model):
+    """A named, reusable presence requirement (presence-rules capability).
+
+    Referenced by any number of Challenges through their nullable
+    `presence_requirement` FK; NULL there means "no requirement". A
+    NULL `geofence_radius_meters` falls back to the tower's effective
+    `proximity_meters`; a NULL `window_seconds` falls back to the
+    Session's effective `presence_window_seconds` (see
+    `game.presence.resolve_presence`).
+    """
+
+    name = models.CharField(max_length=255)
+    min_members_present = models.PositiveIntegerField(default=1)
+    method = models.CharField(
+        max_length=32,
+        choices=PRESENCE_METHOD_CHOICES,
+        default=PRESENCE_METHOD_GEOFENCE,
+    )
+    geofence_radius_meters = models.PositiveIntegerField(null=True, blank=True)
+    window_seconds = models.PositiveIntegerField(null=True, blank=True)
+
+    def __str__(self):
+        return (
+            f'{self.name} (≥{self.min_members_present} present, {self.method})'
+        )
+
+    def clean(self):
+        from django.core.exceptions import ValidationError
+        if self.min_members_present < 1:
+            raise ValidationError(
+                {'min_members_present': 'At least one member must be required.'},
+            )
+
+
 class Challenge(models.Model):
     # game is nullable at the column level through T3.1 so the data
     # migration can backfill; T3.2 tightens to NOT NULL once every row
@@ -392,6 +446,18 @@ class Challenge(models.Model):
     # present. The presence test itself is the `presence-rules`
     # capability; until that ships, assignment alone suffices.
     require_holders_present = models.BooleanField(default=False)
+
+    # presence-rules: NULL means the challenge has no presence
+    # requirement (the default — submissions behave exactly as before).
+    # Deleting a referenced PresenceRequirement detaches, never deletes
+    # the Challenge.
+    presence_requirement = models.ForeignKey(
+        PresenceRequirement,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='challenges',
+    )
 
     def __str__(self):
         if self.tower:
@@ -529,6 +595,41 @@ class TeamTowerChallenge(models.Model):
             Team.objects.filter(pk=self.team_id).update(
                 score=Greatest(F('score') - penalty, Value(0)),
             )
+
+
+class PresenceCheck(models.Model):
+    """Audit record of one presence evaluation (presence-rules capability).
+
+    Written for every presence-gated submission that is stored, so
+    staff review and later disputes can see exactly what was verified:
+    the resolved requirement, which member ids passed, the method used,
+    and whether the continuous-tracking window was satisfied
+    (`window_satisfied` is NULL when the window could not be evaluated,
+    e.g. live-location was unavailable).
+    """
+
+    team_tower_challenge = models.OneToOneField(
+        TeamTowerChallenge,
+        on_delete=models.CASCADE,
+        related_name='presence_check',
+    )
+    required_count = models.PositiveIntegerField()
+    present_count = models.PositiveIntegerField(default=0)
+    method = models.CharField(max_length=32, choices=PRESENCE_METHOD_CHOICES)
+    # Auth-user ids of the members verified present (JSON list of ints).
+    verified_member_ids = models.JSONField(default=list, blank=True)
+    window_seconds = models.PositiveIntegerField(default=0)
+    window_satisfied = models.BooleanField(null=True, blank=True)
+    satisfied = models.BooleanField(default=False)
+    reason_code = models.CharField(max_length=64, blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        state = 'ok' if self.satisfied else (self.reason_code or 'failed')
+        return (
+            f'PresenceCheck(ttc={self.team_tower_challenge_id}, '
+            f'{self.present_count}/{self.required_count}, {state})'
+        )
 
 
 class TeamZoneOwnership(models.Model):
@@ -701,6 +802,136 @@ class PauseWindow(models.Model):
         row = model.objects.create(team_id=team_id, **{target_field: target_id})
         # timestamp_start is auto_now_add; pin it to the resume instant.
         model.objects.filter(pk=row.pk).update(timestamp_start=when)
+
+
+class LocationPingQuerySet(models.QuerySet):
+    def latest_per_user(self, session):
+        """Most recent ping per user in `session`, newest first.
+
+        The live feed's read shape: one row per user, each user's
+        latest `recorded_at`. Uses Postgres DISTINCT ON via
+        order_by(user, -recorded_at) + distinct(user).
+        """
+        return (
+            self.filter(session=session)
+            .order_by('user_id', '-recorded_at')
+            .distinct('user_id')
+        )
+
+
+class LocationPing(models.Model):
+    """One consented position sample (live-location capability).
+
+    Append-only history: serves live plotting (latest per user) and
+    after-game replay/analysis (per-user time series). `recorded_at` is
+    the client's sample clock; `received_at` is stamped by the server so
+    stale/queued uploads can be reasoned about. `team` is denormalized
+    from the submitter's active membership at ingestion time so replay
+    grouping survives roster changes.
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='location_pings',
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='location_pings',
+    )
+    team = models.ForeignKey(
+        'organize.Team',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='location_pings',
+    )
+    point = models.PointField()
+    accuracy = models.FloatField(null=True, blank=True, help_text='GPS accuracy in meters')
+    recorded_at = models.DateTimeField()
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    objects = LocationPingQuerySet.as_manager()
+
+    class Meta:
+        indexes = [
+            models.Index(
+                fields=['session', 'user', 'recorded_at'],
+                name='locationping_session_user_ts',
+            ),
+        ]
+        ordering = ['-recorded_at']
+
+    def __str__(self):
+        return f'{self.user} @ {self.recorded_at:%H:%M:%S} in {self.session}'
+
+
+class LocationConsent(models.Model):
+    """A player's recorded agreement to a Session's location rules.
+
+    Standing consent = a row with `withdrawn_at IS NULL`. The agreed
+    consent text is snapshotted (plus a hash) so audits know exactly
+    which version was accepted. Withdrawal keeps the row for audit but
+    stops streaming/plotting and purges the user's pings for the
+    Session (see the live-location capability).
+    """
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='location_consents',
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='location_consents',
+    )
+    agreed_at = models.DateTimeField()
+    withdrawn_at = models.DateTimeField(null=True, blank=True)
+    consent_text = models.TextField(blank=True, default='')
+    consent_text_hash = models.CharField(max_length=64, blank=True, default='')
+
+    class Meta:
+        # One consent row per (user, session): re-granting after a
+        # withdrawal updates the same row (fresh agreed_at + snapshot).
+        unique_together = (('user', 'session'),)
+
+    def __str__(self):
+        state = 'withdrawn' if self.withdrawn_at else 'standing'
+        return f'LocationConsent({self.user}, {self.session}, {state})'
+
+    @property
+    def is_standing(self):
+        return self.withdrawn_at is None
+
+    @classmethod
+    def standing_for(cls, user, session):
+        """The user's standing consent row for `session`, or None."""
+        if user is None or not getattr(user, 'is_authenticated', False):
+            return None
+        return cls.objects.filter(
+            user=user, session=session, withdrawn_at__isnull=True,
+        ).first()
+
+    @classmethod
+    def grant(cls, user, session):
+        """Record (or re-grant) consent, snapshotting the effective text."""
+        import hashlib
+        text = session.effective('location_consent_text') or ''
+        consent, _created = cls.objects.update_or_create(
+            user=user,
+            session=session,
+            defaults={
+                'agreed_at': _now(),
+                'withdrawn_at': None,
+                'consent_text': text,
+                'consent_text_hash': hashlib.sha256(text.encode()).hexdigest(),
+            },
+        )
+        return consent
+
+    def withdraw(self):
+        """Withdraw consent and purge this user's pings for the Session."""
+        self.withdrawn_at = _now()
+        self.save(update_fields=['withdrawn_at'])
+        LocationPing.objects.filter(user=self.user, session=self.session).delete()
 
 
 class TeamTowerFailCounter(models.Model):

@@ -102,6 +102,15 @@ class TowerStateView(APIView):
                 next_challenge, team,
             )
 
+        # presence-rules: required-vs-present status for the challenge at
+        # this tower. None on the default no-op resolution, so pre-change
+        # clients see no payload change. Re-fetching this endpoint updates
+        # the count as teammates enter/leave the geofence.
+        from game.presence import presence_status_payload
+        presence = presence_status_payload(
+            team.session, team, tower, next_challenge,
+        )
+
         ownership = tower.tower_control(team.group) if team.group else None
         ownership_payload = None
         if ownership is not None:
@@ -122,6 +131,7 @@ class TowerStateView(APIView):
             'has_initial_bonus': tower.initial_bonus != 0,
             'ownership': ownership_payload,
             'next_challenge': next_challenge_payload,
+            'presence': presence,
             'pending_submission': pending,
             'cooloff_until': (
                 cooloff_until.isoformat() if cooloff_until else None
@@ -143,6 +153,7 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
     challenge_difficulty = serializers.SerializerMethodField()
     submitted_by_username = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
+    presence_check = serializers.SerializerMethodField()
 
     class Meta:
         model = TeamTowerChallenge
@@ -152,8 +163,24 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
             'challenge', 'challenge_text', 'challenge_difficulty',
             'submitted_by', 'submitted_by_username',
             'photo_url', 'timestamp_submitted', 'timestamp_verified',
-            'outcome', 'response_text',
+            'outcome', 'response_text', 'presence_check',
         )
+
+    def get_presence_check(self, obj):
+        """Presence evidence (presence-rules): None for ungated submissions."""
+        check = getattr(obj, 'presence_check', None)
+        if check is None:
+            return None
+        return {
+            'required_count': check.required_count,
+            'present_count': check.present_count,
+            'method': check.method,
+            'verified_member_ids': check.verified_member_ids,
+            'window_seconds': check.window_seconds,
+            'window_satisfied': check.window_satisfied,
+            'satisfied': check.satisfied,
+            'reason_code': check.reason_code,
+        }
 
     def get_challenge_text(self, obj):
         return obj.challenge.text if obj.challenge else None
@@ -185,7 +212,9 @@ class StaffSubmissionList(SessionScopedViewSetMixin, generics.ListAPIView):
     session_scope_field = 'team__session'
     queryset = (
         TeamTowerChallenge.objects
-        .select_related('team', 'tower', 'challenge', 'submitted_by')
+        .select_related(
+            'team', 'tower', 'challenge', 'submitted_by', 'presence_check',
+        )
         .order_by('-timestamp_submitted')
     )
 

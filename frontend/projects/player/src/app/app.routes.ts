@@ -25,6 +25,14 @@ export const routes: Routes = [
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },
   {
+    path: 'location-consent',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./location/location-consent.component').then(
+        (m) => m.LocationConsentComponent,
+      ),
+  },
+  {
     path: 'team',
     canActivate: [authGuard],
     loadComponent: () =>

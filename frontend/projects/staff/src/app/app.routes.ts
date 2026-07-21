@@ -73,6 +73,14 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'sessions/:id/locations',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./location/location-history.component').then(
+        (m) => m.LocationHistoryComponent,
+      ),
+  },
+  {
     path: 'scoreboard',
     canActivate: [staffGuard],
     loadComponent: () =>

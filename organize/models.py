@@ -39,6 +39,38 @@ JOIN_CONFIRM_CHOICES = [
     (JOIN_CONFIRM_STAFF, 'Staff approve joins'),
 ]
 
+# Live-location visibility (live-location capability). Coarse gate on
+# who may see live player positions; the presence-rules teammate
+# visibility refines within what this allows.
+LOCATION_VISIBILITY_NONE = 'NONE'
+LOCATION_VISIBILITY_OWN_TEAM = 'OWN_TEAM'
+LOCATION_VISIBILITY_EVERYONE = 'EVERYONE'
+LOCATION_VISIBILITY_CHOICES = [
+    (LOCATION_VISIBILITY_NONE, 'Stored only — no live positions shown to players'),
+    (LOCATION_VISIBILITY_OWN_TEAM, 'Players see their own team'),
+    (LOCATION_VISIBILITY_EVERYONE, 'Players see everyone'),
+]
+
+# Presence rules (presence-rules capability). Togetherness controls
+# whether a team may split up; teammate visibility refines which other
+# players the live-location plotting shows a player (always within what
+# `location_visibility` allows — the more restrictive layer wins).
+TOGETHERNESS_SPLIT_ALLOWED = 'SPLIT_ALLOWED'
+TOGETHERNESS_WHOLE_TEAM = 'WHOLE_TEAM_TOGETHER'
+TOGETHERNESS_CHOICES = [
+    (TOGETHERNESS_SPLIT_ALLOWED, 'Members may split up'),
+    (TOGETHERNESS_WHOLE_TEAM, 'Whole team must be together'),
+]
+
+TEAMMATE_VISIBILITY_OWN_TEAM = 'OWN_TEAM'
+TEAMMATE_VISIBILITY_EVERYONE = 'EVERYONE'
+TEAMMATE_VISIBILITY_SELECT_COUNT = 'SELECT_COUNT'
+TEAMMATE_VISIBILITY_CHOICES = [
+    (TEAMMATE_VISIBILITY_OWN_TEAM, 'Own team only'),
+    (TEAMMATE_VISIBILITY_EVERYONE, 'Everyone in the session'),
+    (TEAMMATE_VISIBILITY_SELECT_COUNT, 'The nearest N players'),
+]
+
 # Config fields that live on Game as defaults and are overridable per
 # Session. `Session.effective(field)` resolves override-or-default.
 OVERRIDABLE_CONFIG_FIELDS = (
@@ -55,6 +87,20 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'min_members_per_team',
     'max_members_per_team',
     'allow_player_team_creation',
+    # Live-location knobs (live-location capability). Tracking defaults
+    # OFF; the ping interval is game-level only — players never override.
+    'location_tracking_enabled',
+    'location_ping_interval_seconds',
+    'location_visibility',
+    'location_retention_days',
+    'location_consent_text',
+    # Presence-rules knobs (presence-rules capability). Defaults are
+    # today's behavior: splitting allowed, own-team visibility, no
+    # continuous-tracking window.
+    'togetherness_mode',
+    'teammate_visibility_mode',
+    'teammate_visibility_count',
+    'presence_window_seconds',
 )
 
 
@@ -124,6 +170,37 @@ class Game(models.Model):
         choices=JOIN_CONFIRM_CHOICES,
         default=JOIN_CONFIRM_AUTO_APPROVE,
     )
+
+    # --- Live-location knobs (live-location capability). Tracking is
+    # OFF by default so existing games are unchanged. The ping interval
+    # is a battery/power tradeoff the organiser owns — there is no
+    # player-facing control. Overridable per Session. ---
+    location_tracking_enabled = models.BooleanField(default=False)
+    location_ping_interval_seconds = models.PositiveIntegerField(default=30)
+    location_visibility = models.CharField(
+        max_length=16,
+        choices=LOCATION_VISIBILITY_CHOICES,
+        default=LOCATION_VISIBILITY_OWN_TEAM,
+    )
+    location_retention_days = models.PositiveIntegerField(default=30)
+    location_consent_text = models.TextField(blank=True, default='')
+
+    # --- Presence-rules knobs (presence-rules capability). Defaults
+    # preserve pre-change behavior: teams may split, players see their
+    # own team, and no continuous-tracking window is enforced.
+    # Overridable per Session. ---
+    togetherness_mode = models.CharField(
+        max_length=32,
+        choices=TOGETHERNESS_CHOICES,
+        default=TOGETHERNESS_SPLIT_ALLOWED,
+    )
+    teammate_visibility_mode = models.CharField(
+        max_length=16,
+        choices=TEAMMATE_VISIBILITY_CHOICES,
+        default=TEAMMATE_VISIBILITY_OWN_TEAM,
+    )
+    teammate_visibility_count = models.PositiveIntegerField(default=0)
+    presence_window_seconds = models.PositiveIntegerField(default=0)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -473,6 +550,27 @@ class Session(models.Model):
     max_teams = models.PositiveSmallIntegerField(null=True, blank=True)
     min_members_per_team = models.PositiveSmallIntegerField(null=True, blank=True)
     max_members_per_team = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    # --- Live-location overrides (live-location capability). NULL means
+    # "inherit the Game default"; resolve with Session.effective(field). ---
+    location_tracking_enabled = models.BooleanField(null=True, blank=True)
+    location_ping_interval_seconds = models.PositiveIntegerField(null=True, blank=True)
+    location_visibility = models.CharField(
+        max_length=16, choices=LOCATION_VISIBILITY_CHOICES, null=True, blank=True,
+    )
+    location_retention_days = models.PositiveIntegerField(null=True, blank=True)
+    location_consent_text = models.TextField(null=True, blank=True)
+
+    # --- Presence-rules overrides (presence-rules capability). NULL
+    # means "inherit the Game default"; resolve with Session.effective(field). ---
+    togetherness_mode = models.CharField(
+        max_length=32, choices=TOGETHERNESS_CHOICES, null=True, blank=True,
+    )
+    teammate_visibility_mode = models.CharField(
+        max_length=16, choices=TEAMMATE_VISIBILITY_CHOICES, null=True, blank=True,
+    )
+    teammate_visibility_count = models.PositiveIntegerField(null=True, blank=True)
+    presence_window_seconds = models.PositiveIntegerField(null=True, blank=True)
 
     class Meta:
         unique_together = (('game', 'slug'),)

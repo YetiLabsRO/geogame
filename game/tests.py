@@ -41,7 +41,11 @@ from game.models import (
     ROLE_REQUIREMENT_NONE,
     Challenge,
     Collection,
+    LocationConsent,
+    LocationPing,
     PauseWindow,
+    PresenceCheck,
+    PresenceRequirement,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -3747,3 +3751,871 @@ class CollectionBackfillMigrationTest(TransactionTestCase):
                 .values_list('pk', flat=True)),
             {z2.pk},
         )
+
+
+# ---------------------------------------------------------------------------
+# live-location — config knobs, consent gate, ping ingestion, visibility,
+# retention (live-location-tracking change)
+# ---------------------------------------------------------------------------
+
+
+class LocationConfigResolutionTest(TestCase):
+    """Task 7.1 — effective location knobs resolve override → default."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+
+    def test_defaults_leave_tracking_off(self):
+        self.assertFalse(self.session.effective('location_tracking_enabled'))
+        self.assertEqual(self.session.effective('location_ping_interval_seconds'), 30)
+        self.assertEqual(self.session.effective('location_visibility'), 'OWN_TEAM')
+        self.assertEqual(self.session.effective('location_retention_days'), 30)
+        self.assertEqual(self.session.effective('location_consent_text'), '')
+
+    def test_session_override_wins(self):
+        self.game.location_tracking_enabled = True
+        self.game.location_ping_interval_seconds = 60
+        self.game.save()
+        self.session.location_ping_interval_seconds = 10
+        self.session.location_visibility = 'EVERYONE'
+        self.session.save()
+        self.assertTrue(self.session.effective('location_tracking_enabled'))
+        self.assertEqual(self.session.effective('location_ping_interval_seconds'), 10)
+        self.assertEqual(self.session.effective('location_visibility'), 'EVERYONE')
+        # Un-overridden fields keep resolving to the Game default.
+        self.assertEqual(self.session.effective('location_retention_days'), 30)
+
+    def test_ping_rejected_when_tracking_disabled(self):
+        group = _make_group(self.game)
+        team = _make_team(self.game, group)
+        client, _user = _authed_client(team, username='loc-off')
+        response = client.post(
+            reverse('api-location-ping'),
+            {'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(LocationPing.objects.count(), 0)
+
+
+class LocationConsentGateTest(TestCase):
+    """Tasks 7.2/3.3 — consent gates pings and play; withdrawal purges."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.location_consent_text = 'We track you during the game.'
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.tower = _make_tower(self.game, name='LT', lng=23.5, lat=46.5)
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='Sing', tower=self.tower, difficulty=1,
+        )
+        self.client_api, self.user = _authed_client(self.team, username='loc-player')
+
+    def _ping(self):
+        return self.client_api.post(
+            reverse('api-location-ping'),
+            {'lat': 46.5, 'lng': 23.5, 'accuracy': 8.5},
+            format='json',
+        )
+
+    def _submit(self):
+        return self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.id,
+                'challenge': self.challenge.id,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+
+    def test_consent_status_reports_effective_text(self):
+        response = self.client_api.get(reverse('api-location-consent'))
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['tracking_enabled'])
+        self.assertFalse(response.data['has_consent'])
+        self.assertEqual(
+            response.data['consent_text'], 'We track you during the game.',
+        )
+        self.assertEqual(response.data['ping_interval_seconds'], 30)
+
+    def test_ping_and_play_blocked_without_consent(self):
+        self.assertEqual(self._ping().status_code, 403)
+        response = self._submit()
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(TeamTowerChallenge.objects.count(), 0)
+
+    def test_recording_consent_unblocks_and_snapshots_text(self):
+        response = self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        consent = LocationConsent.objects.get(user=self.user, session=self.session)
+        self.assertTrue(consent.is_standing)
+        self.assertEqual(consent.consent_text, 'We track you during the game.')
+        self.assertEqual(len(consent.consent_text_hash), 64)
+
+        self.assertEqual(self._ping().status_code, 201)
+        submit = self._submit()
+        self.assertEqual(submit.status_code, 201)
+
+    def test_withdrawal_reblocks_and_purges_session_pings(self):
+        self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self._ping()
+        self.assertEqual(
+            LocationPing.objects.filter(user=self.user, session=self.session).count(), 1,
+        )
+        response = self.client_api.delete(reverse('api-location-consent'))
+        self.assertEqual(response.status_code, 204)
+        self.assertEqual(
+            LocationPing.objects.filter(user=self.user, session=self.session).count(), 0,
+        )
+        consent = LocationConsent.objects.get(user=self.user, session=self.session)
+        self.assertFalse(consent.is_standing)
+        self.assertEqual(self._ping().status_code, 403)
+        self.assertEqual(self._submit().status_code, 403)
+
+    def test_regranting_after_withdrawal_reuses_the_row(self):
+        self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self.client_api.delete(reverse('api-location-consent'))
+        response = self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(LocationConsent.objects.count(), 1)
+        self.assertTrue(
+            LocationConsent.objects.get(user=self.user, session=self.session).is_standing,
+        )
+
+    def test_consent_post_rejected_when_tracking_disabled(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        response = self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self.assertEqual(response.status_code, 409)
+
+    def test_tracking_off_requires_no_consent_to_play(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        response = self._submit()
+        self.assertEqual(response.status_code, 201)
+
+
+class LocationPingIngestionTest(TestCase):
+    """Task 7.3 — stored pings denormalize team and carry both clocks."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.client_api, self.user = _authed_client(self.team, username='pinger')
+        self.client_api.post(reverse('api-location-consent'), {}, format='json')
+
+    def test_ping_stored_with_denormalized_team_and_timestamps(self):
+        recorded = (timezone.now() - timedelta(seconds=5)).isoformat()
+        response = self.client_api.post(
+            reverse('api-location-ping'),
+            {'lat': 46.51, 'lng': 23.52, 'accuracy': 12.0, 'recorded_at': recorded},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        ping = LocationPing.objects.get()
+        self.assertEqual(ping.user, self.user)
+        self.assertEqual(ping.session, self.session)
+        self.assertEqual(ping.team, self.team)
+        self.assertAlmostEqual(ping.point.y, 46.51)
+        self.assertAlmostEqual(ping.point.x, 23.52)
+        self.assertEqual(ping.accuracy, 12.0)
+        self.assertIsNotNone(ping.recorded_at)
+        self.assertIsNotNone(ping.received_at)
+        self.assertLess(ping.recorded_at, ping.received_at)
+        # The response tells the app its (game-level) pacing interval.
+        self.assertEqual(response.data['ping_interval_seconds'], 30)
+
+    def test_ping_requires_coordinates(self):
+        response = self.client_api.post(
+            reverse('api-location-ping'), {'lat': 46.5}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_ping_rejected_when_session_override_disables_tracking(self):
+        self.session.location_tracking_enabled = False
+        self.session.save()
+        response = self.client_api.post(
+            reverse('api-location-ping'), {'lat': 46.5, 'lng': 23.5}, format='json',
+        )
+        self.assertEqual(response.status_code, 409)
+
+
+class LocationLiveVisibilityTest(TestCase):
+    """Task 7.4 — the live feed honors the effective location_visibility."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team_a = _make_team(self.game, self.group, name='A', color='#111111')
+        self.team_b = _make_team(self.game, self.group, name='B', color='#222222')
+        self.client_a, self.user_a = _authed_client(self.team_a, username='alice')
+        self.client_b, self.user_b = _authed_client(self.team_b, username='bob')
+        for client in (self.client_a, self.client_b):
+            client.post(reverse('api-location-consent'), {}, format='json')
+            client.post(
+                reverse('api-location-ping'),
+                {'lat': 46.5, 'lng': 23.5},
+                format='json',
+            )
+
+    def _live_usernames(self, client):
+        response = client.get(reverse('api-location-live'))
+        self.assertEqual(response.status_code, 200)
+        return {p['username'] for p in response.data['players']}
+
+    def test_own_team_default_limits_to_callers_team(self):
+        self.assertEqual(self._live_usernames(self.client_a), {'alice'})
+        self.assertEqual(self._live_usernames(self.client_b), {'bob'})
+
+    def test_everyone_broadens_to_all_consenting_players(self):
+        self.session.location_visibility = 'EVERYONE'
+        self.session.save()
+        self.assertEqual(self._live_usernames(self.client_a), {'alice', 'bob'})
+
+    def test_none_hides_from_players_but_not_staff(self):
+        self.session.location_visibility = 'NONE'
+        self.session.save()
+        self.assertEqual(self._live_usernames(self.client_a), set())
+        staff_client, _staff = _staff_client(session=self.session)
+        self.assertEqual(self._live_usernames(staff_client), {'alice', 'bob'})
+
+    def test_latest_ping_per_user_only(self):
+        self.client_a.post(
+            reverse('api-location-ping'),
+            {'lat': 46.6, 'lng': 23.6},
+            format='json',
+        )
+        response = self.client_a.get(reverse('api-location-live'))
+        players = [p for p in response.data['players'] if p['username'] == 'alice']
+        self.assertEqual(len(players), 1)
+        self.assertAlmostEqual(players[0]['lat'], 46.6)
+
+    def test_withdrawn_player_never_revealed(self):
+        self.session.location_visibility = 'EVERYONE'
+        self.session.save()
+        self.client_b.delete(reverse('api-location-consent'))
+        self.assertEqual(self._live_usernames(self.client_a), {'alice'})
+        staff_client, _staff = _staff_client(session=self.session)
+        self.assertEqual(self._live_usernames(staff_client), {'alice'})
+
+    def test_live_feed_reports_tracking_disabled(self):
+        self.session.location_tracking_enabled = False
+        self.session.save()
+        response = self.client_a.get(reverse('api-location-live'))
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(response.data['tracking_enabled'])
+        self.assertEqual(response.data['players'], [])
+
+    def test_staff_history_series_with_filters(self):
+        staff_client, _staff = _staff_client(session=self.session)
+        url = reverse('api-staff-location-history', args=[self.session.id])
+        response = staff_client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['pings']), 2)
+        response = staff_client.get(f'{url}?user={self.user_a.id}')
+        self.assertEqual(
+            {p['username'] for p in response.data['pings']}, {'alice'},
+        )
+        response = staff_client.get(f'{url}?team={self.team_b.id}')
+        self.assertEqual(
+            {p['username'] for p in response.data['pings']}, {'bob'},
+        )
+
+    def test_history_is_staff_only(self):
+        url = reverse('api-staff-location-history', args=[self.session.id])
+        self.assertEqual(self.client_a.get(url).status_code, 403)
+
+
+class LocationRetentionTest(TestCase):
+    """Task 7.5 — purge honors retention and consent withdrawal."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.location_retention_days = 7
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.client_api, self.user = _authed_client(self.team, username='retained')
+        self.client_api.post(reverse('api-location-consent'), {}, format='json')
+
+    def _make_ping(self, user, age_days):
+        return LocationPing.objects.create(
+            user=user,
+            session=self.session,
+            team=self.team,
+            point=Point(23.5, 46.5),
+            recorded_at=timezone.now() - timedelta(days=age_days),
+        )
+
+    def _run_purge(self):
+        from django.core.management import call_command
+        call_command('purge_location_pings', verbosity=0)
+
+    def test_purge_deletes_expired_keeps_in_window(self):
+        old = self._make_ping(self.user, age_days=10)
+        fresh = self._make_ping(self.user, age_days=1)
+        self._run_purge()
+        remaining = list(LocationPing.objects.all())
+        self.assertEqual([p.pk for p in remaining], [fresh.pk])
+        self.assertFalse(LocationPing.objects.filter(pk=old.pk).exists())
+
+    def test_purge_respects_session_retention_override(self):
+        self.session.location_retention_days = 15
+        self.session.save()
+        keeper = self._make_ping(self.user, age_days=10)
+        self._run_purge()
+        self.assertTrue(LocationPing.objects.filter(pk=keeper.pk).exists())
+
+    def test_purge_deletes_unconsented_pings(self):
+        other = User.objects.create_user(
+            username='ghost', email='ghost@example.com', password='password123',
+        )
+        self._make_ping(other, age_days=1)  # no standing consent row
+        mine = self._make_ping(self.user, age_days=1)
+        self._run_purge()
+        self.assertEqual(
+            list(LocationPing.objects.values_list('pk', flat=True)), [mine.pk],
+        )
+
+    def test_finished_session_keeps_in_window_history(self):
+        fresh = self._make_ping(self.user, age_days=1)
+        Session.objects.filter(pk=self.session.pk).update(state=Session.FINISHED)
+        self._run_purge()
+        self.assertTrue(LocationPing.objects.filter(pk=fresh.pk).exists())
+
+
+# ---------------------------------------------------------------------------
+# presence-rules — togetherness/visibility knobs, PresenceRequirement,
+# geofence + window verification, photo fallback, PresenceCheck evidence
+# ---------------------------------------------------------------------------
+
+
+class PresenceConfigResolutionTest(TestCase):
+    """Task 8.1 — the four presence knobs resolve override → default."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+
+    def test_defaults_preserve_base_behavior(self):
+        self.assertEqual(self.session.effective('togetherness_mode'), 'SPLIT_ALLOWED')
+        self.assertEqual(self.session.effective('teammate_visibility_mode'), 'OWN_TEAM')
+        self.assertEqual(self.session.effective('teammate_visibility_count'), 0)
+        self.assertEqual(self.session.effective('presence_window_seconds'), 0)
+
+    def test_session_override_wins(self):
+        self.game.togetherness_mode = 'WHOLE_TEAM_TOGETHER'
+        self.game.teammate_visibility_count = 3
+        self.game.save()
+        self.session.togetherness_mode = 'SPLIT_ALLOWED'
+        self.session.teammate_visibility_mode = 'SELECT_COUNT'
+        self.session.presence_window_seconds = 45
+        self.session.save()
+        self.assertEqual(self.session.effective('togetherness_mode'), 'SPLIT_ALLOWED')
+        self.assertEqual(
+            self.session.effective('teammate_visibility_mode'), 'SELECT_COUNT',
+        )
+        # Un-overridden fields keep resolving to the Game default.
+        self.assertEqual(self.session.effective('teammate_visibility_count'), 3)
+        self.assertEqual(self.session.effective('presence_window_seconds'), 45)
+
+
+class ResolvePresenceTest(TestCase):
+    """Task 8.2 — effective requirement resolution (pure config function)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.tower = _make_tower(self.game, name='PT')
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='Together', tower=self.tower, difficulty=1,
+        )
+        for name in ('pr-a', 'pr-b', 'pr-c'):
+            _add_member(self.team, name)
+
+    def test_null_requirement_resolves_to_noop_default(self):
+        from game.presence import resolve_presence
+        resolved = resolve_presence(self.session, self.challenge, self.tower, team=self.team)
+        self.assertTrue(resolved['is_noop'])
+        self.assertEqual(resolved['min_members'], 1)
+        self.assertEqual(resolved['method'], 'GEOFENCE')
+        self.assertEqual(resolved['geofence_radius_meters'], self.game.proximity_meters)
+        self.assertEqual(resolved['window_seconds'], 0)
+
+    def test_split_allowed_uses_challenge_minimum(self):
+        from game.presence import resolve_presence
+        req = PresenceRequirement.objects.create(name='Pair', min_members_present=2)
+        self.challenge.presence_requirement = req
+        self.challenge.save()
+        resolved = resolve_presence(self.session, self.challenge, self.tower, team=self.team)
+        self.assertFalse(resolved['is_noop'])
+        self.assertEqual(resolved['min_members'], 2)
+
+    def test_whole_team_raises_min_to_active_team_size(self):
+        from game.presence import resolve_presence
+        req = PresenceRequirement.objects.create(name='Pair', min_members_present=2)
+        self.challenge.presence_requirement = req
+        self.challenge.save()
+        self.session.togetherness_mode = 'WHOLE_TEAM_TOGETHER'
+        self.session.save()
+        resolved = resolve_presence(self.session, self.challenge, self.tower, team=self.team)
+        self.assertEqual(resolved['min_members'], 3)
+        self.assertFalse(resolved['is_noop'])
+
+    def test_radius_and_window_fallbacks(self):
+        from game.presence import resolve_presence
+        self.session.presence_window_seconds = 30
+        self.session.save()
+        req = PresenceRequirement.objects.create(name='Loose', min_members_present=2)
+        self.challenge.presence_requirement = req
+        self.challenge.save()
+        resolved = resolve_presence(self.session, self.challenge, self.tower, team=self.team)
+        self.assertEqual(resolved['geofence_radius_meters'], self.game.proximity_meters)
+        self.assertEqual(resolved['window_seconds'], 30)
+
+        req.geofence_radius_meters = 120
+        req.window_seconds = 90
+        req.save()
+        self.challenge.refresh_from_db()
+        resolved = resolve_presence(self.session, self.challenge, self.tower, team=self.team)
+        self.assertEqual(resolved['geofence_radius_meters'], 120)
+        self.assertEqual(resolved['window_seconds'], 90)
+
+
+class _PresenceSubmissionBase(TestCase):
+    """Shared fixture: location-enabled game, a team of three, a tower."""
+
+    TOWER_LNG, TOWER_LAT = 23.5, 46.5
+    INSIDE = (23.5, 46.5001)     # ~11 m from the tower
+    OUTSIDE = (23.5, 46.502)     # ~220 m from the tower
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.zone = _make_zone(self.game, name='PZ')
+        self.tower = _make_tower(
+            self.game, name='PT', zone=self.zone,
+            lng=self.TOWER_LNG, lat=self.TOWER_LAT,
+        )
+        self.challenge = Challenge.objects.create(
+            game=self.game, text='Together', tower=self.tower, difficulty=1,
+        )
+        self.client_api, self.submitter = _authed_client(self.team, username='p-sub')
+        self.client_api.post(reverse('api-location-consent'), {}, format='json')
+        self.mate_a = _add_member(self.team, 'p-mate-a').user.user
+        self.mate_b = _add_member(self.team, 'p-mate-b').user.user
+
+    def _ping_at(self, user, lnglat, age_seconds=5):
+        lng, lat = lnglat
+        return LocationPing.objects.create(
+            user=user,
+            session=self.session,
+            team=self.team,
+            point=Point(lng, lat),
+            recorded_at=timezone.now() - timedelta(seconds=age_seconds),
+        )
+
+    def _submit(self, photo=False, rfid_code=None):
+        payload = {
+            'challenge': self.challenge.id,
+            'lat': self.INSIDE[1],
+            'lng': self.INSIDE[0],
+        }
+        if rfid_code:
+            payload['rfid_code'] = rfid_code
+        else:
+            payload['tower'] = self.tower.id
+        if photo:
+            payload['photo'] = _tiny_png_b64()
+        return self.client_api.post('/api/team_tower_challenges/', payload, format='json')
+
+    def _attach_requirement(self, **kwargs):
+        kwargs.setdefault('name', 'Pair')
+        kwargs.setdefault('min_members_present', 2)
+        req = PresenceRequirement.objects.create(**kwargs)
+        self.challenge.presence_requirement = req
+        self.challenge.save()
+        return req
+
+
+class GeofencePresenceTest(_PresenceSubmissionBase):
+    """Task 8.3 — point-in-time geofence co-presence counting."""
+
+    def test_two_members_inside_pass(self):
+        self._attach_requirement()
+        self._ping_at(self.mate_a, self.INSIDE)
+        response = self._submit()
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        check = ttc.presence_check
+        self.assertTrue(check.satisfied)
+        self.assertEqual(check.required_count, 2)
+        self.assertEqual(check.present_count, 2)
+        self.assertEqual(
+            set(check.verified_member_ids), {self.submitter.id, self.mate_a.id},
+        )
+
+    def test_only_submitter_rejected_insufficient(self):
+        self._attach_requirement()
+        response = self._submit()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'INSUFFICIENT_MEMBERS_PRESENT',
+        )
+        self.assertEqual(TeamTowerChallenge.objects.count(), 0)
+
+    def test_member_outside_geofence_reason(self):
+        self._attach_requirement()
+        self._ping_at(self.mate_a, self.OUTSIDE)
+        response = self._submit()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'MEMBER_OUTSIDE_GEOFENCE',
+        )
+
+    def test_stale_ping_does_not_count(self):
+        self._attach_requirement()
+        self._ping_at(self.mate_a, self.INSIDE, age_seconds=600)
+        response = self._submit()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'INSUFFICIENT_MEMBERS_PRESENT',
+        )
+
+    def test_whole_team_together_requires_everyone(self):
+        # No PresenceRequirement at all — togetherness alone gates.
+        self.session.togetherness_mode = 'WHOLE_TEAM_TOGETHER'
+        self.session.save()
+        self._ping_at(self.mate_a, self.INSIDE)
+        response = self._submit()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'INSUFFICIENT_MEMBERS_PRESENT',
+        )
+        self._ping_at(self.mate_b, self.INSIDE)
+        self.assertEqual(self._submit().status_code, 201)
+
+
+class PresenceWindowTest(_PresenceSubmissionBase):
+    """Task 8.4 — continuous-tracking window (trajectory/duration)."""
+
+    def setUp(self):
+        super().setUp()
+        self._attach_requirement(window_seconds=60)
+
+    def test_member_inside_for_whole_window_passes(self):
+        self._ping_at(self.mate_a, self.INSIDE, age_seconds=70)  # boundary
+        self._ping_at(self.mate_a, self.INSIDE, age_seconds=30)
+        self._ping_at(self.mate_a, self.INSIDE, age_seconds=5)
+        response = self._submit()
+        self.assertEqual(response.status_code, 201)
+        check = TeamTowerChallenge.objects.get().presence_check
+        self.assertTrue(check.satisfied)
+        self.assertTrue(check.window_satisfied)
+        self.assertEqual(check.window_seconds, 60)
+
+    def test_member_inside_only_at_last_instant_fails_window(self):
+        self._ping_at(self.mate_a, self.OUTSIDE, age_seconds=40)
+        self._ping_at(self.mate_a, self.INSIDE, age_seconds=5)
+        response = self._submit()
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'PRESENCE_WINDOW_NOT_SATISFIED',
+        )
+
+    def test_jitter_within_geofence_still_passes(self):
+        self._ping_at(self.mate_a, (23.5, 46.50005), age_seconds=50)
+        self._ping_at(self.mate_a, (23.50008, 46.5001), age_seconds=25)
+        self._ping_at(self.mate_a, (23.5, 46.5002), age_seconds=5)
+        self.assertEqual(self._submit().status_code, 201)
+
+
+class PhotoFallbackTest(_PresenceSubmissionBase):
+    """Task 8.5 — photo evidence routes to PENDING review, never auto-confirms."""
+
+    def test_photo_method_requires_photo(self):
+        self._attach_requirement(method='PHOTO')
+        response = self._submit(photo=False)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'PHOTO_REVIEW_REQUIRED',
+        )
+
+    def test_photo_method_holds_for_review(self):
+        self._attach_requirement(method='PHOTO')
+        response = self._submit(photo=True)
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        check = ttc.presence_check
+        self.assertEqual(check.method, 'PHOTO')
+        self.assertEqual(check.reason_code, 'PHOTO_REVIEW_REQUIRED')
+
+    def test_geofence_or_photo_falls_back_when_geofence_insufficient(self):
+        self._attach_requirement(method='GEOFENCE_OR_PHOTO')
+        response = self._submit(photo=True)  # no teammate pings at all
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        self.assertEqual(ttc.presence_check.method, 'PHOTO')
+
+    def test_geofence_or_photo_without_photo_rejects_with_geofence_reason(self):
+        self._attach_requirement(method='GEOFENCE_OR_PHOTO')
+        response = self._submit(photo=False)
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.data['presence']['reason_code'], 'INSUFFICIENT_MEMBERS_PRESENT',
+        )
+
+    def test_photo_fallback_suppresses_rfid_auto_confirm(self):
+        self.tower.category = Tower.CATEGORY_RFID
+        self.tower.rfid_code = 'PRESENCE1'
+        self.tower.save()
+        self._attach_requirement(method='PHOTO')
+        response = self._submit(photo=True, rfid_code='PRESENCE1')
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+
+
+class PresenceBackwardCompatTest(_PresenceSubmissionBase):
+    """Task 8.6 — a NULL-requirement challenge submits exactly as before."""
+
+    def test_default_game_submission_unchanged(self):
+        # Turn location tracking back off — a fully default game.
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        response = self._submit()
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        self.assertEqual(PresenceCheck.objects.count(), 0)
+
+    def test_rfid_auto_confirm_still_confirms_without_requirement(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        self.tower.category = Tower.CATEGORY_RFID
+        self.tower.rfid_code = 'PRESENCE2'
+        self.tower.save()
+        response = self._submit(rfid_code='PRESENCE2')
+        self.assertEqual(response.status_code, 201)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(PresenceCheck.objects.count(), 0)
+
+
+class PresenceDegradationTest(_PresenceSubmissionBase):
+    """Task 8.7 — window configured but live-location unavailable."""
+
+    def test_tracking_disabled_degrades_to_point_in_time(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        self.session.presence_window_seconds = 30
+        self.session.save()
+        response = self._submit()
+        self.assertEqual(response.status_code, 201)
+        check = TeamTowerChallenge.objects.get().presence_check
+        self.assertTrue(check.satisfied)
+        self.assertIsNone(check.window_satisfied)  # not evaluated
+
+    def test_no_ping_data_degrades_to_point_in_time(self):
+        self.session.presence_window_seconds = 30
+        self.session.save()
+        response = self._submit()  # nobody has pinged yet
+        self.assertEqual(response.status_code, 201)
+        check = TeamTowerChallenge.objects.get().presence_check
+        self.assertTrue(check.satisfied)
+        self.assertIsNone(check.window_satisfied)
+
+
+class PresenceEvidenceTest(_PresenceSubmissionBase):
+    """Task 8.8 — PresenceCheck persists and reaches the staff review payload."""
+
+    def test_staff_review_payload_exposes_presence_check(self):
+        self._attach_requirement()
+        self._ping_at(self.mate_a, self.INSIDE)
+        self.assertEqual(self._submit().status_code, 201)
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.get('/api/staff/submissions/')
+        self.assertEqual(response.status_code, 200)
+        payload = response.data[0]['presence_check']
+        self.assertIsNotNone(payload)
+        self.assertEqual(payload['required_count'], 2)
+        self.assertEqual(payload['present_count'], 2)
+        self.assertEqual(payload['method'], 'GEOFENCE')
+        self.assertEqual(
+            set(payload['verified_member_ids']),
+            {self.submitter.id, self.mate_a.id},
+        )
+
+    def test_ungated_submission_has_no_presence_block(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        self.assertEqual(self._submit().status_code, 201)
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.get('/api/staff/submissions/')
+        self.assertIsNone(response.data[0]['presence_check'])
+
+
+class PresenceApiTest(_PresenceSubmissionBase):
+    """Tasks 6.2/6.3 — staff CRUD + knobs, player presence status."""
+
+    def test_staff_presence_requirement_crud(self):
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.post(
+            '/api/staff/presence-requirements/',
+            {'name': 'Trio', 'min_members_present': 3, 'method': 'GEOFENCE_OR_PHOTO'},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        req_id = response.data['id']
+        response = staff_client.patch(
+            f'/api/staff/presence-requirements/{req_id}/',
+            {'window_seconds': 45},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['window_seconds'], 45)
+        response = staff_client.get('/api/staff/presence-requirements/')
+        self.assertEqual(len(response.data), 1)
+        # Attach to the challenge through the challenge editor.
+        response = staff_client.patch(
+            f'/api/staff/challenges/{self.challenge.id}/',
+            {'presence_requirement': req_id},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['presence_requirement'], req_id)
+        # Deleting detaches (SET_NULL) without touching the challenge.
+        response = staff_client.delete(f'/api/staff/presence-requirements/{req_id}/')
+        self.assertEqual(response.status_code, 204)
+        self.challenge.refresh_from_db()
+        self.assertIsNone(self.challenge.presence_requirement)
+
+    def test_requirement_validation_rejects_zero_minimum(self):
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.post(
+            '/api/staff/presence-requirements/',
+            {'name': 'Nobody', 'min_members_present': 0},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_staff_game_and_session_accept_presence_knobs(self):
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.patch(
+            f'/api/staff/games/{self.game.id}/',
+            {'togetherness_mode': 'WHOLE_TEAM_TOGETHER', 'presence_window_seconds': 20},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['togetherness_mode'], 'WHOLE_TEAM_TOGETHER')
+        response = staff_client.patch(
+            f'/api/staff/sessions/{self.session.id}/',
+            {'teammate_visibility_mode': 'SELECT_COUNT', 'teammate_visibility_count': 2},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.session.refresh_from_db()
+        self.assertEqual(
+            self.session.effective('teammate_visibility_mode'), 'SELECT_COUNT',
+        )
+
+    def test_tower_state_reports_presence_status(self):
+        self._attach_requirement(method='GEOFENCE_OR_PHOTO')
+        self._ping_at(self.mate_a, self.INSIDE)
+        response = self.client_api.get(f'/api/towers/{self.tower.id}/state/')
+        self.assertEqual(response.status_code, 200)
+        presence = response.data['presence']
+        self.assertIsNotNone(presence)
+        self.assertEqual(presence['required_members'], 2)
+        self.assertEqual(presence['present_members'], 1)
+        self.assertTrue(presence['photo_fallback_offered'])
+
+    def test_tower_state_presence_none_by_default(self):
+        response = self.client_api.get(f'/api/towers/{self.tower.id}/state/')
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.data['presence'])
+
+
+class TeammateVisibilitySelectCountTest(TestCase):
+    """Task 6.1 — SELECT_COUNT narrows the live feed to the nearest N."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.game.location_tracking_enabled = True
+        self.game.location_visibility = 'EVERYONE'
+        self.game.teammate_visibility_mode = 'SELECT_COUNT'
+        self.game.teammate_visibility_count = 1
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.client_a, self.user_a = _authed_client(self.team, username='va')
+        self.client_b, self.user_b = _authed_client(self.team, username='vb')
+        self.client_c, self.user_c = _authed_client(self.team, username='vc')
+        for client, lnglat in (
+            (self.client_a, (23.5, 46.5)),
+            (self.client_b, (23.5, 46.5002)),   # near A
+            (self.client_c, (23.5, 46.52)),     # far from A
+        ):
+            client.post(reverse('api-location-consent'), {}, format='json')
+            client.post(
+                reverse('api-location-ping'),
+                {'lat': lnglat[1], 'lng': lnglat[0]},
+                format='json',
+            )
+
+    def test_nearest_n_plus_self(self):
+        response = self.client_a.get(reverse('api-location-live'))
+        self.assertEqual(response.status_code, 200)
+        names = {p['username'] for p in response.data['players']}
+        self.assertEqual(names, {'va', 'vb'})
+        self.assertEqual(
+            response.data['teammate_visibility'],
+            {'mode': 'SELECT_COUNT', 'count': 1},
+        )
+
+    def test_staff_unaffected_by_select_count(self):
+        staff_client, _staff = _staff_client(session=self.session)
+        response = staff_client.get(reverse('api-location-live'))
+        names = {p['username'] for p in response.data['players']}
+        self.assertEqual(names, {'va', 'vb', 'vc'})
+
+    def test_select_count_never_widens_own_team_gate(self):
+        # location_visibility OWN_TEAM caps the feed even with a huge N.
+        self.game.location_visibility = 'OWN_TEAM'
+        self.game.teammate_visibility_count = 10
+        self.game.save()
+        other_group = _make_group(self.game, name='Other', slug='other')
+        other_team = _make_team(self.game, other_group, name='others', color='#222222')
+        client_d, _user_d = _authed_client(other_team, username='vd')
+        client_d.post(reverse('api-location-consent'), {}, format='json')
+        client_d.post(
+            reverse('api-location-ping'), {'lat': 46.5, 'lng': 23.5}, format='json',
+        )
+        response = self.client_a.get(reverse('api-location-live'))
+        names = {p['username'] for p in response.data['players']}
+        self.assertEqual(names, {'va', 'vb', 'vc'})

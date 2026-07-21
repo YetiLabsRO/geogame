@@ -80,6 +80,47 @@ import { extractErrorMessage } from '../auth/form-error';
                   <div class="small text-body-secondary mt-2">No photo attached.</div>
                 }
 
+                @if (s.presence_check; as pc) {
+                  <div class="border rounded p-2 mt-2 small">
+                    <div class="fw-semibold mb-1">
+                      <i class="bi bi-people"></i> Presence evidence
+                    </div>
+                    <div>
+                      Present:
+                      <span
+                        class="badge"
+                        [class.text-bg-success]="pc.present_count >= pc.required_count"
+                        [class.text-bg-warning]="pc.present_count < pc.required_count"
+                      >
+                        {{ pc.present_count }} / {{ pc.required_count }}
+                      </span>
+                      · Method: <code>{{ pc.method }}</code>
+                      @if (pc.window_seconds > 0) {
+                        · Window ({{ pc.window_seconds }}s):
+                        @if (pc.window_satisfied === true) {
+                          <span class="badge text-bg-success">held</span>
+                        } @else if (pc.window_satisfied === false) {
+                          <span class="badge text-bg-danger">not held</span>
+                        } @else {
+                          <span class="badge text-bg-secondary">not evaluated</span>
+                        }
+                      }
+                    </div>
+                    @if (pc.method === 'PHOTO') {
+                      <div class="text-warning mt-1">
+                        <i class="bi bi-exclamation-triangle"></i>
+                        Photo evidence is the weakest tier (easily AI-edited) —
+                        confirm the required people are actually in the photo.
+                      </div>
+                    }
+                    @if (pc.verified_member_ids.length > 0) {
+                      <div class="text-body-secondary mt-1">
+                        Verified member ids: {{ pc.verified_member_ids.join(', ') }}
+                      </div>
+                    }
+                  </div>
+                }
+
                 @if (rejectingId() === s.id) {
                   <div class="mt-3">
                     <label class="form-label small" [attr.for]="'reject-reason-' + s.id">

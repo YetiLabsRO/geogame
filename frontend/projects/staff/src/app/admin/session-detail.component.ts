@@ -14,6 +14,7 @@ import {
   GameApiService,
   PauseHistory,
   Phase10Overrides,
+  PresenceRulesOverrides,
   SessionScoreboard,
   SessionState,
   SessionTimeline,
@@ -21,6 +22,8 @@ import {
   StaffApiService,
   StartReadiness,
   TeamBuildResult,
+  TeammateVisibilityMode,
+  TogethernessMode,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -63,6 +66,9 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
           · <i class="bi bi-clock"></i>
           scheduled start {{ scheduled | date: 'medium' }}
         }
+        · <a [routerLink]="['/sessions', sessionId, 'locations']">
+          <i class="bi bi-geo-alt"></i> Location history
+        </a>
       </div>
 
       <!-- Lifecycle -------------------------------------------------------- -->
@@ -369,6 +375,61 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
               </select>
             </div>
           </div>
+          <div class="col-12">
+            <div class="fw-semibold small mb-2 mt-2">
+              Presence rules (presence-rules)
+            </div>
+            <div class="row g-2">
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Togetherness</label>
+                <select
+                  class="form-select form-select-sm"
+                  [ngModel]="presenceOverride().togetherness_mode"
+                  (ngModelChange)="setPresenceOverride('togetherness_mode', $event)"
+                >
+                  <option [ngValue]="null">Inherit</option>
+                  @for (o of togethernessOptions; track o.value) {
+                    <option [ngValue]="o.value">{{ o.label }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Teammate map visibility</label>
+                <select
+                  class="form-select form-select-sm"
+                  [ngModel]="presenceOverride().teammate_visibility_mode"
+                  (ngModelChange)="setPresenceOverride('teammate_visibility_mode', $event)"
+                >
+                  <option [ngValue]="null">Inherit</option>
+                  @for (o of teammateVisibilityOptions; track o.value) {
+                    <option [ngValue]="o.value">{{ o.label }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Nearest N</label>
+                <input
+                  class="form-control form-control-sm"
+                  type="number"
+                  min="0"
+                  placeholder="Inherit"
+                  [ngModel]="presenceOverride().teammate_visibility_count"
+                  (ngModelChange)="setPresenceOverride('teammate_visibility_count', $event)"
+                />
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Presence window (s)</label>
+                <input
+                  class="form-control form-control-sm"
+                  type="number"
+                  min="0"
+                  placeholder="Inherit"
+                  [ngModel]="presenceOverride().presence_window_seconds"
+                  (ngModelChange)="setPresenceOverride('presence_window_seconds', $event)"
+                />
+              </div>
+            </div>
+          </div>
         </div>
         <button
           type="button"
@@ -534,6 +595,9 @@ export class StaffSessionDetailComponent {
 
   protected readonly override = signal<Phase10Overrides>(blankOverrides());
   protected readonly teamFormationOverride = signal<boolean | null>(null);
+  protected readonly presenceOverride = signal<PresenceRulesOverrides>(
+    blankPresenceOverrides(),
+  );
 
   protected readonly buildCount = signal<number | null>(null);
   protected readonly buildKeys = signal('');
@@ -563,7 +627,21 @@ export class StaffSessionDetailComponent {
     { value: 'ANY_ATTEMPT_ELSEWHERE', label: 'Reset on any submission anywhere' },
   ];
 
-  private readonly sessionId = Number(this.route.snapshot.paramMap.get('id'));
+  protected readonly togethernessOptions: { value: TogethernessMode; label: string }[] = [
+    { value: 'SPLIT_ALLOWED', label: 'Members may split up' },
+    { value: 'WHOLE_TEAM_TOGETHER', label: 'Whole team together' },
+  ];
+
+  protected readonly teammateVisibilityOptions: {
+    value: TeammateVisibilityMode;
+    label: string;
+  }[] = [
+    { value: 'OWN_TEAM', label: 'Own team only' },
+    { value: 'EVERYONE', label: 'Everyone' },
+    { value: 'SELECT_COUNT', label: 'Nearest N players' },
+  ];
+
+  protected readonly sessionId = Number(this.route.snapshot.paramMap.get('id'));
 
   constructor() {
     if (!this.sessionId) {
@@ -592,6 +670,7 @@ export class StaffSessionDetailComponent {
     this.session.set(s);
     this.override.set(pickOverrides(s));
     this.teamFormationOverride.set(s.allow_player_team_creation);
+    this.presenceOverride.set(pickPresenceOverrides(s));
     this.overrideDirty.set(false);
     this.refreshReadiness();
   }
@@ -727,6 +806,16 @@ export class StaffSessionDetailComponent {
     this.overrideDirty.set(true);
   }
 
+  protected setPresenceOverride<K extends keyof PresenceRulesOverrides>(
+    field: K,
+    value: PresenceRulesOverrides[K],
+  ): void {
+    // Empty number inputs come through as '' or null — both mean Inherit.
+    const normalized = (value as unknown) === '' ? null : value;
+    this.presenceOverride.update((o) => ({ ...o, [field]: normalized }));
+    this.overrideDirty.set(true);
+  }
+
   protected shuffleTeams(): void {
     this.runBuild(this.staff.shuffleTeams(this.sessionId, this.buildCount() ?? 0));
   }
@@ -762,6 +851,7 @@ export class StaffSessionDetailComponent {
     this.overrideError.set(null);
     const payload: AdminSessionPayload = {
       ...this.override(),
+      ...this.presenceOverride(),
       allow_player_team_creation: this.teamFormationOverride(),
     };
     this.staff.updateSession(id, payload).subscribe({
@@ -830,4 +920,22 @@ function pickOverrides(s: AdminSession): Phase10Overrides {
     (out[field] as Phase10Overrides[typeof field]) = s[field];
   }
   return out;
+}
+
+function blankPresenceOverrides(): PresenceRulesOverrides {
+  return {
+    togetherness_mode: null,
+    teammate_visibility_mode: null,
+    teammate_visibility_count: null,
+    presence_window_seconds: null,
+  };
+}
+
+function pickPresenceOverrides(s: AdminSession): PresenceRulesOverrides {
+  return {
+    togetherness_mode: s.togetherness_mode,
+    teammate_visibility_mode: s.teammate_visibility_mode,
+    teammate_visibility_count: s.teammate_visibility_count,
+    presence_window_seconds: s.presence_window_seconds,
+  };
 }

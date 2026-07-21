@@ -8,7 +8,11 @@ from leaflet.admin import LeafletGeoAdmin
 from game.models import (
     Challenge,
     Collection,
+    LocationConsent,
+    LocationPing,
     PauseWindow,
+    PresenceCheck,
+    PresenceRequirement,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -147,6 +151,39 @@ class CollectionAdmin(admin.ModelAdmin):
         return obj.zones.count()
 
 
+class LocationPingAdmin(LeafletGeoAdmin):
+    list_display = ('user', 'session', 'team', 'accuracy', 'recorded_at', 'received_at')
+    list_filter = ('session', 'team')
+    readonly_fields = ('received_at',)
+
+
+class LocationConsentAdmin(admin.ModelAdmin):
+    list_display = ('user', 'session', 'agreed_at', 'withdrawn_at')
+    list_filter = ('session',)
+    readonly_fields = ('consent_text', 'consent_text_hash')
+
+
+class PresenceRequirementAdmin(admin.ModelAdmin):
+    list_display = (
+        'name', 'min_members_present', 'method',
+        'geofence_radius_meters', 'window_seconds',
+    )
+    list_filter = ('method',)
+
+
+class PresenceCheckAdmin(admin.ModelAdmin):
+    list_display = (
+        'team_tower_challenge', 'required_count', 'present_count',
+        'method', 'window_satisfied', 'satisfied', 'reason_code', 'created_at',
+    )
+    list_filter = ('method', 'satisfied')
+    readonly_fields = ('created_at',)
+
+
+admin.site.register(LocationPing, LocationPingAdmin)
+admin.site.register(LocationConsent, LocationConsentAdmin)
+admin.site.register(PresenceRequirement, PresenceRequirementAdmin)
+admin.site.register(PresenceCheck, PresenceCheckAdmin)
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)

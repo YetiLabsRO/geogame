@@ -5,6 +5,7 @@ from rest_framework.exceptions import APIException
 
 from game.models import (
     Challenge,
+    PresenceCheck,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     Tower,
@@ -161,10 +162,18 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
     send `rfid_code` and skip `tower`; the serializer resolves the matching
     active RFID tower and marks the submission CONFIRMED.
 
-    Check order: membership → tower/RFID resolution → GPS proximity →
-    challenge role requirement (team-roles) → paused session → failure
-    lockout. The role gate runs after proximity so "you are too far" wins
-    over "you lack a role", and before the pause/lockout state checks.
+    Check order: membership → location consent (live-location) →
+    tower/RFID resolution → GPS proximity → presence requirement
+    (presence-rules) → challenge role requirement (team-roles) →
+    paused session → failure lockout. The consent gate sits right
+    after membership because it is a session-level "may this player
+    play at all" precondition, independent of the tower. Presence runs
+    directly after the submitter's own proximity check (it extends it
+    to teammates), so "you are too far" wins over "your team is not
+    together", which in turn wins over "you lack a role"; the
+    pause/lockout state checks stay last. A presence photo fallback
+    never rejects — it stores the submission PENDING and forces staff
+    review (never auto-confirm, even for RFID captures).
     """
 
     class Meta:
@@ -200,6 +209,14 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             )
         attrs['_team'] = membership.team
 
+        # live-location: playing a location-enabled session requires
+        # standing consent to its location rules (no-op when the
+        # effective config has tracking off — the default).
+        from game.location_api import location_consent_blocker
+        consent_blocker = location_consent_blocker(user, membership.team.session)
+        if consent_blocker is not None:
+            raise consent_blocker
+
         rfid_code = attrs.get('rfid_code') or None
         tower = attrs.get('tower')
 
@@ -233,12 +250,42 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
                 "pentru a putea face provocarea!",
             )
 
+        # presence-rules: enforce the challenge's effective presence
+        # requirement right after the submitter's own proximity check.
+        # The fully-default resolution (no PresenceRequirement,
+        # SPLIT_ALLOWED, window 0) is a no-op and writes nothing, so
+        # unconfigured games submit exactly as before.
+        challenge = attrs.get('challenge')
+        from game.presence import evaluate_presence, resolve_presence
+        session = attrs['_team'].session
+        resolved = resolve_presence(session, challenge, tower, team=attrs['_team'])
+        if not resolved['is_noop']:
+            result = evaluate_presence(
+                session=session,
+                team=attrs['_team'],
+                tower=tower,
+                submitter=self.context['request'].user,
+                submission_point=point,
+                resolved=resolved,
+                has_photo=bool(attrs.get('photo')),
+            )
+            if not result.satisfied:
+                raise serializers.ValidationError({
+                    'detail': result.detail,
+                    'presence': {
+                        'reason_code': result.reason_code,
+                        'required_members': resolved['min_members'],
+                        'present_members': result.present_count,
+                        'method': resolved['method'],
+                    },
+                })
+            attrs['_presence'] = (resolved, result)
+
         # team-roles: role-requirement gate. Evaluated on the submitting
         # team's ACTIVE role holders, independent of head-count. A
         # `require_holders_present` challenge defers the presence test to
-        # the presence-rules capability; until that ships, assignment
-        # alone suffices (the default path).
-        challenge = attrs.get('challenge')
+        # the presence-rules capability (see above); role assignment is
+        # checked here.
         if challenge is not None:
             ok, missing = challenge.team_satisfies_roles(attrs['_team'])
             if not ok:
@@ -252,7 +299,6 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
 
         # Phase 10: paused-session gating (lifecycle state is the source
         # of truth; equivalent to the open-PauseWindow predicate).
-        session = attrs['_team'].session
         if session.is_paused():
             if session.effective('pause_rejects_submissions'):
                 raise SessionPausedError()
@@ -275,11 +321,16 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
         team = validated_data.pop('_team')
         auto_confirm = validated_data.pop('_auto_confirm')
         paused_hold = validated_data.pop('_paused_hold', False)
+        presence = validated_data.pop('_presence', None)
         user = self.context['request'].user
 
         # A held submission (paused session, rejects disabled) is stored
         # PENDING and never auto-confirms — capture waits for resume.
         if paused_hold:
+            auto_confirm = False
+        # presence-rules: a photo-fallback submission must be reviewed
+        # by a human — it is never auto-confirmed, RFID included.
+        if presence is not None and presence[1].hold_for_review:
             auto_confirm = False
 
         ttc = TeamTowerChallenge.objects.create(
@@ -288,4 +339,17 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             outcome=TeamTowerChallenge.CONFIRMED if auto_confirm else TeamTowerChallenge.PENDING,
             **validated_data,
         )
+        if presence is not None:
+            resolved, result = presence
+            PresenceCheck.objects.create(
+                team_tower_challenge=ttc,
+                required_count=resolved['min_members'],
+                present_count=result.present_count,
+                method=result.method_used,
+                verified_member_ids=result.verified_member_ids,
+                window_seconds=resolved['window_seconds'],
+                window_satisfied=result.window_satisfied,
+                satisfied=result.satisfied,
+                reason_code=result.reason_code,
+            )
         return ttc
