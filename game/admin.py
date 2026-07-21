@@ -13,6 +13,7 @@ from game.models import (
     TeamTowerFailCounter,
     TeamTowerOwnership,
     Tower,
+    TowerPhoto,
     Zone,
 )
 from organize.models import Team, TeamGroup
@@ -46,6 +47,12 @@ def unassign_all(modeladmin, request, queryset):
 unassign_all.short_description = "Închide toate deținerile de Zone (selectează toate turnurile pentru a închide jocul)"
 
 
+class TowerPhotoInline(admin.TabularInline):
+    model = TowerPhoto
+    extra = 0
+    readonly_fields = ['captured_by', 'captured_at']
+
+
 class TowerAdmin(LeafletGeoAdmin):
     list_display = [
         '__str__', 'is_active', 'zone', 'category', 'get_tower_control', 'get_rfid_url', 'id',
@@ -54,6 +61,7 @@ class TowerAdmin(LeafletGeoAdmin):
     list_filter = ['zone', 'is_active', 'category']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]
+    inlines = [TowerPhotoInline]
 
     def get_tower_control(self, instance):
         output = "<ul>"
@@ -133,6 +141,12 @@ class TeamTowerFailCounterAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'tower__name')
 
 
+class TowerPhotoAdmin(admin.ModelAdmin):
+    list_display = ('tower', 'caption', 'captured_by', 'captured_at')
+    list_filter = ('tower',)
+    readonly_fields = ('captured_at',)
+
+
 class CollectionAdmin(admin.ModelAdmin):
     list_display = ('name', 'slug', 'tower_count', 'zone_count', 'created_by', 'created_at')
     search_fields = ('name', 'slug')
@@ -150,6 +164,7 @@ class CollectionAdmin(admin.ModelAdmin):
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
+admin.site.register(TowerPhoto, TowerPhotoAdmin)
 admin.site.register(Team, TeamAdmin)
 admin.site.register(Challenge, ChallengeAdmin)
 admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)

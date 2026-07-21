@@ -30,6 +30,17 @@ export interface UsageRef {
   name: string;
 }
 
+/** A curator-captured reference photo of a tower (field-authoring-mode). */
+export interface TowerPhotoInfo {
+  id: number;
+  tower: number;
+  image: string;
+  caption: string;
+  captured_by: number | null;
+  captured_by_username: string | null;
+  captured_at: string;
+}
+
 export interface AdminTower {
   id: number;
   name: string;
@@ -38,8 +49,26 @@ export interface AdminTower {
   is_active: boolean;
   initial_bonus: number;
   rfid_code: string | null;
+  location: { type: 'Point'; coordinates: [number, number] } | null;
+  authored_accuracy_m: number | null;
+  photos: TowerPhotoInfo[];
   collections: UsageRef[];
   games: UsageRef[];
+}
+
+/** Create-at-GPS payload (field-authoring-mode task 2.1). */
+export interface CreateTowerPayload {
+  name: string;
+  lat: number;
+  lng: number;
+  zone?: number | null;
+  category?: number;
+  is_active?: boolean;
+  initial_bonus?: number;
+  /** GPS accuracy (m) of the capture fix — provenance, desk creates omit it. */
+  authored_accuracy_m?: number | null;
+  /** Target Collection the new tower is filed into in the same call. */
+  collection?: number | null;
 }
 
 export interface AdminZone {
@@ -47,9 +76,26 @@ export interface AdminZone {
   name: string;
   color: string;
   scoring_type: number;
+  shape: { type: 'Polygon'; coordinates: number[][][] } | null;
   collections: UsageRef[];
   games: UsageRef[];
 }
+
+/** Walked/tapped boundary payload (field-authoring-mode task 2.3). */
+export interface CreateZonePayload {
+  name: string;
+  scoring_type?: number;
+  color?: string;
+  /** Boundary as [lng, lat] pairs in capture order; ring closed server-side. */
+  vertices: [number, number][];
+  /** Target Collection the new zone is filed into in the same call. */
+  collection?: number | null;
+}
+
+/** Attach a Challenge to a tower on site (field-authoring-mode task 2.4). */
+export type AttachChallengePayload =
+  | { challenge: number }
+  | { game: number; text: string; difficulty?: number };
 
 export interface AdminCollection {
   id: number;
@@ -344,8 +390,47 @@ export class StaffApiService {
     return this.http.get<AdminTower[]>(`/api/staff/towers/${query}`);
   }
 
-  updateTower(id: number, patch: Partial<AdminTower>): Observable<AdminTower> {
+  /** Field authoring: drop a tower at a GPS fix, filing it into a Collection. */
+  createTower(payload: CreateTowerPayload): Observable<AdminTower> {
+    return this.http.post<AdminTower>('/api/staff/towers/', payload);
+  }
+
+  updateTower(
+    id: number,
+    patch: Partial<AdminTower> & { lat?: number; lng?: number },
+  ): Observable<AdminTower> {
     return this.http.patch<AdminTower>(`/api/staff/towers/${id}/`, patch);
+  }
+
+  // ---- Field authoring: reference photos + attach-challenge ----------------
+
+  listTowerPhotos(towerId: number): Observable<TowerPhotoInfo[]> {
+    return this.http.get<TowerPhotoInfo[]>(`/api/staff/towers/${towerId}/photos/`);
+  }
+
+  /** `image` is a base64 data URL (client-side compressed capture). */
+  uploadTowerPhoto(
+    towerId: number,
+    payload: { image: string; caption?: string },
+  ): Observable<TowerPhotoInfo> {
+    return this.http.post<TowerPhotoInfo>(
+      `/api/staff/towers/${towerId}/photos/`,
+      payload,
+    );
+  }
+
+  deleteTowerPhoto(towerId: number, photoId: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/towers/${towerId}/photos/${photoId}/`);
+  }
+
+  attachChallenge(
+    towerId: number,
+    payload: AttachChallengePayload,
+  ): Observable<AdminChallenge> {
+    return this.http.post<AdminChallenge>(
+      `/api/staff/towers/${towerId}/attach-challenge/`,
+      payload,
+    );
   }
 
   unassignTower(id: number): Observable<AdminTower> {
@@ -364,7 +449,15 @@ export class StaffApiService {
     return this.http.get<AdminZone[]>(`/api/staff/zones/${query}`);
   }
 
-  updateZone(id: number, patch: Partial<AdminZone>): Observable<AdminZone> {
+  /** Field authoring: create a zone from walked/tapped vertices. */
+  createZone(payload: CreateZonePayload): Observable<AdminZone> {
+    return this.http.post<AdminZone>('/api/staff/zones/', payload);
+  }
+
+  updateZone(
+    id: number,
+    patch: Partial<AdminZone> & { vertices?: [number, number][] },
+  ): Observable<AdminZone> {
     return this.http.patch<AdminZone>(`/api/staff/zones/${id}/`, patch);
   }
 

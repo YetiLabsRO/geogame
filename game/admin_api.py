@@ -1,8 +1,9 @@
 import random
 import secrets
 
-from django.contrib.gis.geos import Point
+from django.contrib.gis.geos import GEOSException, Point, Polygon
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers, status, viewsets
@@ -20,6 +21,7 @@ from game.models import (
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
+    TowerPhoto,
     Zone,
 )
 from game.scoping import (
@@ -27,6 +29,7 @@ from game.scoping import (
     SessionScopedViewSetMixin,
     _current_session,
 )
+from game.serializers import Base64ImageField
 from organize.models import (
     Game,
     GameRole,
@@ -73,19 +76,170 @@ class GeometryUsageMixin(serializers.Serializer):
         ]
 
 
+def _close_ring(vertices):
+    """Turn a walked/tapped vertex list into a closed polygon ring.
+
+    Vertices arrive as [[lng, lat], ...] in capture order (field
+    authoring: one vertex per GPS mark or map tap). Needs at least 3
+    distinct points; the ring is closed automatically.
+    """
+    if not isinstance(vertices, list) or len(vertices) < 3:
+        raise serializers.ValidationError(
+            {'vertices': 'A zone needs at least 3 vertices.'},
+        )
+    ring = [tuple(v) for v in vertices]
+    if ring[0] != ring[-1]:
+        ring.append(ring[0])
+    try:
+        return Polygon(ring)
+    except (GEOSException, ValueError) as exc:
+        raise serializers.ValidationError({'vertices': f'Invalid polygon: {exc}'})
+
+
+class TowerPhotoSerializer(serializers.ModelSerializer):
+    """Reference photo payload (field-authoring, task 2.2).
+
+    `image` accepts a multipart file OR a base64 data URL (the offline
+    queue replays captures as JSON). `tower` / `captured_by` are set by
+    the viewset, never by the client.
+    """
+
+    image = Base64ImageField(use_url=True)
+    captured_by_username = serializers.CharField(
+        source='captured_by.username', read_only=True, default=None,
+    )
+
+    class Meta:
+        model = TowerPhoto
+        fields = (
+            'id', 'tower', 'image', 'caption',
+            'captured_by', 'captured_by_username', 'captured_at',
+        )
+        read_only_fields = ('tower', 'captured_by', 'captured_at')
+
+
 class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
+    """Staff Zone payload.
+
+    Field authoring (task 2.3): `vertices` writes the boundary as
+    [[lng, lat], ...] (walked or tapped order, ring closed server-side);
+    `shape` reads back as GeoJSON. `collection` files a NEW zone into
+    that Collection in the same call.
+    """
+
+    shape = serializers.SerializerMethodField(read_only=True)
+    vertices = serializers.ListField(
+        child=serializers.ListField(
+            child=serializers.FloatField(), min_length=2, max_length=2,
+        ),
+        write_only=True, required=False, allow_null=True,
+    )
+    collection = serializers.PrimaryKeyRelatedField(
+        queryset=Collection.objects.all(),
+        write_only=True, required=False, allow_null=True,
+    )
+
     class Meta:
         model = Zone
-        fields = ('id', 'name', 'color', 'scoring_type', 'collections', 'games')
+        fields = (
+            'id', 'name', 'color', 'scoring_type',
+            'shape', 'vertices', 'collection',
+            'collections', 'games',
+        )
+
+    def get_shape(self, zone):
+        if zone.shape is None:
+            return None
+        return {
+            'type': 'Polygon',
+            'coordinates': [
+                [list(point) for point in ring] for ring in zone.shape.coords
+            ],
+        }
+
+    def validate(self, attrs):
+        vertices = attrs.pop('vertices', None)
+        if vertices is not None:
+            attrs['shape'] = _close_ring(vertices)
+        return attrs
+
+    def create(self, validated_data):
+        collection = validated_data.pop('collection', None)
+        zone = super().create(validated_data)
+        if collection is not None:
+            collection.zones.add(zone)
+        return zone
+
+    def update(self, instance, validated_data):
+        # Target-collection filing is a create-time concern; adjusting an
+        # existing zone never re-files it.
+        validated_data.pop('collection', None)
+        return super().update(instance, validated_data)
 
 
 class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
+    """Staff Tower payload.
+
+    Field authoring (task 2.1): create-at-GPS writes `lat`/`lng`
+    (+ optional `authored_accuracy_m` capture provenance) and an optional
+    target `collection` the new tower is filed into in the same call.
+    `location` reads back as GeoJSON; `photos` lists reference photos.
+    """
+
+    location = serializers.SerializerMethodField(read_only=True)
+    lat = serializers.FloatField(write_only=True, required=False, allow_null=True)
+    lng = serializers.FloatField(write_only=True, required=False, allow_null=True)
+    collection = serializers.PrimaryKeyRelatedField(
+        queryset=Collection.objects.all(),
+        write_only=True, required=False, allow_null=True,
+    )
+    photos = TowerPhotoSerializer(many=True, read_only=True)
+
     class Meta:
         model = Tower
         fields = (
             'id', 'name', 'zone', 'category', 'is_active',
-            'initial_bonus', 'rfid_code', 'collections', 'games',
+            'initial_bonus', 'rfid_code',
+            'location', 'lat', 'lng', 'authored_accuracy_m',
+            'collection', 'photos', 'collections', 'games',
         )
+
+    def get_location(self, tower):
+        if tower.location is None:
+            return None
+        return {
+            'type': 'Point',
+            'coordinates': [tower.location.x, tower.location.y],
+        }
+
+    def validate(self, attrs):
+        lat = attrs.pop('lat', None)
+        lng = attrs.pop('lng', None)
+        if lat is not None and lng is not None:
+            attrs['location'] = Point(lng, lat)
+        elif (lat is None) != (lng is None):
+            raise serializers.ValidationError('Provide both lat and lng, or neither.')
+        if self.instance is None and 'location' not in attrs:
+            raise serializers.ValidationError(
+                'Creating a tower requires lat and lng.',
+            )
+        return attrs
+
+    def create(self, validated_data):
+        collection = validated_data.pop('collection', None)
+        tower = super().create(validated_data)
+        if collection is not None:
+            collection.towers.add(tower)
+            # A tower is only useful where its zone is also reachable:
+            # file the linked zone into the same target collection
+            # (idempotent when it is already a member).
+            if tower.zone is not None:
+                collection.zones.add(tower.zone)
+        return tower
+
+    def update(self, instance, validated_data):
+        validated_data.pop('collection', None)
+        return super().update(instance, validated_data)
 
 
 class AdminTeamSerializer(serializers.ModelSerializer):
@@ -182,24 +336,168 @@ class CollectionFilterMixin:
         return qs
 
 
-class AdminZoneViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
-    """Staff-only CRUD for repository Zones. Shape editing stays in Django admin."""
+class CollectionAuthorGateMixin:
+    """Field-authoring permission gate (task 2.5, `game-authoring-roles`).
+
+    Filing geometry into a Collection — or mutating geometry already
+    shared through Collections — requires the caller to be authorised to
+    author EVERY Collection touched (`Collection.can_author`, which
+    resolves to `Game.can_edit` on the referencing Games). Geometry in
+    no Collection stays plain staff-editable, as before.
+    """
+
+    def _require_collection_author(self, collection):
+        if collection is not None and not collection.can_author(self.request.user):
+            raise PermissionDenied(
+                'You are not authorised to author into this collection. '
+                'Ask its game creator for CREATOR collaboration, or clone the game.',
+            )
+
+    def _require_geometry_author(self, obj):
+        for collection in obj.collections.all():
+            self._require_collection_author(collection)
+
+
+class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
+    """Staff-only CRUD for repository Zones.
+
+    Field authoring: boundaries are writable as `vertices` (walked or
+    tapped [[lng, lat], ...]); new zones are filed into the target
+    `collection` in the same call. Writes into a Collection are gated
+    by `Collection.can_author` (task 2.5).
+    """
 
     permission_classes = [IsAdminUser]
     queryset = Zone.objects.all().order_by('name')
     serializer_class = AdminZoneSerializer
 
+    def perform_create(self, serializer):
+        self._require_collection_author(serializer.validated_data.get('collection'))
+        serializer.save()
 
-class AdminTowerViewSet(CollectionFilterMixin, viewsets.ModelViewSet):
+    def perform_update(self, serializer):
+        self._require_geometry_author(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_geometry_author(instance)
+        instance.delete()
+
+
+class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
-    Location (PointField) edits stay in Django admin. Everything else
-    is reachable through this viewset.
+    Field authoring: create-at-GPS via `lat`/`lng` (+ optional
+    `authored_accuracy_m` provenance and a target `collection` the new
+    tower is filed into in one call, task 2.1); reference-photo
+    endpoints under {id}/photos/ (task 2.2); attach-challenge action
+    (task 2.4). Collection-touching writes are gated by
+    `Collection.can_author` (task 2.5).
     """
 
     permission_classes = [IsAdminUser]
-    queryset = Tower.objects.all().order_by('name')
+    queryset = Tower.objects.all().order_by('name').prefetch_related('photos__captured_by')
     serializer_class = AdminTowerSerializer
+
+    def perform_create(self, serializer):
+        self._require_collection_author(serializer.validated_data.get('collection'))
+        serializer.save()
+
+    def perform_update(self, serializer):
+        self._require_geometry_author(serializer.instance)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        self._require_geometry_author(instance)
+        instance.delete()
+
+    @action(detail=True, methods=['get', 'post'])
+    def photos(self, request, pk=None):
+        """Reference photos: GET lists, POST uploads (multipart or base64)."""
+        tower = self.get_object()
+        if request.method == 'POST':
+            self._require_geometry_author(tower)
+            serializer = TowerPhotoSerializer(
+                data=request.data, context=self.get_serializer_context(),
+            )
+            serializer.is_valid(raise_exception=True)
+            photo = serializer.save(tower=tower, captured_by=request.user)
+            return Response(
+                TowerPhotoSerializer(
+                    photo, context=self.get_serializer_context(),
+                ).data,
+                status=status.HTTP_201_CREATED,
+            )
+        return Response(
+            TowerPhotoSerializer(
+                tower.photos.all(), many=True,
+                context=self.get_serializer_context(),
+            ).data,
+        )
+
+    @action(
+        detail=True, methods=['delete'],
+        url_path=r'photos/(?P<photo_id>[0-9]+)',
+    )
+    def delete_photo(self, request, pk=None, photo_id=None):
+        tower = self.get_object()
+        self._require_geometry_author(tower)
+        photo = get_object_or_404(TowerPhoto, pk=photo_id, tower=tower)
+        photo.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=['post'], url_path='attach-challenge')
+    def attach_challenge(self, request, pk=None):
+        """Field action (task 2.4): attach a Challenge to this tower.
+
+        Body: {"challenge": <id>} re-points an existing challenge at
+        this tower, or {"game": <id>, "text": ..., "difficulty": <n>}
+        creates one on the spot. The challenge bank is Game template
+        data, so both paths require `Game.can_edit`.
+        """
+        tower = self.get_object()
+        challenge_id = request.data.get('challenge')
+        if challenge_id:
+            challenge = (
+                Challenge.objects.select_related('game')
+                .filter(pk=challenge_id).first()
+            )
+            if challenge is None:
+                return Response(
+                    {'detail': 'Challenge not found.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            self._require_challenge_bank_edit(challenge.game)
+            challenge.tower = tower
+            challenge.save(update_fields=['tower'])
+            return Response(AdminChallengeSerializer(challenge).data)
+
+        game = Game.objects.filter(pk=request.data.get('game') or 0).first()
+        text = (request.data.get('text') or '').strip()
+        if game is None or not text:
+            return Response(
+                {'detail': 'Provide either "challenge", or "game" and "text".'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        self._require_challenge_bank_edit(game)
+        try:
+            difficulty = int(request.data.get('difficulty', 1))
+        except (TypeError, ValueError):
+            difficulty = 1
+        challenge = Challenge.objects.create(
+            game=game, tower=tower, text=text, difficulty=max(1, difficulty),
+        )
+        return Response(
+            AdminChallengeSerializer(challenge).data,
+            status=status.HTTP_201_CREATED,
+        )
+
+    def _require_challenge_bank_edit(self, game):
+        if game is not None and not game.can_edit(self.request.user):
+            raise PermissionDenied(
+                'Only the game creator may modify its challenge bank. '
+                'Clone the game to personalise it.',
+            )
 
     @action(detail=True, methods=['post'])
     def unassign(self, request, pk=None):

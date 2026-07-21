@@ -25,6 +25,12 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'field',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./field/field-mode.component').then((m) => m.FieldModeComponent),
+  },
+  {
     path: 'towers',
     canActivate: [staffGuard],
     loadComponent: () =>
