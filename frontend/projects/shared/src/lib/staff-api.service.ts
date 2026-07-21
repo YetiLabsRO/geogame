@@ -1028,6 +1028,60 @@ export class StaffApiService {
       {},
     );
   }
+
+  // ---- mcp-authoring: AI authoring review inbox + credentials ----------
+
+  authoringProposals(status?: string): Observable<AuthoringProposal[]> {
+    const query = status ? `?status=${status}` : '';
+    return this.http.get<AuthoringProposal[]>(`/api/staff/authoring/proposals/${query}`);
+  }
+
+  authoringProposal(id: number): Observable<AuthoringProposalDetail> {
+    return this.http.get<AuthoringProposalDetail>(`/api/staff/authoring/proposals/${id}/`);
+  }
+
+  authoringDecision(
+    id: number,
+    action: 'approve' | 'reject' | 'apply' | 'withdraw',
+  ): Observable<AuthoringProposalDetail> {
+    return this.http.post<AuthoringProposalDetail>(
+      `/api/staff/authoring/proposals/${id}/${action}/`,
+      {},
+    );
+  }
+
+  authoringOperationDecision(
+    proposalId: number,
+    opId: number,
+    action: 'approve' | 'reject',
+  ): Observable<AuthoringProposalDetail> {
+    return this.http.post<AuthoringProposalDetail>(
+      `/api/staff/authoring/proposals/${proposalId}/operations/${opId}/${action}/`,
+      {},
+    );
+  }
+
+  authoringAudit(): Observable<AuthoringAuditEvent[]> {
+    return this.http.get<AuthoringAuditEvent[]>('/api/staff/authoring/audit/');
+  }
+
+  mcpCredentials(): Observable<McpCredential[]> {
+    return this.http.get<McpCredential[]>('/api/staff/authoring/credentials/');
+  }
+
+  issueMcpCredential(label: string): Observable<McpCredential & { token: string }> {
+    return this.http.post<McpCredential & { token: string }>(
+      '/api/staff/authoring/credentials/',
+      { label },
+    );
+  }
+
+  revokeMcpCredential(id: number): Observable<McpCredential> {
+    return this.http.post<McpCredential>(
+      `/api/staff/authoring/credentials/${id}/revoke/`,
+      {},
+    );
+  }
 }
 
 // ---- tower-visibility: discovery matrix ------------------------------------
@@ -1147,4 +1201,73 @@ export interface AdminScoreMultiplierPayload {
   starts_at?: string | null;
   ends_at?: string | null;
   label?: string;
+}
+
+// ---- mcp-authoring: staged proposals, operations, audit, credentials -------
+
+export type AuthoringProposalStatus =
+  | 'DRAFT' | 'PENDING' | 'APPROVED' | 'APPLIED'
+  | 'PARTIALLY_APPLIED' | 'REJECTED' | 'WITHDRAWN' | 'FAILED';
+
+export type ProposedOperationStatus =
+  | 'PENDING' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'FAILED';
+
+export interface ProposedOperation {
+  id: number;
+  entity_type: string;
+  action: string;
+  temp_ref: string;
+  target_ref: string;
+  payload: Record<string, unknown>;
+  rationale: string;
+  status: ProposedOperationStatus;
+  order: number;
+  applied_object_type: string;
+  applied_object_id: number | null;
+  error: string;
+  current: Record<string, string> | null;
+}
+
+export interface AuthoringProposal {
+  id: number;
+  status: AuthoringProposalStatus;
+  atomic: boolean;
+  summary: string;
+  created_by: number;
+  created_by_username: string | null;
+  client_name: string;
+  llm_model: string;
+  created_at: string;
+  updated_at: string;
+  decided_by: number | null;
+  decided_at: string | null;
+  operation_count: number;
+}
+
+export interface AuthoringProposalDetail extends AuthoringProposal {
+  operations: ProposedOperation[];
+}
+
+export interface AuthoringAuditEvent {
+  id: number;
+  event_type: string;
+  tool_name: string;
+  client_name: string;
+  llm_model: string;
+  created_by: number;
+  created_by_username: string | null;
+  session: number | null;
+  proposal: number | null;
+  args: Record<string, unknown>;
+  result: Record<string, unknown>;
+  created_at: string;
+}
+
+export interface McpCredential {
+  id: number;
+  label: string;
+  is_active: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  revoked_at: string | null;
 }

@@ -326,6 +326,8 @@ urlpatterns = [
         name='api-staff-reset-scores',
     ),
     path('api/', include('organize.urls')),
+    # mcp-authoring-server: staff review + MCP credential endpoints.
+    path('', include('authoring.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),
 

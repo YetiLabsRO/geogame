@@ -12,3 +12,4 @@ gunicorn>=23
 channels>=4.3
 channels-redis>=4.3
 pywebpush>=2.0
+mcp>=1.2

@@ -72,6 +72,12 @@ export const routes: Routes = [
       import('./admin/games.component').then((m) => m.GamesComponent),
   },
   {
+    path: 'authoring',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/authoring-review.component').then((m) => m.AuthoringReviewComponent),
+  },
+  {
     path: 'sessions',
     canActivate: [staffGuard],
     loadComponent: () =>
