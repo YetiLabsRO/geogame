@@ -37,6 +37,13 @@ from game.api import (
     StaffSubmissionReview,
     TowerStateView,
 )
+from game.multipliers_api import (
+    GameScoreMultiplierDetail,
+    GameScoreMultiplierListCreate,
+    SessionActiveMultipliersView,
+    SessionScoreMultiplierListCreate,
+    SessionScoreMultiplierToggle,
+)
 from game.views import (
     ChallengeViewSet,
     TeamTowerChallengeViewSet,
@@ -91,6 +98,39 @@ urlpatterns = [
         'api/staff/submissions/<int:pk>/review/',
         StaffSubmissionReview.as_view(),
         name='api-staff-submission-review',
+    ),
+    # score-multipliers: nested under games/sessions. The DRF admin
+    # router registered below never matches these extra suffixes, so
+    # resolution falls through cleanly (same trick as organize/urls.py).
+    path(
+        'api/staff/games/<int:game_id>/score-multipliers/',
+        GameScoreMultiplierListCreate.as_view(),
+        name='api-staff-game-multipliers',
+    ),
+    path(
+        'api/staff/games/<int:game_id>/score-multipliers/<int:pk>/',
+        GameScoreMultiplierDetail.as_view(),
+        name='api-staff-game-multiplier-detail',
+    ),
+    path(
+        'api/staff/sessions/<int:session_id>/score-multipliers/',
+        SessionScoreMultiplierListCreate.as_view(),
+        name='api-staff-session-multipliers',
+    ),
+    path(
+        'api/staff/sessions/<int:session_id>/score-multipliers/<int:pk>/activate/',
+        SessionScoreMultiplierToggle.as_view(target_state=True),
+        name='api-staff-session-multiplier-activate',
+    ),
+    path(
+        'api/staff/sessions/<int:session_id>/score-multipliers/<int:pk>/deactivate/',
+        SessionScoreMultiplierToggle.as_view(target_state=False),
+        name='api-staff-session-multiplier-deactivate',
+    ),
+    path(
+        'api/sessions/<int:pk>/score-multipliers/active/',
+        SessionActiveMultipliersView.as_view(),
+        name='api-session-active-multipliers',
     ),
     path('api/staff/', include(admin_router.urls)),
     path(

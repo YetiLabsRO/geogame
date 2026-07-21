@@ -9,6 +9,7 @@ from game.models import (
     Challenge,
     Collection,
     PauseWindow,
+    ScoreMultiplier,
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
@@ -147,6 +148,16 @@ class CollectionAdmin(admin.ModelAdmin):
         return obj.zones.count()
 
 
+class ScoreMultiplierAdmin(admin.ModelAdmin):
+    list_display = (
+        '__str__', 'game', 'session', 'scope', 'tower', 'zone',
+        'multiplier_type', 'factor', 'is_active',
+    )
+    list_filter = ('multiplier_type', 'scope', 'is_active')
+    readonly_fields = ('created_at',)
+
+
+admin.site.register(ScoreMultiplier, ScoreMultiplierAdmin)
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)

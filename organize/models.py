@@ -203,15 +203,17 @@ class Game(models.Model):
         """Deep-copy this Game template, sharing the geometry repository.
 
         Copies every config field, the TeamGroup taxonomy, GameRoles,
-        and the challenge bank, remapping each cloned Challenge's
+        the challenge bank (remapping each cloned Challenge's
         `required_roles` to the clone's own roles so the clone never
-        references the original's roles. Geometry is never copied: the
-        clone links the SAME Collections (and therefore the same
-        Tower/Zone rows by PK), so tower-bound challenges keep their
-        tower reference. Records `cloned_from` provenance; the clone
-        starts inactive.
+        references the original's roles), and the Game-owned
+        ScoreMultipliers (Session-owned ones belong to a single run and
+        are never copied). Geometry is never copied: the clone links the
+        SAME Collections (and therefore the same Tower/Zone rows by PK),
+        so tower-bound challenges and tower/zone-scoped multipliers keep
+        their target reference. Records `cloned_from` provenance; the
+        clone starts inactive.
         """
-        from game.models import Challenge
+        from game.models import Challenge, ScoreMultiplier
 
         with transaction.atomic():
             clone = Game.objects.get(pk=self.pk)
@@ -259,6 +261,26 @@ class Game(models.Model):
                     challenge_clone.required_roles.set(
                         [role_map[r.pk] for r in required],
                     )
+
+            # score-multipliers: template (Game-owned) multipliers travel
+            # with the clone; Session-owned rows never do. Tower/Zone
+            # targets are shared by PK, like tower-bound challenges.
+            for multiplier in ScoreMultiplier.objects.filter(game=self):
+                ScoreMultiplier.objects.create(
+                    game=clone,
+                    scope=multiplier.scope,
+                    tower=multiplier.tower,
+                    zone=multiplier.zone,
+                    multiplier_type=multiplier.multiplier_type,
+                    factor=multiplier.factor,
+                    is_active=multiplier.is_active,
+                    window_start_offset=multiplier.window_start_offset,
+                    window_end_offset=multiplier.window_end_offset,
+                    starts_at=multiplier.starts_at,
+                    ends_at=multiplier.ends_at,
+                    label=multiplier.label,
+                    created_by=created_by,
+                )
             return clone
 
 
