@@ -254,6 +254,14 @@ class Game(models.Model):
                     difficulty=challenge.difficulty,
                     role_requirement_mode=challenge.role_requirement_mode,
                     require_holders_present=challenge.require_holders_present,
+                    # challenge-type-system: the type and its config are
+                    # template data — clones keep them. Single-use
+                    # consumption is derived from the clone's own
+                    # submissions, so it never carries over.
+                    type=challenge.type,
+                    validation_code=challenge.validation_code,
+                    type_config=dict(challenge.type_config or {}),
+                    review_mode=challenge.review_mode,
                 )
                 if required:
                     challenge_clone.required_roles.set(

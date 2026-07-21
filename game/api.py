@@ -7,6 +7,7 @@ from rest_framework.permissions import IsAdminUser, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from game.challenge_types import TYPE_RFID
 from game.models import (
     ROLE_REQUIREMENT_NONE,
     Challenge,
@@ -17,9 +18,28 @@ from game.scoping import SessionScopedViewSetMixin
 
 
 class ChallengeSummarySerializer(serializers.ModelSerializer):
+    """Player-facing challenge summary (tower state / next challenge).
+
+    Reports the challenge `type`, effective review mode and the payload
+    a submission must supply so the client can render the matching
+    submission UI — never the raw `validation_code`.
+    """
+
+    effective_review_mode = serializers.SerializerMethodField()
+    required_payload = serializers.SerializerMethodField()
+
     class Meta:
         model = Challenge
-        fields = ('id', 'text', 'difficulty', 'tower')
+        fields = (
+            'id', 'text', 'difficulty', 'tower', 'type',
+            'effective_review_mode', 'required_payload',
+        )
+
+    def get_effective_review_mode(self, obj):
+        return obj.effective_review_mode()
+
+    def get_required_payload(self, obj):
+        return obj.required_payload()
 
 
 class OwnershipSummarySerializer(serializers.Serializer):
@@ -141,8 +161,12 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
     tower_name = serializers.CharField(source='tower.name', read_only=True)
     challenge_text = serializers.SerializerMethodField()
     challenge_difficulty = serializers.SerializerMethodField()
+    challenge_type = serializers.SerializerMethodField()
     submitted_by_username = serializers.SerializerMethodField()
     photo_url = serializers.SerializerMethodField()
+    # AUTO outcomes carry checked_by = NULL (system-attributed); the
+    # scanned code stays visible as the audit trail.
+    auto_resolved = serializers.SerializerMethodField()
 
     class Meta:
         model = TeamTowerChallenge
@@ -150,8 +174,9 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
             'id', 'team', 'team_name', 'team_color',
             'tower', 'tower_name',
             'challenge', 'challenge_text', 'challenge_difficulty',
-            'submitted_by', 'submitted_by_username',
-            'photo_url', 'timestamp_submitted', 'timestamp_verified',
+            'challenge_type', 'submitted_by', 'submitted_by_username',
+            'photo_url', 'submitted_code', 'auto_resolved',
+            'timestamp_submitted', 'timestamp_verified',
             'outcome', 'response_text',
         )
 
@@ -160,6 +185,19 @@ class StaffSubmissionSerializer(serializers.ModelSerializer):
 
     def get_challenge_difficulty(self, obj):
         return obj.challenge.difficulty if obj.challenge else None
+
+    def get_challenge_type(self, obj):
+        if obj.challenge:
+            return obj.challenge.type
+        # Challenge-less scan rows are RFID captures by construction.
+        return TYPE_RFID if obj.submitted_code else None
+
+    def get_auto_resolved(self, obj):
+        return (
+            obj.outcome != TeamTowerChallenge.PENDING
+            and obj.checked_by_id is None
+            and obj.timestamp_verified is not None
+        )
 
     def get_submitted_by_username(self, obj):
         return obj.submitted_by.username if obj.submitted_by else None

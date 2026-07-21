@@ -12,6 +12,7 @@ from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from game.challenge_types import REVIEW_MANUAL, TYPE_NFC_QR, TYPE_TEXT
 from game.models import (
     ROLE_REQUIREMENT_NONE,
     Challenge,
@@ -129,20 +130,56 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
 
 
 class AdminChallengeSerializer(serializers.ModelSerializer):
+    """Staff-side challenge payload.
+
+    Unlike the player serializers this DOES expose `validation_code` —
+    staff author it and hand it to the venue (printable handout).
+    """
+
     class Meta:
         model = Challenge
         fields = (
             'id', 'game', 'text', 'tower', 'difficulty',
+            'type', 'validation_code', 'type_config', 'review_mode',
             'role_requirement_mode', 'required_roles', 'require_holders_present',
         )
 
     def validate(self, attrs):
-        """team-roles config validation (task 2.3).
+        """team-roles config validation (task 2.3) + challenge-type config.
 
         `required_roles` must belong to the challenge's Game, and a
         non-NONE `role_requirement_mode` needs a non-empty role set.
+        An NFC_QR challenge needs a `validation_code` unless forced to
+        MANUAL review; `type_config` must be a JSON object and
+        `single_use`, when present, a boolean.
         """
         instance = self.instance
+
+        def resolved(field, default=None):
+            if field in attrs:
+                return attrs[field]
+            return getattr(instance, field) if instance else default
+
+        challenge_type = resolved('type', TYPE_TEXT)
+        type_config = resolved('type_config', {}) or {}
+        if not isinstance(type_config, dict):
+            raise serializers.ValidationError(
+                'type_config must be a JSON object.',
+            )
+        if 'single_use' in type_config and not isinstance(type_config['single_use'], bool):
+            raise serializers.ValidationError(
+                'type_config.single_use must be a boolean.',
+            )
+        if (
+            challenge_type == TYPE_NFC_QR
+            and not resolved('validation_code')
+            and resolved('review_mode') != REVIEW_MANUAL
+        ):
+            raise serializers.ValidationError(
+                'An NFC_QR challenge needs a validation_code (the code the '
+                'venue hands out) unless its review_mode is forced to MANUAL.',
+            )
+
         mode = attrs.get(
             'role_requirement_mode',
             instance.role_requirement_mode if instance else ROLE_REQUIREMENT_NONE,
