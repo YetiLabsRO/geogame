@@ -16,11 +16,11 @@ from organize.models import (
 @admin.register(Game)
 class GameAdmin(admin.ModelAdmin):
     list_display = (
-        'name', 'slug', 'is_active', 'created_by', 'cloned_from',
+        'name', 'slug', 'mode', 'is_active', 'created_by', 'cloned_from',
         'proximity_meters', 'cooloff_minutes',
         'allow_player_team_creation', 'team_join_confirmation',
     )
-    list_filter = ('is_active', 'allow_player_team_creation')
+    list_filter = ('is_active', 'mode', 'allow_player_team_creation')
     search_fields = ('name', 'slug')
     filter_horizontal = ('collections',)
 

@@ -21,6 +21,11 @@ export const routes: Routes = [
     loadComponent: () => import('./map/map.component').then((m) => m.MapComponent),
   },
   {
+    path: 'trail',
+    canActivate: [authGuard],
+    loadComponent: () => import('./trail/trail.component').then((m) => m.TrailComponent),
+  },
+  {
     path: 'rules',
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },

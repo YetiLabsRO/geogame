@@ -109,6 +109,44 @@ export interface TowerFeature {
   ownership: TowerOwnership | Record<string, never>;
 }
 
+
+/** mode-trail-discovery: one trail step in the player state payload. */
+export interface TrailStepInfo {
+  id: number;
+  order: number;
+  is_start: boolean;
+  is_finish: boolean;
+  has_gate: boolean;
+  gate_challenge: number | null;
+  tower: { id: number; name: string; location: { type: 'Point'; coordinates: [number, number] } };
+  clue: string;
+  state: 'REVEALED' | 'ARRIVED' | 'UNLOCKED' | null;
+  revealed_at?: string | null;
+  arrived_at?: string | null;
+  unlocked_at?: string | null;
+}
+
+export interface TrailState {
+  trail: { structure: string; starting_knowledge: string; participation: string };
+  route: { start_step: number; party: string; sequence: number[] | null } | null;
+  steps: TrailStepInfo[];
+  next_steps: TrailStepInfo[];
+  progress?: { unlocked: number; total: number };
+  finished: boolean;
+  finished_at: string | null;
+  start_hint?: string;
+}
+
+export interface TrailLeaderboardRow {
+  party: string;
+  team_id: number | null;
+  team_color: string | null;
+  steps_unlocked: number;
+  finished: boolean;
+  finished_at: string | null;
+  rank: number;
+}
+
 @Injectable({ providedIn: 'root' })
 export class GameApiService {
   private readonly http = inject(HttpClient);
@@ -158,6 +196,19 @@ export class GameApiService {
       '/api/team_tower_challenges/',
       payload,
     );
+  }
+
+  /** mode-trail-discovery: the party's trail state. 404 on DOMINATION sessions. */
+  trailState(): Observable<TrailState> {
+    return this.http.get<TrailState>('/api/trail/state/');
+  }
+
+  trailNext(): Observable<{ next_steps: TrailStepInfo[]; is_branch: boolean }> {
+    return this.http.get<{ next_steps: TrailStepInfo[]; is_branch: boolean }>('/api/trail/next/');
+  }
+
+  trailLeaderboard(): Observable<{ ranking: TrailLeaderboardRow[] }> {
+    return this.http.get<{ ranking: TrailLeaderboardRow[] }>('/api/trail/leaderboard/');
   }
 
   teams(): Observable<TeamSummary[]> {
