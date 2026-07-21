@@ -31,7 +31,7 @@
 
 - [x] 5.1 `GET /api/dementors/me/`: own role, energy, and the live drain/gain delta for the current tick (polling fallback).
 - [x] 5.2 `GET /api/staff/dementors/session/{id}/totals/`: live role counts (e.g. 5 dementors / 10 wizards) and a per-player feed for a map/tablet.
-- [ ] 5.3 Channels push: live energy/role updates to each player and live totals to the staff dashboard; polling remains a graceful fallback.
+- [x] 5.3 Channels push: live energy/role updates to each player and live totals to the staff dashboard; polling remains a graceful fallback.
 
 ## 6. Frontend
 

@@ -96,6 +96,11 @@ def run_tick(session, now=None):
     events = derive_proximity(session, now=now)
     if dementors_enabled(session):
         economy_tick(session, events, now=now)
+        # 5.3: push the fresh role/energy snapshot to connected clients.
+        # Best-effort — a missing/failed channel layer degrades to the
+        # existing polling path and never breaks the tick.
+        from game.events import emit_dementor_tick
+        emit_dementor_tick(session)
     return events
 
 

@@ -3,15 +3,20 @@ import {
   Component,
   DestroyRef,
   computed,
+  effect,
   inject,
   signal,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { DatePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 
 import {
   DementorMe,
   DementorsService,
+  GameApiService,
+  REALTIME_EVENTS,
+  RealtimeService,
   ProximityIdentityInfo,
   ProximityObservation,
 } from 'shared';
@@ -273,6 +278,8 @@ const POLL_INTERVAL_MS = 3_000;
 })
 export class DementorsComponent {
   private readonly api = inject(DementorsService);
+  private readonly gameApi = inject(GameApiService);
+  protected readonly realtime = inject(RealtimeService);
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly me = signal<DementorMe | null>(null);
@@ -320,6 +327,7 @@ export class DementorsComponent {
   });
 
   private pollHandle: ReturnType<typeof setInterval> | null = null;
+  private seenConnections = 0;
   private wakeLock: { release(): Promise<void> } | null = null;
   private readonly onVisibility = () => {
     if (document.visibilityState === 'visible') this.acquireWakeLock();
@@ -327,7 +335,30 @@ export class DementorsComponent {
 
   constructor() {
     this.refresh();
-    this.pollHandle = setInterval(() => this.refresh(), POLL_INTERVAL_MS);
+    this.connectRealtime();
+    // Polling stays as the graceful fallback: skip the periodic refresh
+    // while the realtime socket is delivering tick snapshots (5.3).
+    this.pollHandle = setInterval(() => {
+      if (!this.realtime.connected()) this.refresh();
+    }, POLL_INTERVAL_MS);
+
+    // Reconcile from a fresh /me/ snapshot after every reconnect.
+    effect(() => {
+      const count = this.realtime.connections();
+      if (count > this.seenConnections && this.seenConnections > 0) {
+        this.refresh();
+      }
+      this.seenConnections = Math.max(this.seenConnections, count);
+    });
+
+    // 5.3 — a server economy tick pushes a role/energy snapshot; pull our
+    // own authoritative /me/ view (trend + report-staleness are computed
+    // there per player, not carried in the session-wide broadcast).
+    this.realtime
+      .eventsOfType(REALTIME_EVENTS.dementorTick)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => this.refresh());
+
     // BLE detection is foreground-only: keep the screen awake while the
     // Dementors screen is open (best-effort; unsupported browsers just
     // fall back to the "phone out" prompt).
@@ -338,6 +369,14 @@ export class DementorsComponent {
       document.removeEventListener('visibilitychange', this.onVisibility);
       this.wakeLock?.release().catch(() => {});
       this.wakeLock = null;
+      this.realtime.disconnect();
+    });
+  }
+
+  private connectRealtime(): void {
+    this.gameApi.currentSession().subscribe({
+      next: (session) => this.realtime.connect(session.id, session.realtime_enabled),
+      error: () => {},
     });
   }
 

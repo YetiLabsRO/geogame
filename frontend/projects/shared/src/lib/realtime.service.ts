@@ -65,6 +65,18 @@ export interface SessionStateChangedPayload {
   is_active: boolean;
 }
 
+/** mode-dementors-ble 5.3: full role/energy snapshot after a server tick. */
+export interface DementorTickPayload {
+  totals: { wizards: number; dementors: number; out_of_play: number };
+  players: {
+    player_id: number;
+    role: 'WIZARD' | 'DEMENTOR';
+    energy: number;
+    alive: boolean;
+    last_delta: number;
+  }[];
+}
+
 /** Application close codes the server uses to refuse a socket for good. */
 const FATAL_CLOSE_CODES = [4401, 4403, 4404, 4423];
 
@@ -243,4 +255,5 @@ export const REALTIME_EVENTS = {
   scoreboardUpdated: 'scoreboard.updated',
   bonusAppeared: 'bonus.appeared',
   sessionStateChanged: 'session.state_changed',
+  dementorTick: 'dementor.tick',
 } as const;

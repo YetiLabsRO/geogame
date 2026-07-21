@@ -2,12 +2,21 @@ import {
   ChangeDetectionStrategy,
   Component,
   DestroyRef,
+  effect,
   inject,
   signal,
 } from '@angular/core';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { DatePipe } from '@angular/common';
 
-import { DementorTotals, DementorsService, GameApiService } from 'shared';
+import {
+  DementorTickPayload,
+  DementorTotals,
+  DementorsService,
+  GameApiService,
+  REALTIME_EVENTS,
+  RealtimeService,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -162,6 +171,7 @@ const POLL_INTERVAL_MS = 5_000;
 export class DementorsDashboardComponent {
   private readonly api = inject(DementorsService);
   private readonly gameApi = inject(GameApiService);
+  protected readonly realtime = inject(RealtimeService);
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly totals = signal<DementorTotals | null>(null);
@@ -171,13 +181,68 @@ export class DementorsDashboardComponent {
 
   private sessionId: number | null = null;
   private pollHandle: ReturnType<typeof setInterval> | null = null;
+  private seenConnections = 0;
 
   constructor() {
     this.refresh();
-    this.pollHandle = setInterval(() => this.refresh(), POLL_INTERVAL_MS);
+    this.connectRealtime();
+    // Polling stays as the graceful fallback: skip it while the socket
+    // is delivering tick snapshots (5.3).
+    this.pollHandle = setInterval(() => {
+      if (!this.realtime.connected()) this.refresh();
+    }, POLL_INTERVAL_MS);
+
+    // Reconcile the full feed from REST after every reconnect.
+    effect(() => {
+      const count = this.realtime.connections();
+      if (count > this.seenConnections && this.seenConnections > 0) {
+        this.refresh();
+      }
+      this.seenConnections = Math.max(this.seenConnections, count);
+    });
+
+    // 5.3 — apply live totals + role/energy from each tick push, keeping
+    // the username/team join from the last REST snapshot.
+    this.realtime
+      .eventsOfType<DementorTickPayload>(REALTIME_EVENTS.dementorTick)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((envelope) => this.applyTick(envelope.payload));
+
     this.destroyRef.onDestroy(() => {
       if (this.pollHandle) clearInterval(this.pollHandle);
+      this.realtime.disconnect();
     });
+  }
+
+  private connectRealtime(): void {
+    this.gameApi.currentSession().subscribe({
+      next: (session) => this.realtime.connect(session.id, session.realtime_enabled),
+      error: () => {},
+    });
+  }
+
+  private applyTick(payload: DementorTickPayload): void {
+    const current = this.totals();
+    if (!current) {
+      // No baseline yet (username/team unknown) — pull the full feed.
+      this.refresh();
+      return;
+    }
+    const known = new Set(current.players.map((row) => row.player_id));
+    if (payload.players.some((p) => !known.has(p.player_id))) {
+      // A player we have never seen (roster changed) — reconcile via REST.
+      this.refresh();
+      return;
+    }
+    const live = new Map(payload.players.map((p) => [p.player_id, p]));
+    const players = current.players.map((row) => {
+      const p = live.get(row.player_id);
+      return p
+        ? { ...row, role: p.role, energy: p.energy, alive: p.alive, last_delta: p.last_delta }
+        : row;
+    });
+    this.totals.set({ ...current, totals: payload.totals, players });
+    this.lastUpdated.set(new Date().toLocaleTimeString());
   }
 
   protected refresh(): void {

@@ -39,9 +39,16 @@ EVENT_BONUS_APPEARED = 'bonus.appeared'
 # transitions are broadcast too so clients can react (pause banners,
 # snapshot refetch) without polling. Clients ignore unknown types.
 EVENT_SESSION_STATE_CHANGED = 'session.state_changed'
+# mode-dementors-ble 5.3: after each server economy tick, push a full
+# role/energy snapshot so players see their own drain/gain and staff see
+# live totals without waiting for the next poll. Coalesced like the
+# scoreboard (each event is a full snapshot; dropping intermediates is
+# safe), and clients still reconcile from REST on (re)connect.
+EVENT_DEMENTOR_TICK = 'dementor.tick'
 
-# Leading-edge throttle bookkeeping for scoreboard broadcasts.
+# Leading-edge throttle bookkeeping for coalesced broadcasts.
 _scoreboard_last_sent = {}
+_dementor_last_sent = {}
 
 
 def session_group(session_id):
@@ -50,8 +57,9 @@ def session_group(session_id):
 
 
 def reset_throttle():
-    """Test hook: forget scoreboard throttle timestamps."""
+    """Test hook: forget coalesced-broadcast throttle timestamps."""
     _scoreboard_last_sent.clear()
+    _dementor_last_sent.clear()
 
 
 def _channel_layer():
@@ -229,6 +237,66 @@ def emit_scoreboard_update(session, *, force=False):
         _scoreboard_last_sent[session.id] = now
     return broadcast_session_event(
         session.id, EVENT_SCOREBOARD_UPDATED, {'entries': _scoreboard_entries(session)},
+    )
+
+
+def _dementor_snapshot(session):
+    """Live role totals + a compact per-player role/energy list.
+
+    Mirrors `StaffDementorTotalsView`'s numbers (minus the per-request
+    username/team join, which stays a REST concern): the staff dashboard
+    shows the totals live and reconciles the full feed from REST, and
+    each player's client picks its own entry by `player_id`.
+    """
+    from game.models import DementorState
+
+    states = list(
+        DementorState.objects
+        .filter(session=session)
+        .order_by('player_id')
+    )
+    wizards = sum(
+        1 for s in states if s.alive and s.role == DementorState.WIZARD
+    )
+    dementors = sum(
+        1 for s in states if s.alive and s.role == DementorState.DEMENTOR
+    )
+    out_of_play = sum(1 for s in states if not s.alive)
+    return {
+        'totals': {
+            'wizards': wizards,
+            'dementors': dementors,
+            'out_of_play': out_of_play,
+        },
+        'players': [
+            {
+                'player_id': s.player_id,
+                'role': s.role,
+                'energy': round(s.energy, 2),
+                'alive': s.alive,
+                'last_delta': round(s.last_delta, 3),
+            }
+            for s in states
+        ],
+    }
+
+
+def emit_dementor_tick(session, *, force=False):
+    """Broadcast a role/energy snapshot after an economy tick, throttled.
+
+    At most one broadcast per REALTIME_DEMENTOR_THROTTLE_SECONDS per
+    Session (`force=True` bypasses). Safe to coalesce: every event is a
+    full snapshot and clients reconcile from REST on (re)connect.
+    """
+    window = getattr(settings, 'REALTIME_DEMENTOR_THROTTLE_SECONDS', 2.0)
+    if not force and window > 0:
+        now = time.monotonic()
+        last = _dementor_last_sent.get(session.id)
+        if last is not None and (now - last) < window:
+            return False
+        _dementor_last_sent[session.id] = now
+    return broadcast_session_event(
+        session.id, EVENT_DEMENTOR_TICK, _dementor_snapshot(session),
     )
 
 

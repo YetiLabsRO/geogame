@@ -9748,6 +9748,84 @@ class DementorEconomyTest(TestCase):
         self.assertEqual(state.last_tick_at, self.t0 - timedelta(seconds=10))
 
 
+@override_settings(REALTIME_DEMENTOR_THROTTLE_SECONDS=0)
+class DementorTickBroadcastTest(TestCase):
+    """5.3 — the server economy tick pushes a role/energy snapshot."""
+
+    def setUp(self):
+        events.reset_throttle()
+        self.game, self.session, self.team, self.players = _proximity_setup(4)
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        self.w1, self.w2, self.w3, self.d1 = self.players
+        self.t0 = timezone.now()
+        _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.w2, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        # Drained-and-died wizard: counts toward out_of_play, never ticks.
+        _state(
+            self.session, self.w3, DementorState.WIZARD, 0, self.t0, alive=False,
+        )
+
+    def test_run_tick_broadcasts_snapshot(self):
+        with patch('game.events.broadcast_session_event', return_value=True) as rec:
+            run_tick(self.session, now=self.t0 + timedelta(seconds=1))
+        ticks = [c.args for c in rec.call_args_list
+                 if c.args[1] == events.EVENT_DEMENTOR_TICK]
+        self.assertEqual(len(ticks), 1)
+        session_id, _, payload = ticks[0]
+        self.assertEqual(session_id, self.session.id)
+        self.assertEqual(payload['totals'],
+                         {'wizards': 2, 'dementors': 1, 'out_of_play': 1})
+        self.assertEqual(len(payload['players']), 4)
+        entry = payload['players'][0]
+        self.assertCountEqual(
+            entry.keys(),
+            ['player_id', 'role', 'energy', 'alive', 'last_delta'],
+        )
+        # Session-wide broadcast never leaks the per-request username/team.
+        self.assertNotIn('username', entry)
+
+    def test_no_broadcast_when_mode_disabled(self):
+        self.game.dementors_enabled = False
+        self.game.save(update_fields=['dementors_enabled'])
+        with patch('game.events.broadcast_session_event', return_value=True) as rec:
+            run_tick(self.session, now=self.t0 + timedelta(seconds=1))
+        self.assertEqual(
+            [c.args for c in rec.call_args_list
+             if c.args[1] == events.EVENT_DEMENTOR_TICK],
+            [],
+        )
+
+    def test_snapshot_ignores_dead_in_role_totals(self):
+        payload = events._dementor_snapshot(self.session)
+        self.assertEqual(payload['totals']['out_of_play'], 1)
+        dead = next(p for p in payload['players'] if not p['alive'])
+        self.assertEqual(dead['player_id'], self.w3.pk)
+
+    def test_tick_coalesced_per_session(self):
+        with override_settings(REALTIME_DEMENTOR_THROTTLE_SECONDS=60):
+            events.reset_throttle()
+            with patch('game.events.broadcast_session_event',
+                       return_value=True) as rec:
+                events.emit_dementor_tick(self.session)
+                events.emit_dementor_tick(self.session)
+                ticks = [c.args for c in rec.call_args_list
+                         if c.args[1] == events.EVENT_DEMENTOR_TICK]
+                self.assertEqual(len(ticks), 1)
+                # force=True bypasses the coalescing window.
+                events.emit_dementor_tick(self.session, force=True)
+                ticks = [c.args for c in rec.call_args_list
+                         if c.args[1] == events.EVENT_DEMENTOR_TICK]
+                self.assertEqual(len(ticks), 2)
+        events.reset_throttle()
+
+    def test_tick_degrades_without_channel_layer(self):
+        with patch('game.events._channel_layer', return_value=None):
+            # No raise, and reports a no-op so callers can tell.
+            self.assertFalse(events.emit_dementor_tick(self.session, force=True))
+
+
 class DementorLifecycleTest(TestCase):
     """T3.3 — initial role assignment and the session-start hook."""
 
