@@ -39,11 +39,18 @@ from game.serializers import (
     TowerSerializer,
     ZoneSerializer,
 )
+from game.trail import (
+    on_submission_confirmed,
+    on_submission_created,
+    revealed_tower_ids,
+)
 from organize.models import (
+    MODE_TRAIL,
     Team,
     TeamGroup,
     TeamMembership,
     effective_allow_player_team_creation,
+    effective_mode,
 )
 
 
@@ -80,6 +87,22 @@ class TowerViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         queryset = super().get_queryset()
+        # mode-trail-discovery: on a TRAIL session, mask trail points the
+        # caller's party has not revealed yet (per-party map masking —
+        # see game.trail.revealed_tower_ids).
+        session = _current_session(self.request)
+        if session is not None:
+            profile = self.request.user.profile
+            membership = profile.memberships.filter(
+                is_active=True, team__session=session,
+            ).select_related('team').first()
+            revealed = revealed_tower_ids(
+                session,
+                team=membership.team if membership else None,
+                profile=profile,
+            )
+            if revealed is not None:
+                queryset = queryset.filter(pk__in=revealed)
         if self.request.query_params.get("lat") and self.request.query_params.get("lng"):
             lat = float(self.request.query_params.get("lat"))
             lng = float(self.request.query_params.get("lng"))
@@ -222,7 +245,14 @@ class TeamTowerChallengeViewSet(SessionScopedViewSetMixin, viewsets.ModelViewSet
 
     def perform_create(self, serializer):
         ttc = serializer.save()
-        if ttc.outcome == TeamTowerChallenge.CONFIRMED:
+        if effective_mode(ttc.team.session) == MODE_TRAIL:
+            # mode-trail-discovery: geofenced arrival marks the step
+            # ARRIVED; a confirmed gate unlocks it. Domination capture
+            # (tower ownership + bonus) stays inert in TRAIL mode.
+            on_submission_created(ttc)
+            if ttc.outcome == TeamTowerChallenge.CONFIRMED:
+                on_submission_confirmed(ttc)
+        elif ttc.outcome == TeamTowerChallenge.CONFIRMED:
             ttc.tower.assign_to_team(ttc.team)
 
 

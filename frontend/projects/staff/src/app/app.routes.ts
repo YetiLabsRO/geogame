@@ -94,6 +94,12 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'trails',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/trail-designer.component').then((m) => m.TrailDesignerComponent),
+  },
+  {
     path: 'scoreboard',
     canActivate: [staffGuard],
     loadComponent: () =>

@@ -39,6 +39,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from game import events
+from game import trail as trail_engine  # mode-trail-discovery
 from game.admin import unassign_all
 from game.challenge_types import (
     REVIEW_AUTO,
@@ -49,12 +50,18 @@ from game.challenge_types import (
     TYPE_TEXT,
     get_handler,
 )
-from game.models import (  # nfc-native-and-secure-links
+from game.models import (  # mode-trail-discovery  # nfc-native-and-secure-links
+    KNOWLEDGE_ALL_KNOWN,
+    KNOWLEDGE_NONE_KNOWN,
+    KNOWLEDGE_ONE_KNOWN,
     NFC_MODE_LEGACY_URL,
     NFC_MODE_SECURE_TOKEN,
     ROLE_REQUIREMENT_ALL,
     ROLE_REQUIREMENT_ANY,
     ROLE_REQUIREMENT_NONE,
+    STRUCTURE_CIRCUIT,
+    STRUCTURE_FIXED_ORDER,
+    STRUCTURE_GRAPH,
     Challenge,
     Collection,
     LocationConsent,
@@ -67,13 +74,20 @@ from game.models import (  # nfc-native-and-secure-links
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
+    TeamTrailProgress,
+    TeamTrailRoute,
     TeamZoneOwnership,
     Tower,
     TowerPhoto,
+    Trail,
+    TrailEdge,
+    TrailStep,
     Zone,
 )
 from geogame.asgi import application as asgi_application
-from organize.models import (
+from organize.models import (  # mode-trail-discovery
+    MODE_DOMINATION,
+    MODE_TRAIL,
     Game,
     GameCollaborator,
     GameRole,
@@ -84,6 +98,7 @@ from organize.models import (
     TeamGroup,
     TeamMembership,
     TeamRole,
+    effective_mode,
 )
 from organize.push import BasePushSender
 
@@ -7305,3 +7320,472 @@ class AdminNfcTagEndpointTest(TestCase):
         team = _make_team(self.game, group)
         client, _ = _authed_client(team)
         self.assertEqual(client.get('/api/staff/nfc-tags/').status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# mode-trail-discovery — trail/discovery game mode
+# ---------------------------------------------------------------------------
+
+
+def _make_trail(structure=STRUCTURE_FIXED_ORDER, knowledge=KNOWLEDGE_ONE_KNOWN,
+                n_steps=4, gates=False, name='Trail Game'):
+    """A TRAIL-mode Game with a RUNNING session, one team and n steps.
+
+    Steps are ordered 1..n at distinct locations; first is_start, last
+    is_finish. With `gates`, each step gets a TEXT gate challenge bound
+    to its tower; without, steps are read-only ("acknowledge") gates.
+    """
+    game = _make_game(name)
+    game.mode = MODE_TRAIL
+    game.save(update_fields=['mode'])
+    group = _make_group(game)
+    team = _make_team(game, group, name=f'{name} team')
+    session = team.session
+    trail = Trail.objects.create(
+        game=game, structure=structure, starting_knowledge=knowledge,
+    )
+    steps = []
+    for i in range(n_steps):
+        tower = _make_tower(
+            game, name=f'{name} T{i + 1}', lng=23.5 + i * 0.1, lat=46.5,
+        )
+        gate = None
+        if gates:
+            gate = Challenge.objects.create(
+                game=game, text=f'Gate {i + 1}?', tower=tower, difficulty=1,
+            )
+        steps.append(TrailStep.objects.create(
+            trail=trail, tower=tower, order=i + 1,
+            is_start=(i == 0), is_finish=(i == n_steps - 1),
+            gate_challenge=gate, clue_text=f'Clue to point {i + 1}',
+            start_hint='Look near the old oak' if i == 0 else '',
+        ))
+    return game, session, team, trail, steps
+
+
+def _assign_route(session, team, start_step, step_ids=None):
+    route = TeamTrailRoute.objects.create(
+        session=session, team=team, start_step=start_step,
+    )
+    if step_ids:
+        from game.models import TeamTrailRouteStep
+        TeamTrailRouteStep.objects.bulk_create([
+            TeamTrailRouteStep(route=route, step_id=sid, position=pos)
+            for pos, sid in enumerate(step_ids)
+        ])
+    trail = start_step.trail
+    trail_engine.seed_initial_reveal(session, trail, route)
+    return route
+
+
+def _confirm_at(team, user, step):
+    """Simulate a confirmed gate submission at `step` (engine-level)."""
+    ttc = TeamTowerChallenge.objects.create(
+        team=team, tower=step.tower, challenge=step.gate_challenge,
+        submitted_by=user, outcome=TeamTowerChallenge.CONFIRMED,
+    )
+    return trail_engine.on_submission_confirmed(ttc)
+
+
+def _progress(session, team, step):
+    return TeamTrailProgress.objects.filter(
+        session=session, team=team, step=step,
+    ).first()
+
+
+class TrailModeSwitchTest(TestCase):
+    """Task 1.x / 8.1 — mode switch, effective resolution, isolation."""
+
+    def test_default_mode_is_domination_with_session_override(self):
+        game = _make_game('Plain')
+        session = _default_session(game)
+        self.assertEqual(game.mode, MODE_DOMINATION)
+        self.assertEqual(effective_mode(session), MODE_DOMINATION)
+        session.mode = MODE_TRAIL
+        session.save(update_fields=['mode'])
+        self.assertEqual(effective_mode(session), MODE_TRAIL)
+
+    def test_domination_session_exposes_no_trail_state(self):
+        game = _make_game('Dom')
+        group = _make_group(game)
+        team = _make_team(game, group)
+        client, _user = _authed_client(team, username='dom-player')
+        for url in ('/api/trail/state/', '/api/trail/next/', '/api/trail/leaderboard/'):
+            self.assertEqual(client.get(url).status_code, 404, url)
+
+    def test_trail_session_accrues_no_domination_scoring(self):
+        game, session, team, trail, steps = _make_trail(gates=True, name='NoScore')
+        tower = steps[0].tower
+        tower.initial_bonus = 25
+        tower.save(update_fields=['initial_bonus'])
+        _assign_route(session, team, steps[0])
+        client, _user = _authed_client(team, username='trail-noscore')
+        response = client.post('/api/team_tower_challenges/', {
+            'tower': tower.id, 'challenge': steps[0].gate_challenge_id,
+            'lat': 46.5, 'lng': 23.5, 'response_text': 'answer',
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        submission = TeamTowerChallenge.objects.get(pk=response.data['id'])
+        self.assertEqual(submission.outcome, TeamTowerChallenge.PENDING)
+        staff, _s = _staff_client(session, username='trail-staff-1')
+        review = staff.post(
+            f'/api/staff/submissions/{submission.id}/review/',
+            {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(review.status_code, 200)
+        team.refresh_from_db()
+        self.assertEqual(team.score, 0)
+        self.assertFalse(TeamTowerOwnership.objects.filter(team=team).exists())
+        self.assertFalse(TeamZoneOwnership.objects.filter(team=team).exists())
+        row = _progress(session, team, steps[0])
+        self.assertEqual(row.state, TeamTrailProgress.UNLOCKED)
+        # ...and the next step got revealed for this party.
+        self.assertEqual(
+            _progress(session, team, steps[1]).state, TeamTrailProgress.REVEALED,
+        )
+
+
+class TrailStructureTest(TestCase):
+    """Task 8.2 — FIXED_ORDER, GRAPH branch choice, CIRCUIT offsets."""
+
+    def test_fixed_order_advances_in_order(self):
+        game, session, team, trail, steps = _make_trail(gates=True, name='Fixed')
+        route = _assign_route(session, team, steps[0])
+        user = User.objects.create_user(username='fixed-user', password='x')
+        for i, step in enumerate(steps):
+            nxt = trail_engine.next_steps(session, trail, route)
+            self.assertEqual([s.id for s in nxt], [step.id])
+            _confirm_at(team, user, step)
+            self.assertEqual(
+                _progress(session, team, step).state, TeamTrailProgress.UNLOCKED,
+            )
+        route.refresh_from_db()
+        self.assertIsNotNone(route.finished_at)
+        self.assertEqual(trail_engine.next_steps(session, trail, route), [])
+
+    def test_out_of_order_submission_does_not_unlock(self):
+        game, session, team, trail, steps = _make_trail(gates=True, name='OutOfOrder')
+        _assign_route(session, team, steps[0])
+        user = User.objects.create_user(username='ooo-user', password='x')
+        _confirm_at(team, user, steps[2])  # step 3 first: not the next step
+        row = _progress(session, team, steps[2])
+        self.assertTrue(row is None or row.state != TeamTrailProgress.UNLOCKED)
+
+    def test_graph_branch_offers_choice_and_honours_it(self):
+        game, session, team, trail, steps = _make_trail(
+            structure=STRUCTURE_GRAPH, n_steps=4, name='Graph',
+        )
+        s1, s2, s3, s4 = steps
+        TrailStep.objects.filter(pk__in=[s2.pk, s3.pk]).update(is_finish=False)
+        TrailStep.objects.filter(pk=s4.pk).update(is_finish=True)
+        TrailEdge.objects.create(trail=trail, from_step=s1, to_step=s2, clue='Left path')
+        TrailEdge.objects.create(trail=trail, from_step=s1, to_step=s3, clue='Right path')
+        TrailEdge.objects.create(trail=trail, from_step=s2, to_step=s4, clue='Home via left')
+        TrailEdge.objects.create(trail=trail, from_step=s3, to_step=s4, clue='Home via right')
+        route = _assign_route(session, team, s1)
+        user = User.objects.create_user(username='graph-user', password='x')
+
+        self.assertEqual([s.id for s in trail_engine.next_steps(session, trail, route)], [s1.id])
+        _confirm_at(team, user, s1)
+        options = trail_engine.next_steps(session, trail, route)
+        self.assertEqual({s.id for s in options}, {s2.id, s3.id})
+        # Branch clues come from the edges.
+        s1.refresh_from_db()
+        self.assertEqual(trail_engine.clue_for(trail, s1, s3), 'Right path')
+        # The party picks the right branch.
+        _confirm_at(team, user, s3)
+        options = trail_engine.next_steps(session, trail, route)
+        self.assertEqual([s.id for s in options], [s4.id])
+        _confirm_at(team, user, s4)
+        route.refresh_from_db()
+        self.assertIsNotNone(route.finished_at)
+
+    def test_circuit_two_teams_start_at_different_points(self):
+        game, session, team_a, trail, steps = _make_trail(
+            structure=STRUCTURE_CIRCUIT, name='Circuit',
+        )
+        group = TeamGroup.objects.get(game=game)
+        team_b = Team.objects.create(
+            name='Circuit team B', color='#AA0000', session=session, group=group,
+        )
+        route_a = _assign_route(session, team_a, steps[0])
+        route_b = _assign_route(session, team_b, steps[2])
+        self.assertEqual(
+            [s.id for s in route_a.sequence()],
+            [steps[0].id, steps[1].id, steps[2].id, steps[3].id],
+        )
+        self.assertEqual(
+            [s.id for s in route_b.sequence()],
+            [steps[2].id, steps[3].id, steps[0].id, steps[1].id],
+        )
+        user_b = User.objects.create_user(username='circuit-b', password='x')
+        # Team B's first next step is ITS start (step 3), wrapping later.
+        self.assertEqual(
+            [s.id for s in trail_engine.next_steps(session, trail, route_b)],
+            [steps[2].id],
+        )
+        _confirm_at(team_b, user_b, steps[2])
+        self.assertEqual(
+            [s.id for s in trail_engine.next_steps(session, trail, route_b)],
+            [steps[3].id],
+        )
+
+
+class TrailStartingKnowledgeTest(TestCase):
+    """Task 8.3 — ALL_KNOWN / ONE_KNOWN / NONE_KNOWN initial reveal."""
+
+    def _revealed_ids(self, session, team):
+        return set(
+            TeamTrailProgress.objects.filter(session=session, team=team)
+            .values_list('step_id', flat=True),
+        )
+
+    def test_all_known_reveals_every_step(self):
+        game, session, team, trail, steps = _make_trail(
+            knowledge=KNOWLEDGE_ALL_KNOWN, name='AllKnown',
+        )
+        _assign_route(session, team, steps[0])
+        self.assertEqual(self._revealed_ids(session, team), {s.id for s in steps})
+
+    def test_one_known_reveals_only_the_start(self):
+        game, session, team, trail, steps = _make_trail(
+            knowledge=KNOWLEDGE_ONE_KNOWN, name='OneKnown',
+        )
+        _assign_route(session, team, steps[0])
+        self.assertEqual(self._revealed_ids(session, team), {steps[0].id})
+
+    def test_none_known_reveals_nothing_and_staff_can_reveal_start(self):
+        game, session, team, trail, steps = _make_trail(
+            knowledge=KNOWLEDGE_NONE_KNOWN, name='NoneKnown',
+        )
+        _assign_route(session, team, steps[0])
+        self.assertEqual(self._revealed_ids(session, team), set())
+        # The player state exposes the creator's out-of-band start hint.
+        client, _user = _authed_client(team, username='none-known-player')
+        state = client.get('/api/trail/state/')
+        self.assertEqual(state.status_code, 200)
+        self.assertEqual(state.data['start_hint'], 'Look near the old oak')
+        # Staff "reveal start" override unsticks the party.
+        staff, _s = _staff_client(session, username='none-known-staff')
+        response = staff.post(
+            f'/api/staff/sessions/{session.id}/trail-reveal-start/',
+            {'team': team.id}, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self._revealed_ids(session, team), {steps[0].id})
+
+
+class TrailGateGeofenceTest(TestCase):
+    """Task 8.4 — geofenced arrival, typed gates, read-only gates."""
+
+    def test_distant_arrival_is_rejected(self):
+        game, session, team, trail, steps = _make_trail(gates=True, name='Far')
+        _assign_route(session, team, steps[0])
+        client, _user = _authed_client(team, username='far-player')
+        response = client.post('/api/team_tower_challenges/', {
+            'tower': steps[0].tower_id, 'challenge': steps[0].gate_challenge_id,
+            'lat': 46.9, 'lng': 23.9, 'response_text': 'x',
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+        # The seeded reveal stays, but the step never advances to ARRIVED.
+        row = _progress(session, team, steps[0])
+        self.assertEqual(row.state, TeamTrailProgress.REVEALED)
+        self.assertIsNone(row.arrived_at)
+
+    def test_auto_gate_unlocks_immediately_and_reveals_next_clue(self):
+        game, session, team, trail, steps = _make_trail(name='AutoGate')
+        gate = Challenge.objects.create(
+            game=game, text='Scan the venue code', tower=steps[0].tower,
+            type=TYPE_NFC_QR, validation_code='TRAIL-CODE-1',
+        )
+        TrailStep.objects.filter(pk=steps[0].pk).update(gate_challenge=gate)
+        _assign_route(session, team, steps[0])
+        client, _user = _authed_client(team, username='auto-gate-player')
+        response = client.post('/api/team_tower_challenges/', {
+            'tower': steps[0].tower_id, 'challenge': gate.id,
+            'submitted_code': 'TRAIL-CODE-1', 'lat': 46.5, 'lng': 23.5,
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['outcome'], TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(
+            _progress(session, team, steps[0]).state, TeamTrailProgress.UNLOCKED,
+        )
+        state = client.get('/api/trail/state/')
+        self.assertEqual(state.status_code, 200)
+        next_ids = [s['id'] for s in state.data['next_steps']]
+        self.assertEqual(next_ids, [steps[1].id])
+        self.assertEqual(state.data['next_steps'][0]['clue'], 'Clue to point 2')
+        # No domination capture happened for the auto gate either.
+        self.assertFalse(TeamTowerOwnership.objects.filter(team=team).exists())
+
+    def test_read_only_gate_auto_advances_on_arrival(self):
+        game, session, team, trail, steps = _make_trail(name='ReadOnly')
+        _assign_route(session, team, steps[0])
+        client, _user = _authed_client(team, username='read-only-player')
+        response = client.post('/api/team_tower_challenges/', {
+            'tower': steps[0].tower_id, 'lat': 46.5, 'lng': 23.5,
+        }, format='json')
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['outcome'], TeamTowerChallenge.CONFIRMED)
+        row = _progress(session, team, steps[0])
+        self.assertEqual(row.state, TeamTrailProgress.UNLOCKED)
+        self.assertIsNotNone(row.arrived_at)
+        self.assertEqual(
+            _progress(session, team, steps[1]).state, TeamTrailProgress.REVEALED,
+        )
+
+
+class TrailPerTeamRouteTest(TestCase):
+    """Task 8.5 — divergent per-team routes, no cross-party leakage."""
+
+    def _second_team(self, session, game, name):
+        group = TeamGroup.objects.get(game=game)
+        return Team.objects.create(
+            name=name, color='#00AA00', session=session, group=group,
+        )
+
+    def test_auto_generate_gives_teams_different_orderings(self):
+        game, session, team_a, trail, steps = _make_trail(name='AutoRoutes')
+        team_b = self._second_team(session, game, 'AutoRoutes B')
+        staff, _s = _staff_client(session, username='routes-staff')
+        response = staff.post(
+            f'/api/staff/sessions/{session.id}/trail-routes/auto-generate/',
+        )
+        self.assertEqual(response.status_code, 201)
+        routes = {r['team']: r for r in response.data['routes']}
+        self.assertNotEqual(
+            routes[team_a.id]['step_ids'], routes[team_b.id]['step_ids'],
+        )
+        self.assertNotEqual(
+            routes[team_a.id]['start_step'], routes[team_b.id]['start_step'],
+        )
+
+    def test_explicit_route_assignment_and_no_leakage(self):
+        game, session, team_a, trail, steps = _make_trail(name='Leak')
+        team_b = self._second_team(session, game, 'Leak B')
+        staff, _s = _staff_client(session, username='leak-staff')
+        response = staff.post(
+            f'/api/staff/sessions/{session.id}/trail-routes/',
+            {
+                'team': team_b.id,
+                'start_step': steps[2].id,
+                'step_ids': [steps[2].id, steps[1].id, steps[0].id, steps[3].id],
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        route_a = _assign_route(session, team_a, steps[0])
+        user_a = User.objects.create_user(username='leak-a', password='x')
+        _confirm_at(team_a, user_a, steps[0])
+        # Team A's unlock reveals A's next step — nothing for team B.
+        self.assertEqual(
+            _progress(session, team_a, steps[0]).state, TeamTrailProgress.UNLOCKED,
+        )
+        b_states = TeamTrailProgress.objects.filter(session=session, team=team_b)
+        self.assertFalse(
+            b_states.filter(state=TeamTrailProgress.UNLOCKED).exists(),
+        )
+        # And B's own progression follows ITS sequence (starts at step 3).
+        route_b = TeamTrailRoute.objects.get(session=session, team=team_b)
+        self.assertEqual(
+            [s.id for s in trail_engine.next_steps(session, trail, route_b)],
+            [steps[2].id],
+        )
+        self.assertEqual(
+            [s.id for s in route_a.sequence()],
+            [s.id for s in steps],
+        )
+
+    def test_unrevealed_trail_points_hidden_on_player_map(self):
+        game, session, team, trail, steps = _make_trail(name='Masked')
+        _assign_route(session, team, steps[0])
+        client, _user = _authed_client(team, username='masked-player')
+        response = client.get('/api/towers/')
+        self.assertEqual(response.status_code, 200)
+        names = {t['name'] for t in response.data}
+        self.assertEqual(names, {steps[0].tower.name})
+
+
+class TrailCompletionRankingTest(TestCase):
+    """Task 8.6 — finish detection, ranking, structural validation."""
+
+    def test_finish_and_leaderboard_ranking(self):
+        game, session, team_a, trail, steps = _make_trail(n_steps=2, name='Rank')
+        group = TeamGroup.objects.get(game=game)
+        team_b = Team.objects.create(
+            name='Rank B', color='#0000AA', session=session, group=group,
+        )
+        _assign_route(session, team_a, steps[0])
+        _assign_route(session, team_b, steps[0])
+        user_a = User.objects.create_user(username='rank-a', password='x')
+        user_b = User.objects.create_user(username='rank-b', password='x')
+        _confirm_at(team_a, user_a, steps[0])
+        _confirm_at(team_a, user_a, steps[1])
+        _confirm_at(team_b, user_b, steps[0])
+        ranking = trail_engine.ranking(session)
+        self.assertEqual([r['team_id'] for r in ranking], [team_a.id, team_b.id])
+        self.assertTrue(ranking[0]['finished'])
+        self.assertFalse(ranking[1]['finished'])
+        self.assertEqual(ranking[0]['rank'], 1)
+        client, _user = _authed_client(team_a, username='rank-player')
+        response = client.get('/api/trail/leaderboard/')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['ranking']), 2)
+        staff, _s = _staff_client(session, username='rank-staff')
+        self.assertEqual(
+            staff.get(f'/api/staff/sessions/{session.id}/trail-leaderboard/').status_code,
+            200,
+        )
+
+    def test_validator_flags_dead_end_and_unreachable(self):
+        game, session, team, trail, steps = _make_trail(
+            structure=STRUCTURE_GRAPH, n_steps=3, name='BadGraph',
+        )
+        s1, s2, s3 = steps
+        TrailStep.objects.filter(pk=s3.pk).update(is_finish=True)
+        # Only s1→s2 exists: s2 is a dead-end, s3 unreachable.
+        TrailEdge.objects.create(trail=trail, from_step=s1, to_step=s2, clue='go')
+        codes = {issue['code'] for issue in trail.validate_structure()}
+        self.assertIn('dead_end', codes)
+        self.assertIn('unreachable_step', codes)
+        self.assertIn('finish_unreachable', codes)
+
+    def test_step_with_out_of_collection_tower_rejected(self):
+        game, session, team, trail, steps = _make_trail(n_steps=2, name='Foreign')
+        other_game = _make_game('Foreign Other')
+        foreign_tower = _make_tower(other_game, name='Foreign tower', lng=23.9, lat=46.9)
+        staff, _s = _staff_client(session, username='foreign-staff')
+        response = staff.post('/api/staff/trail-steps/', {
+            'trail': trail.id, 'tower': foreign_tower.id, 'order': 9,
+        }, format='json')
+        self.assertEqual(response.status_code, 400)
+        # The structural validator reports it too when forced in via ORM.
+        bad = TrailStep.objects.create(trail=trail, tower=foreign_tower, order=10)
+        codes = {issue['code'] for issue in trail.validate_structure()}
+        self.assertIn('tower_outside_collections', codes)
+        bad.delete()
+
+    def test_staff_trail_crud_roundtrip(self):
+        game = _make_game('CRUD Game')
+        game.mode = MODE_TRAIL
+        game.save(update_fields=['mode'])
+        session = _default_session(game)
+        tower = _make_tower(game, name='CRUD tower')
+        staff, _s = _staff_client(session, username='crud-staff')
+        created = staff.post('/api/staff/trails/', {
+            'game': game.id, 'structure': STRUCTURE_FIXED_ORDER,
+            'starting_knowledge': KNOWLEDGE_ONE_KNOWN, 'participation': 'TEAM',
+        }, format='json')
+        self.assertEqual(created.status_code, 201)
+        trail_id = created.data['id']
+        step = staff.post('/api/staff/trail-steps/', {
+            'trail': trail_id, 'tower': tower.id, 'order': 1,
+            'is_start': True, 'is_finish': True, 'clue_text': 'c',
+        }, format='json')
+        self.assertEqual(step.status_code, 201)
+        listing = staff.get(f'/api/staff/trails/?game={game.id}')
+        self.assertEqual(listing.status_code, 200)
+        self.assertEqual(listing.data[0]['step_count'], 1)
+        validate = staff.get(f'/api/staff/trails/{trail_id}/validate/')
+        self.assertEqual(validate.status_code, 200)
+        self.assertTrue(validate.data['valid'])

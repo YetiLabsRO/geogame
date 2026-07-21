@@ -32,6 +32,7 @@ from organize.models import (
     TeamMembership,
     active_membership_conflict,
     effective_allow_player_team_creation,
+    effective_mode,
     effective_team_join_confirmation,
     user_can_invite_to_team,
 )
@@ -422,6 +423,8 @@ class CurrentSessionSerializer(serializers.Serializer):
     # clients know whether to open the websocket / offer push opt-in.
     realtime_enabled = serializers.SerializerMethodField()
     push_notifications_enabled = serializers.SerializerMethodField()
+    # Effective game mode (mode-trail-discovery): DOMINATION or TRAIL.
+    mode = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
@@ -439,6 +442,9 @@ class CurrentSessionSerializer(serializers.Serializer):
 
     def get_push_notifications_enabled(self, session):
         return session.effective('push_notifications_enabled')
+
+    def get_mode(self, session):
+        return effective_mode(session)
 
 
 class MySessionsView(APIView):

@@ -24,10 +24,12 @@ from organize.models import (
     CONQUEST_RULE_MAJORITY,
     FAIL_RESET_ANY_ATTEMPT_ELSEWHERE,
     FAIL_RESET_ANY_SUCCESS_ELSEWHERE,
+    MODE_TRAIL,
     TIME_UNIT_MINUTE,
     TIME_UNIT_SECONDS,
     Team,
     TeamGroup,
+    effective_mode,
 )
 
 
@@ -941,7 +943,14 @@ class TeamTowerChallenge(models.Model):
             if self.outcome == TeamTowerChallenge.CONFIRMED:
                 self.__original_outcome = self.outcome
                 self.timestamp_verified = datetime.now(timezone.utc)
-                self.tower.assign_to_team(self.team, self.challenge)
+                if effective_mode(self.team.session) == MODE_TRAIL:
+                    # mode-trail-discovery: a confirmed gate advances the
+                    # trail INSTEAD of capturing the tower — domination
+                    # ownership/scoring stays inert in TRAIL mode.
+                    from game.trail import on_submission_confirmed
+                    on_submission_confirmed(self)
+                else:
+                    self.tower.assign_to_team(self.team, self.challenge)
                 self._reset_fail_counters_on_confirm()
                 self.save()
             elif self.outcome == TeamTowerChallenge.REJECTED:
@@ -1546,6 +1555,364 @@ class TagScan(models.Model):
 
     def __str__(self):
         return f'TagScan({self.tag_id}, {self.outcome}, {self.player})'
+
+
+# ---------------------------------------------------------------------------
+# mode-trail-discovery: trail structure + per-party route / progress
+# ---------------------------------------------------------------------------
+
+# Trail structures.
+STRUCTURE_FIXED_ORDER = 'FIXED_ORDER'
+STRUCTURE_GRAPH = 'GRAPH'
+STRUCTURE_CIRCUIT = 'CIRCUIT'
+STRUCTURE_CHOICES = [
+    (STRUCTURE_FIXED_ORDER, 'Fixed order — linear 1→2→3→4'),
+    (STRUCTURE_GRAPH, 'Graph — branching, the party chooses'),
+    (STRUCTURE_CIRCUIT, 'Circuit — shared loop, per-party start offset'),
+]
+
+# Starting knowledge.
+KNOWLEDGE_ALL_KNOWN = 'ALL_KNOWN'
+KNOWLEDGE_ONE_KNOWN = 'ONE_KNOWN'
+KNOWLEDGE_NONE_KNOWN = 'NONE_KNOWN'
+KNOWLEDGE_CHOICES = [
+    (KNOWLEDGE_ALL_KNOWN, 'All points known from the start'),
+    (KNOWLEDGE_ONE_KNOWN, 'Only the start point known'),
+    (KNOWLEDGE_NONE_KNOWN, 'Nothing known — discover the start'),
+]
+
+# Participation.
+PARTICIPATION_TEAM = 'TEAM'
+PARTICIPATION_SOLO = 'SOLO'
+PARTICIPATION_CHOICES = [
+    (PARTICIPATION_TEAM, 'Teams'),
+    (PARTICIPATION_SOLO, 'Solo players'),
+]
+
+
+class Trail(models.Model):
+    """The trail layer of a trail-mode Game (1:1).
+
+    Steps/edges add an ordering/graph layer OVER repository Towers —
+    the Tower stays a reusable library asset carrying no trail data.
+    """
+
+    game = models.OneToOneField(
+        'organize.Game', on_delete=models.CASCADE, related_name='trail',
+    )
+    structure = models.CharField(
+        max_length=16, choices=STRUCTURE_CHOICES, default=STRUCTURE_FIXED_ORDER,
+    )
+    starting_knowledge = models.CharField(
+        max_length=16, choices=KNOWLEDGE_CHOICES, default=KNOWLEDGE_ONE_KNOWN,
+    )
+    participation = models.CharField(
+        max_length=8, choices=PARTICIPATION_CHOICES, default=PARTICIPATION_TEAM,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f'Trail({self.game.slug}, {self.structure})'
+
+    def ordered_steps(self):
+        """The trail's global step order (FIXED_ORDER / CIRCUIT baseline)."""
+        return list(self.steps.order_by('order', 'id'))
+
+    def start_steps(self):
+        steps = list(self.steps.filter(is_start=True).order_by('order', 'id'))
+        if steps:
+            return steps
+        first = self.steps.order_by('order', 'id').first()
+        return [first] if first else []
+
+    def validate_structure(self):
+        """Authoring validator: return a list of issue dicts (empty = OK).
+
+        Checks: every step's Tower resolves through the Game's
+        Collections; at least one start; for GRAPH, every non-start step
+        reachable from a start, at least one finish reachable, and no
+        dead-end (a non-finish step with no outgoing edge).
+        """
+        issues = []
+        steps = list(self.steps.select_related('tower').order_by('order', 'id'))
+        if not steps:
+            issues.append({'code': 'no_steps', 'message': 'Trail has no steps.'})
+            return issues
+
+        game_tower_ids = set(self.game.towers().values_list('id', flat=True))
+        for step in steps:
+            if step.tower_id not in game_tower_ids:
+                issues.append({
+                    'code': 'tower_outside_collections',
+                    'step_id': step.id,
+                    'message': (
+                        f'Step {step.id} is bound to tower "{step.tower.name}" '
+                        "outside the Game's Collections."
+                    ),
+                })
+
+        starts = [s for s in steps if s.is_start]
+        if not starts and self.structure == STRUCTURE_GRAPH:
+            issues.append({
+                'code': 'no_start',
+                'message': 'A GRAPH trail needs at least one is_start step.',
+            })
+
+        if self.structure == STRUCTURE_GRAPH:
+            outgoing = {}
+            for edge in self.edges.all():
+                outgoing.setdefault(edge.from_step_id, []).append(edge.to_step_id)
+            reachable = set()
+            frontier = [s.id for s in (starts or steps[:1])]
+            while frontier:
+                current = frontier.pop()
+                if current in reachable:
+                    continue
+                reachable.add(current)
+                frontier.extend(outgoing.get(current, []))
+            for step in steps:
+                if not step.is_start and step.id not in reachable:
+                    issues.append({
+                        'code': 'unreachable_step',
+                        'step_id': step.id,
+                        'message': f'Step {step.id} is not reachable from any start.',
+                    })
+                if not step.is_finish and not outgoing.get(step.id):
+                    issues.append({
+                        'code': 'dead_end',
+                        'step_id': step.id,
+                        'message': (
+                            f'Step {step.id} is a dead-end: not a finish and '
+                            'has no outgoing edge.'
+                        ),
+                    })
+            finishes = {s.id for s in steps if s.is_finish}
+            if not finishes:
+                issues.append({
+                    'code': 'no_finish',
+                    'message': 'A GRAPH trail needs at least one is_finish step.',
+                })
+            elif not (finishes & reachable):
+                issues.append({
+                    'code': 'finish_unreachable',
+                    'message': 'No finish step is reachable from a start.',
+                })
+        return issues
+
+
+class TrailStep(models.Model):
+    """A node of the trail, geofenced at a repository Tower."""
+
+    trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='steps')
+    tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='trail_steps')
+    order = models.PositiveIntegerField(default=0)
+    is_start = models.BooleanField(default=False)
+    is_finish = models.BooleanField(default=False)
+    # The unlock gate: an ordinary Challenge validated by its type
+    # (challenge-types capability). NULL = read-only gate — arrival
+    # within range unlocks the step immediately.
+    gate_challenge = models.ForeignKey(
+        Challenge, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='gates_trail_steps',
+    )
+    # Clue shown once this step is revealed (FIXED_ORDER / CIRCUIT link
+    # clues live here on the *target* step; GRAPH branch clues live on
+    # the edges).
+    clue_text = models.TextField(blank=True, default='')
+    # Creator-supplied out-of-band hint for a NONE_KNOWN start.
+    start_hint = models.TextField(blank=True, default='')
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        return f'{self.trail} #{self.order} @ {self.tower.name}'
+
+
+class TrailEdge(models.Model):
+    """Directed clue-bearing link between two steps (GRAPH branches)."""
+
+    trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='edges')
+    from_step = models.ForeignKey(
+        TrailStep, on_delete=models.CASCADE, related_name='outgoing_edges',
+    )
+    to_step = models.ForeignKey(
+        TrailStep, on_delete=models.CASCADE, related_name='incoming_edges',
+    )
+    clue = models.TextField(blank=True, default='')
+
+    class Meta:
+        unique_together = (('from_step', 'to_step'),)
+
+    def __str__(self):
+        return f'{self.from_step_id} → {self.to_step_id}'
+
+
+class TeamTrailRoute(models.Model):
+    """A party's assigned route in one Session.
+
+    The party is a Team (participation=TEAM) or a single player
+    (participation=SOLO) — exactly one of `team` / `player` is set.
+    `start_step` pins where the party begins; FIXED_ORDER / CIRCUIT
+    routes may additionally pin an explicit ordered sequence through
+    `TeamTrailRouteStep` rows (anti-collision orderings).
+    """
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='trail_routes',
+    )
+    team = models.ForeignKey(
+        Team, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='trail_routes',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, null=True, blank=True,
+        related_name='trail_routes',
+    )
+    start_step = models.ForeignKey(
+        TrailStep, on_delete=models.CASCADE, related_name='routes_starting_here',
+    )
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'team'],
+                condition=models.Q(team__isnull=False),
+                name='unique_trail_route_per_team',
+            ),
+            models.UniqueConstraint(
+                fields=['session', 'player'],
+                condition=models.Q(player__isnull=False),
+                name='unique_trail_route_per_player',
+            ),
+        ]
+
+    def __str__(self):
+        return f'Route({self.party_label()} @ {self.session})'
+
+    def party_label(self):
+        if self.team_id:
+            return self.team.name
+        return self.player.user.get_username() if self.player_id else '?'
+
+    def sequence(self):
+        """The party's ordered step list, or None for GRAPH free choice.
+
+        Priority: explicit TeamTrailRouteStep rows; else CIRCUIT derives
+        the shared cyclic order rotated to this party's start (wrapping
+        to the step before it); else FIXED_ORDER follows the global
+        ascending order. GRAPH pins only the start — the path emerges
+        from the party's branch choices.
+        """
+        explicit = [rs.step for rs in self.route_steps.select_related('step').order_by('position')]
+        if explicit:
+            return explicit
+        trail = self.start_step.trail
+        if trail.structure == STRUCTURE_GRAPH:
+            return None
+        steps = trail.ordered_steps()
+        if trail.structure == STRUCTURE_CIRCUIT and steps:
+            ids = [s.id for s in steps]
+            if self.start_step_id in ids:
+                offset = ids.index(self.start_step_id)
+                return steps[offset:] + steps[:offset]
+        return steps
+
+
+class TeamTrailRouteStep(models.Model):
+    """Ordered through-row: one step at one position of a party's route."""
+
+    route = models.ForeignKey(
+        TeamTrailRoute, on_delete=models.CASCADE, related_name='route_steps',
+    )
+    step = models.ForeignKey(TrailStep, on_delete=models.CASCADE, related_name='+')
+    position = models.PositiveIntegerField()
+
+    class Meta:
+        ordering = ['position']
+        unique_together = (('route', 'position'), ('route', 'step'))
+
+    def __str__(self):
+        return f'{self.route} [{self.position}] {self.step_id}'
+
+
+class TeamTrailProgress(models.Model):
+    """Per-party, per-step trail progress — (session, party)-scoped.
+
+    REVEALED → the party knows the point (it shows on its map);
+    ARRIVED  → the party physically reached the geofence;
+    UNLOCKED → the step's gate was completed (progression advances).
+    """
+
+    REVEALED = 'REVEALED'
+    ARRIVED = 'ARRIVED'
+    UNLOCKED = 'UNLOCKED'
+    STATE_CHOICES = [
+        (REVEALED, 'Revealed'),
+        (ARRIVED, 'Arrived'),
+        (UNLOCKED, 'Unlocked'),
+    ]
+    _STATE_RANK = {REVEALED: 0, ARRIVED: 1, UNLOCKED: 2}
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='trail_progress',
+    )
+    team = models.ForeignKey(
+        Team, on_delete=models.CASCADE, null=True, blank=True,
+        related_name='trail_progress',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, null=True, blank=True,
+        related_name='trail_progress',
+    )
+    step = models.ForeignKey(
+        TrailStep, on_delete=models.CASCADE, related_name='progress',
+    )
+    state = models.CharField(max_length=8, choices=STATE_CHOICES, default=REVEALED)
+    revealed_at = models.DateTimeField(null=True, blank=True)
+    arrived_at = models.DateTimeField(null=True, blank=True)
+    unlocked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'team', 'step'],
+                condition=models.Q(team__isnull=False),
+                name='unique_trail_progress_per_team_step',
+            ),
+            models.UniqueConstraint(
+                fields=['session', 'player', 'step'],
+                condition=models.Q(player__isnull=False),
+                name='unique_trail_progress_per_player_step',
+            ),
+        ]
+
+    def __str__(self):
+        who = self.team or self.player
+        return f'{who} @ step {self.step_id}: {self.state}'
+
+    def advance(self, state, when=None):
+        """Move forward to `state` (never backwards); stamp timestamps."""
+        when = when or _now()
+        if self._STATE_RANK[state] <= self._STATE_RANK.get(self.state, -1) and self.pk:
+            return self
+        stamp_fields = []
+        for target, field in (
+            (self.REVEALED, 'revealed_at'),
+            (self.ARRIVED, 'arrived_at'),
+            (self.UNLOCKED, 'unlocked_at'),
+        ):
+            if (
+                self._STATE_RANK[target] <= self._STATE_RANK[state]
+                and getattr(self, field) is None
+            ):
+                setattr(self, field, when)
+                stamp_fields.append(field)
+        self.state = state
+        self.save(update_fields=['state'] + stamp_fields if self.pk else None)
+        return self
 
 
 class TeamTowerFailCounter(models.Model):

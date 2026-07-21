@@ -34,6 +34,11 @@ export const routes: Routes = [
     loadComponent: () => import('./nfc/nfc-scan.component').then((m) => m.NfcScanComponent),
   },
   {
+    path: 'trail',
+    canActivate: [authGuard],
+    loadComponent: () => import('./trail/trail.component').then((m) => m.TrailComponent),
+  },
+  {
     path: 'rules',
     loadComponent: () => import('./rules/rules.component').then((m) => m.RulesComponent),
   },

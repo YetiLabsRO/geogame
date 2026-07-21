@@ -947,3 +947,4 @@ export interface TagScanInfo {
   lng: number | null;
   accuracy: number | null;
   counter: number | null;
+}

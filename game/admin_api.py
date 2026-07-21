@@ -1205,7 +1205,7 @@ class AdminGameSerializer(serializers.ModelSerializer):
     class Meta:
         model = Game
         fields = (
-            'id', 'slug', 'name',
+            'id', 'slug', 'name', 'mode',
             'base_point', 'base_lat', 'base_lng',
             'base_zoom_level', 'is_active',
             'proximity_meters', 'cooloff_minutes', 'initial_bonus_default',
@@ -1410,6 +1410,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'realtime_enabled', 'push_notifications_enabled',
             # NFC capture-mode overrides (null = inherit Game default).
             'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
+            # Game-mode override (mode-trail-discovery; null = inherit).
+            'mode',
             'created_at',
         )
         read_only_fields = (
