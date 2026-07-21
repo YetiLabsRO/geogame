@@ -57,6 +57,8 @@ interface Row {
               <th>Zones</th>
               <th>Category</th>
               <th>Prox (m)</th>
+              <th>Discoverability</th>
+              <th>Challenge visibility</th>
               <th>Initial bonus</th>
               <th>RFID code</th>
               <th>Used by</th>
@@ -120,6 +122,34 @@ interface Row {
                     [ngModel]="row.draft.proximity_meters"
                     (ngModelChange)="update(row, 'proximity_meters', $event)"
                   />
+                </td>
+                <td>
+                  <!-- tower-visibility axis 1: whether/when the tower
+                       appears on the map. Blank = inherit the game
+                       default. -->
+                  <select
+                    class="form-select form-select-sm"
+                    [ngModel]="row.draft.discoverability"
+                    (ngModelChange)="update(row, 'discoverability', $event)"
+                  >
+                    <option [ngValue]="null">inherit</option>
+                    <option [ngValue]="'VISIBLE'">Visible</option>
+                    <option [ngValue]="'HIDDEN'">Hidden</option>
+                    <option [ngValue]="'FOG_REVEAL'">Fog reveal</option>
+                  </select>
+                </td>
+                <td>
+                  <!-- tower-visibility axis 2: whether the challenge is
+                       legible before arrival. -->
+                  <select
+                    class="form-select form-select-sm"
+                    [ngModel]="row.draft.challenge_visibility"
+                    (ngModelChange)="update(row, 'challenge_visibility', $event)"
+                  >
+                    <option [ngValue]="null">inherit</option>
+                    <option [ngValue]="'VISIBLE_ANYWHERE'">Visible anywhere</option>
+                    <option [ngValue]="'HIDDEN_UNTIL_ARRIVAL'">Hidden until arrival</option>
+                  </select>
                 </td>
                 <td style="max-width: 8rem">
                   <input

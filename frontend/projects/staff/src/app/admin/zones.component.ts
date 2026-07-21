@@ -45,6 +45,7 @@ interface Row {
               <th>Color</th>
               <th>Scoring type</th>
               <th>Conquest rule</th>
+              <th>Fog reveal %</th>
               <th>Member towers</th>
               <th>Used by</th>
               <th></th>
@@ -94,6 +95,20 @@ interface Row {
                       <option [ngValue]="o.value">{{ o.label }}</option>
                     }
                   </select>
+                </td>
+                <td style="max-width: 7rem">
+                  <!-- tower-visibility: % of the zone a team must cover
+                       to reveal its FOG_REVEAL towers; blank inherits
+                       the Session/Game default. -->
+                  <input
+                    class="form-control form-control-sm"
+                    type="number"
+                    min="0"
+                    max="100"
+                    placeholder="inherit"
+                    [ngModel]="row.draft.fog_reveal_coverage_pct"
+                    (ngModelChange)="update(row, 'fog_reveal_coverage_pct', $event)"
+                  />
                 </td>
                 <td>
                   <!-- Member towers via the many-to-many

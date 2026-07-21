@@ -10,7 +10,9 @@ import {
   AdminGame,
   AdminSession,
   AdminSessionPayload,
+  ChallengeVisibility,
   ConquestRule,
+  Discoverability,
   FailCounterInfo,
   FailCounterReset,
   GameApiService,
@@ -27,6 +29,7 @@ import {
   TeamBuildResult,
   TeammateVisibilityMode,
   TogethernessMode,
+  TowerVisibilityOverrides,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -468,6 +471,72 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
               </div>
             </div>
           </div>
+          <div class="col-12">
+            <div class="fw-semibold small mb-2 mt-2">
+              Tower visibility (tower-visibility)
+            </div>
+            <div class="row g-2">
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Discoverability default</label>
+                <select
+                  class="form-select form-select-sm"
+                  [ngModel]="visibilityOverride().tower_discoverability_default"
+                  (ngModelChange)="setVisibilityOverride('tower_discoverability_default', $event)"
+                >
+                  <option [ngValue]="null">Inherit</option>
+                  @for (o of discoverabilityOptions; track o.value) {
+                    <option [ngValue]="o.value">{{ o.label }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Challenge visibility default</label>
+                <select
+                  class="form-select form-select-sm"
+                  [ngModel]="visibilityOverride().challenge_visibility_default"
+                  (ngModelChange)="setVisibilityOverride('challenge_visibility_default', $event)"
+                >
+                  <option [ngValue]="null">Inherit</option>
+                  @for (o of challengeVisibilityOptions; track o.value) {
+                    <option [ngValue]="o.value">{{ o.label }}</option>
+                  }
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Fog reveal coverage (%)</label>
+                <input
+                  class="form-control form-control-sm"
+                  type="number"
+                  min="0"
+                  max="100"
+                  placeholder="Inherit"
+                  [ngModel]="visibilityOverride().fog_reveal_coverage_pct_default"
+                  (ngModelChange)="setVisibilityOverride('fog_reveal_coverage_pct_default', $event)"
+                />
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small mb-0">Reveal other teams' ownership</label>
+                <select
+                  class="form-select form-select-sm"
+                  [ngModel]="visibilityOverride().reveal_other_teams_ownership"
+                  (ngModelChange)="setVisibilityOverride('reveal_other_teams_ownership', $event)"
+                >
+                  <option [ngValue]="null">Inherit</option>
+                  <option [ngValue]="true">Show all teams' control</option>
+                  <option [ngValue]="false">Only own control</option>
+                </select>
+              </div>
+              <div class="col-12">
+                <a
+                  class="btn btn-outline-secondary btn-sm"
+                  [routerLink]="['/sessions', s.id, 'discovery']"
+                >
+                  <i class="bi bi-binoculars"></i>
+                  Discovery matrix
+                </a>
+              </div>
+            </div>
+          </div>
         </div>
         <button
           type="button"
@@ -636,6 +705,10 @@ export class StaffSessionDetailComponent {
   protected readonly presenceOverride = signal<PresenceRulesOverrides>(
     blankPresenceOverrides(),
   );
+  // Tower-visibility overrides (null = inherit the Game default).
+  protected readonly visibilityOverride = signal<TowerVisibilityOverrides>(
+    blankVisibilityOverrides(),
+  );
   // Conquest & scoring overrides (null = inherit the Game default).
   protected readonly conquestOverride = signal<ConquestRule | null>(null);
   protected readonly timeUnitOverride = signal<ScoreTimeUnit | null>(null);
@@ -673,6 +746,20 @@ export class StaffSessionDetailComponent {
   protected readonly togethernessOptions: { value: TogethernessMode; label: string }[] = [
     { value: 'SPLIT_ALLOWED', label: 'Members may split up' },
     { value: 'WHOLE_TEAM_TOGETHER', label: 'Whole team together' },
+  ];
+
+  protected readonly discoverabilityOptions: { value: Discoverability; label: string }[] = [
+    { value: 'VISIBLE', label: 'Visible (default)' },
+    { value: 'HIDDEN', label: 'Hidden — pops up on approach' },
+    { value: 'FOG_REVEAL', label: 'Fog reveal — uncover the zone' },
+  ];
+
+  protected readonly challengeVisibilityOptions: {
+    value: ChallengeVisibility;
+    label: string;
+  }[] = [
+    { value: 'VISIBLE_ANYWHERE', label: 'Visible anywhere (default)' },
+    { value: 'HIDDEN_UNTIL_ARRIVAL', label: 'Hidden until arrival' },
   ];
 
   protected readonly teammateVisibilityOptions: {
@@ -726,6 +813,7 @@ export class StaffSessionDetailComponent {
     this.override.set(pickOverrides(s));
     this.teamFormationOverride.set(s.allow_player_team_creation);
     this.presenceOverride.set(pickPresenceOverrides(s));
+    this.visibilityOverride.set(pickVisibilityOverrides(s));
     this.conquestOverride.set(s.zone_conquest_rule);
     this.timeUnitOverride.set(s.score_time_unit);
     this.overrideDirty.set(false);
@@ -898,6 +986,15 @@ export class StaffSessionDetailComponent {
     this.overrideDirty.set(true);
   }
 
+  protected setVisibilityOverride<K extends keyof TowerVisibilityOverrides>(
+    field: K,
+    value: TowerVisibilityOverrides[K],
+  ): void {
+    const normalized = (value as unknown) === '' ? null : value;
+    this.visibilityOverride.update((o) => ({ ...o, [field]: normalized }));
+    this.overrideDirty.set(true);
+  }
+
   protected shuffleTeams(): void {
     this.runBuild(this.staff.shuffleTeams(this.sessionId, this.buildCount() ?? 0));
   }
@@ -934,6 +1031,7 @@ export class StaffSessionDetailComponent {
     const payload: AdminSessionPayload = {
       ...this.override(),
       ...this.presenceOverride(),
+      ...this.visibilityOverride(),
       allow_player_team_creation: this.teamFormationOverride(),
       zone_conquest_rule: this.conquestOverride(),
       score_time_unit: this.timeUnitOverride(),
@@ -1021,5 +1119,23 @@ function pickPresenceOverrides(s: AdminSession): PresenceRulesOverrides {
     teammate_visibility_mode: s.teammate_visibility_mode,
     teammate_visibility_count: s.teammate_visibility_count,
     presence_window_seconds: s.presence_window_seconds,
+  };
+}
+
+function blankVisibilityOverrides(): TowerVisibilityOverrides {
+  return {
+    tower_discoverability_default: null,
+    challenge_visibility_default: null,
+    fog_reveal_coverage_pct_default: null,
+    reveal_other_teams_ownership: null,
+  };
+}
+
+function pickVisibilityOverrides(s: AdminSession): TowerVisibilityOverrides {
+  return {
+    tower_discoverability_default: s.tower_discoverability_default,
+    challenge_visibility_default: s.challenge_visibility_default,
+    fog_reveal_coverage_pct_default: s.fog_reveal_coverage_pct_default,
+    reveal_other_teams_ownership: s.reveal_other_teams_ownership,
   };
 }

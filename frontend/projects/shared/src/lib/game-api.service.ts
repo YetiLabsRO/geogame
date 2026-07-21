@@ -40,6 +40,11 @@ export interface TowerState {
   pending_submission: boolean;
   cooloff_until: string | null;
   proximity_meters: number;
+  /** tower-visibility (challenge axis): HIDDEN_UNTIL_ARRIVAL withholds
+   *  the challenge until the reported position is inside the
+   *  activation area — `challenge_hidden` says whether it currently is. */
+  challenge_visibility: 'HIDDEN_UNTIL_ARRIVAL' | 'VISIBLE_ANYWHERE';
+  challenge_hidden: boolean;
 }
 
 export interface ChallengeSubmitPayload {
@@ -83,6 +88,16 @@ export interface LocationConfig {
   consent_text: string;
 }
 
+/** Effective tower-visibility config (tower-visibility capability). */
+export interface VisibilityConfig {
+  default_discoverability: 'HIDDEN' | 'VISIBLE' | 'FOG_REVEAL';
+  /** Any FOG_REVEAL tower reachable in this session → render the fog overlay. */
+  uses_fog: boolean;
+  /** Any non-VISIBLE tower → report positions for discovery. */
+  uses_discovery: boolean;
+  reveal_other_teams_ownership: boolean;
+}
+
 export interface CurrentSession {
   id: number;
   slug: string;
@@ -95,6 +110,7 @@ export interface CurrentSession {
   game: GameConfig;
   allow_player_team_creation: boolean;
   location: LocationConfig;
+  visibility: VisibilityConfig;
 }
 
 export interface ZoneFeature {
@@ -165,8 +181,9 @@ export class GameApiService {
     return this.http.get<TowerFeature[]>('/api/towers/');
   }
 
-  towerState(id: number): Observable<TowerState> {
-    return this.http.get<TowerState>(`/api/towers/${id}/state/`);
+  towerState(id: number, position?: { lat: number; lng: number }): Observable<TowerState> {
+    const query = position ? `?lat=${position.lat}&lng=${position.lng}` : '';
+    return this.http.get<TowerState>(`/api/towers/${id}/state/${query}`);
   }
 
   submitChallenge(payload: ChallengeSubmitPayload): Observable<ChallengeSubmitResponse> {
@@ -205,6 +222,40 @@ export class GameApiService {
   liveLocations(): Observable<LiveLocations> {
     return this.http.get<LiveLocations>('/api/location/live/');
   }
+
+  // ---- discovery (tower-visibility capability) ------------------------------
+
+  /** Self-contained position fallback: report a position, get new reveals. */
+  discoveryPing(payload: { lat: number; lng: number }): Observable<DiscoveryPingResponse> {
+    return this.http.post<DiscoveryPingResponse>('/api/discovery/ping/', payload);
+  }
+
+  /** The caller team's discovered towers for the current Session. */
+  discoveredTowers(): Observable<DiscoveredTowers> {
+    return this.http.get<DiscoveredTowers>('/api/discovery/towers/');
+  }
+}
+
+// ---- discovery (tower-visibility capability) -------------------------------
+
+export interface RevealedTower {
+  tower_id: number;
+  tower_name: string;
+  location: { type: 'Point'; coordinates: [number, number] };
+  method: 'PROXIMITY' | 'ZONE_ENTRY' | 'ZONE_COVERAGE' | 'ALWAYS_VISIBLE' | 'STAFF';
+  discovered_at: string;
+}
+
+export interface DiscoveryPingResponse {
+  session: number;
+  team: number;
+  newly_revealed: RevealedTower[];
+}
+
+export interface DiscoveredTowers {
+  session: number;
+  team: number;
+  towers: RevealedTower[];
 }
 
 // ---- live-location ---------------------------------------------------------
@@ -231,6 +282,8 @@ export interface LocationPingResponse {
   recorded_at: string;
   received_at: string;
   ping_interval_seconds: number;
+  /** Towers this position newly revealed (discovery-tracking). */
+  newly_revealed: { tower_id: number; tower_name: string; method: string }[];
 }
 
 export interface LivePlayer {

@@ -48,6 +48,27 @@ export interface UsageRef {
 /** Zone conquest rules (zone-conquest-and-scoring-config). */
 export type ConquestRule = 'ALL' | 'MAJORITY' | 'ANY';
 
+// ---- tower-visibility -------------------------------------------------------
+
+/** Tower discoverability axis: whether/when a tower appears on the map. */
+export type Discoverability = 'HIDDEN' | 'VISIBLE' | 'FOG_REVEAL';
+
+/** Challenge visibility axis: whether the challenge is legible from afar. */
+export type ChallengeVisibility = 'HIDDEN_UNTIL_ARRIVAL' | 'VISIBLE_ANYWHERE';
+
+/** Visibility knobs shared by Game (defaults) and Session (overrides). */
+export interface TowerVisibilityConfig {
+  tower_discoverability_default: Discoverability;
+  challenge_visibility_default: ChallengeVisibility;
+  fog_reveal_coverage_pct_default: number;
+  reveal_other_teams_ownership: boolean;
+}
+
+/** Per-session visibility overrides: null inherits the Game default. */
+export type TowerVisibilityOverrides = {
+  [K in keyof TowerVisibilityConfig]: TowerVisibilityConfig[K] | null;
+};
+
 /** Scoring time units — the unit zone scores accrue per. */
 export type ScoreTimeUnit = 'SECOND' | 'MINUTE' | 'HOUR';
 
@@ -60,6 +81,9 @@ export interface AdminTower {
   is_active: boolean;
   /** Per-tower capture radius; null inherits the Game default. */
   proximity_meters: number | null;
+  /** tower-visibility axes; null inherits the Session/Game default. */
+  discoverability: Discoverability | null;
+  challenge_visibility: ChallengeVisibility | null;
   initial_bonus: number;
   rfid_code: string | null;
   collections: UsageRef[];
@@ -73,6 +97,8 @@ export interface AdminZone {
   scoring_type: number;
   /** Per-zone conquest override; null inherits Session/Game. */
   conquest_rule: ConquestRule | null;
+  /** Fog-of-war reveal threshold (%); null inherits Session/Game. */
+  fog_reveal_coverage_pct: number | null;
   /** Member towers via the many-to-many (read-only). */
   towers: UsageRef[];
   collections: UsageRef[];
@@ -257,7 +283,8 @@ export interface AdminGame
   extends Phase10Config,
     TeamRulesConfig,
     LocationTrackingConfig,
-    PresenceRulesConfig {
+    PresenceRulesConfig,
+    TowerVisibilityConfig {
   id: number;
   slug: string;
   name: string;
@@ -316,7 +343,8 @@ export interface AdminSession
   extends Phase10Overrides,
     TeamRulesOverrides,
     LocationTrackingOverrides,
-    PresenceRulesOverrides {
+    PresenceRulesOverrides,
+    TowerVisibilityOverrides {
   id: number;
   /** Per-session override; null inherits the Game default. */
   allow_player_team_creation: boolean | null;
@@ -729,6 +757,21 @@ export class StaffApiService {
     return this.http.delete<void>(`/api/staff/presence-requirements/${id}/`);
   }
 
+  // ---- tower-visibility: discovery matrix + staff reveal --------------------
+
+  sessionDiscoveryMatrix(id: number): Observable<DiscoveryMatrix> {
+    return this.http.get<DiscoveryMatrix>(
+      `/api/staff/sessions/${id}/discovery-matrix/`,
+    );
+  }
+
+  revealTowerToTeam(teamId: number, towerId: number): Observable<DiscoveryMatrixCell> {
+    return this.http.post<DiscoveryMatrixCell>('/api/staff/discovery/reveal/', {
+      team: teamId,
+      tower: towerId,
+    });
+  }
+
   // ---- live-location: after-game replay feed --------------------------------
 
   sessionLocationHistory(
@@ -745,6 +788,25 @@ export class StaffApiService {
       `/api/staff/sessions/${id}/location-history/${query}`,
     );
   }
+}
+
+// ---- tower-visibility: discovery matrix ------------------------------------
+
+export interface DiscoveryMatrixCell {
+  team_id?: number;
+  tower_id: number;
+  method: string;
+  discovered_at: string;
+  discovered_by?: string | null;
+}
+
+export interface DiscoveryMatrix {
+  session: number;
+  default_discoverability: Discoverability;
+  teams: { id: number; name: string; color: string }[];
+  /** Only towers whose effective discoverability is not VISIBLE. */
+  towers: { id: number; name: string; discoverability: Discoverability }[];
+  discoveries: DiscoveryMatrixCell[];
 }
 
 // ---- live-location ----------------------------------------------------------
