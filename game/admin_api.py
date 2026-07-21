@@ -624,6 +624,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'min_members_per_team', 'max_members_per_team',
             # Team-formation knobs (defaults preserve staff-only rosters).
             'allow_player_team_creation', 'team_join_confirmation',
+            # Realtime + push defaults (realtime-and-notifications).
+            'realtime_enabled', 'push_notifications_enabled',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -784,6 +786,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'min_members_per_team', 'max_members_per_team',
             # Team-formation override (null = inherit Game default).
             'allow_player_team_creation',
+            # Realtime + push overrides (null = inherit Game default).
+            'realtime_enabled', 'push_notifications_enabled',
             'created_at',
         )
         read_only_fields = (

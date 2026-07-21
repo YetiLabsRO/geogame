@@ -1,15 +1,30 @@
-import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  DestroyRef,
+  inject,
+  signal,
+} from '@angular/core';
 import { DatePipe } from '@angular/common';
 import { ActivatedRoute, RouterLink } from '@angular/router';
+import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { forkJoin } from 'rxjs';
 
 import {
   GameApiService,
+  REALTIME_EVENTS,
+  RealtimeService,
+  ScoreboardUpdatedPayload,
   SessionScoreboard,
   SessionTimeline,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+
+/** How long an overtake highlight stays on a row. */
+const HIGHLIGHT_MS = 4_000;
+/** Poll interval used only while the realtime socket is down. */
+const FALLBACK_POLL_MS = 30_000;
 
 @Component({
   selector: 'app-session-detail',
@@ -33,6 +48,11 @@ import { extractErrorMessage } from '../auth/form-error';
               <span class="badge text-bg-secondary ms-2">Past</span>
             } @else {
               <span class="badge text-bg-success ms-2">Active</span>
+              @if (realtime.connected()) {
+                <span class="text-success ms-2">
+                  <i class="bi bi-broadcast"></i> Live
+                </span>
+              }
             }
           </div>
 
@@ -48,8 +68,13 @@ import { extractErrorMessage } from '../auth/form-error';
               </thead>
               <tbody>
                 @for (e of sb.entries; track e.team_id; let i = $index) {
-                  <tr>
-                    <td class="fw-semibold">{{ i + 1 }}</td>
+                  <tr [class.table-success]="movedUp().has(e.team_id)">
+                    <td class="fw-semibold">
+                      {{ i + 1 }}
+                      @if (movedUp().has(e.team_id)) {
+                        <i class="bi bi-arrow-up-short text-success"></i>
+                      }
+                    </td>
                     <td>
                       <span
                         class="d-inline-block me-2"
@@ -122,26 +147,88 @@ import { extractErrorMessage } from '../auth/form-error';
 export class SessionDetailComponent {
   private readonly route = inject(ActivatedRoute);
   private readonly api = inject(GameApiService);
+  private readonly destroyRef = inject(DestroyRef);
+  protected readonly realtime = inject(RealtimeService);
 
   protected readonly scoreboard = signal<SessionScoreboard | null>(null);
   protected readonly timeline = signal<SessionTimeline | null>(null);
   protected readonly loadError = signal<string | null>(null);
+  /** Team ids that just moved up a rank (overtake highlight). */
+  protected readonly movedUp = signal<ReadonlySet<number>>(new Set());
+
+  private readonly sessionId: number;
+  private highlightHandle: ReturnType<typeof setTimeout> | null = null;
 
   constructor() {
-    const id = Number(this.route.snapshot.paramMap.get('id'));
-    if (!id) {
+    this.sessionId = Number(this.route.snapshot.paramMap.get('id'));
+    if (!this.sessionId) {
       this.loadError.set('Invalid session.');
       return;
     }
+    this.load(true);
+
+    // 4.4 — live scoreboard for the viewed session; the RealtimeService
+    // ignores the call when realtime is disabled and the consumer only
+    // admits members of the session, so this is safe to attempt.
+    this.realtime
+      .eventsOfType<ScoreboardUpdatedPayload>(REALTIME_EVENTS.scoreboardUpdated)
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe((envelope) => {
+        if (envelope.session === this.sessionId) {
+          this.applyScoreboard(envelope.payload);
+        }
+      });
+
+    // 4.5 — polling fallback while the socket is down, active games only.
+    const pollHandle = setInterval(() => {
+      if (!this.realtime.connected() && this.scoreboard()?.session?.is_active) {
+        this.load(false);
+      }
+    }, FALLBACK_POLL_MS);
+
+    this.destroyRef.onDestroy(() => {
+      clearInterval(pollHandle);
+      if (this.highlightHandle) clearTimeout(this.highlightHandle);
+      this.realtime.disconnect();
+    });
+  }
+
+  private load(connectSocket: boolean): void {
     forkJoin({
-      scoreboard: this.api.sessionScoreboard(id),
-      timeline: this.api.sessionTimeline(id),
+      scoreboard: this.api.sessionScoreboard(this.sessionId),
+      timeline: this.api.sessionTimeline(this.sessionId),
     }).subscribe({
       next: ({ scoreboard, timeline }) => {
         this.scoreboard.set(scoreboard);
         this.timeline.set(timeline);
+        if (connectSocket && scoreboard.session.is_active) {
+          this.realtime.connect(
+            this.sessionId, scoreboard.session.realtime_enabled,
+          );
+        }
       },
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
+  }
+
+  private applyScoreboard(payload: ScoreboardUpdatedPayload): void {
+    const current = this.scoreboard();
+    if (!current) return;
+    const previous = new Map(
+      current.entries.map((entry, index) => [entry.team_id, index]),
+    );
+    const moved = new Set<number>();
+    payload.entries.forEach((entry, index) => {
+      const before = previous.get(entry.team_id);
+      if (before !== undefined && index < before) {
+        moved.add(entry.team_id);
+      }
+    });
+    this.scoreboard.set({ ...current, entries: payload.entries });
+    if (moved.size > 0) {
+      this.movedUp.set(moved);
+      if (this.highlightHandle) clearTimeout(this.highlightHandle);
+      this.highlightHandle = setTimeout(() => this.movedUp.set(new Set()), HIGHLIGHT_MS);
+    }
   }
 }

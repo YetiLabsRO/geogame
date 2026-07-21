@@ -1,12 +1,14 @@
 """Tests for organize app: account models, auth endpoints, me/my-team."""
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
 from django.contrib.auth.tokens import default_token_generator
 from django.core import mail
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from django.utils.encoding import force_bytes
@@ -19,12 +21,23 @@ from organize.models import (
     Game,
     GameRole,
     Invite,
+    NotificationPreference,
+    PushSubscription,
     Session,
     Team,
     TeamMembership,
     TeamRole,
     UserProfile,
     user_can_invite_to_team,
+)
+from organize.push import (
+    BasePushSender,
+    LoggingPushSender,
+    PushSendError,
+    SubscriptionGone,
+    WebPushSender,
+    get_sender,
+    notify_session_event,
 )
 
 User = get_user_model()
@@ -2480,3 +2493,360 @@ class EffectiveConfigPayloadTest(TeamFormationBase):
         body = client.get(reverse('api-me')).json()
         self.assertFalse(body['allow_player_team_creation'])
         self.assertIsNone(body['captain_of_team_id'])
+
+
+# ---------------------------------------------------------------------------
+# realtime-and-notifications — push subscriptions, preferences, delivery
+# ---------------------------------------------------------------------------
+
+
+class _RecorderSender(BasePushSender):
+    """Test double for the sender interface: records, delivers nothing."""
+
+    def __init__(self, fail_with=None):
+        self.sent = []
+        self.fail_with = fail_with
+
+    def send(self, subscription, payload):
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.sent.append((subscription, payload))
+
+
+WEBPUSH_BODY = {
+    'endpoint': 'https://push.example/ep-1',
+    'keys': {'p256dh': 'p-key', 'auth': 'a-key'},
+}
+
+
+class PushSubscriptionApiTest(TestCase):
+    """5.2 / 6.1 backend — register (consent) / list / revoke subscriptions."""
+
+    def setUp(self):
+        self.user = _make_user('push-api')
+        self.api = _auth_client(self.user)
+        self.url = reverse('api-push-subscriptions')
+
+    def test_requires_authentication(self):
+        # 403 for anonymous callers matches the project-wide DRF setup.
+        self.assertEqual(APIClient().get(self.url).status_code, 403)
+        self.assertEqual(
+            APIClient().post(self.url, WEBPUSH_BODY, format='json').status_code, 403,
+        )
+
+    def test_register_webpush_subscription(self):
+        resp = self.api.post(self.url, WEBPUSH_BODY, format='json')
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(body['kind'], PushSubscription.KIND_WEBPUSH)
+        self.assertTrue(body['active'])
+        subscription = PushSubscription.objects.get(user=self.user)
+        self.assertEqual(subscription.endpoint, WEBPUSH_BODY['endpoint'])
+        self.assertEqual(subscription.p256dh, 'p-key')
+        self.assertEqual(subscription.auth, 'a-key')
+        self.assertTrue(subscription.is_active)
+
+    def test_register_is_idempotent_per_endpoint(self):
+        first = self.api.post(self.url, WEBPUSH_BODY, format='json')
+        again = self.api.post(self.url, WEBPUSH_BODY, format='json')
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(again.status_code, 200)
+        self.assertEqual(PushSubscription.objects.filter(user=self.user).count(), 1)
+
+    def test_register_fcm_subscription(self):
+        resp = self.api.post(self.url, {'fcm_token': 'fcm-tok-1'}, format='json')
+        self.assertEqual(resp.status_code, 201)
+        subscription = PushSubscription.objects.get(user=self.user)
+        self.assertEqual(subscription.kind, PushSubscription.KIND_FCM)
+        self.assertEqual(subscription.fcm_token, 'fcm-tok-1')
+
+    def test_register_rejects_incomplete_payloads(self):
+        self.assertEqual(self.api.post(self.url, {}, format='json').status_code, 400)
+        self.assertEqual(
+            self.api.post(
+                self.url, {'endpoint': 'https://push.example/x'}, format='json',
+            ).status_code,
+            400,
+        )
+
+    def test_list_shows_only_active_subscriptions(self):
+        self.api.post(self.url, WEBPUSH_BODY, format='json')
+        PushSubscription.objects.create(
+            user=self.user, endpoint='https://push.example/old',
+            p256dh='p', auth='a', revoked_at=timezone.now(),
+        )
+        listed = self.api.get(self.url).json()
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]['endpoint'], WEBPUSH_BODY['endpoint'])
+
+    def test_revoke_all_subscriptions(self):
+        self.api.post(self.url, WEBPUSH_BODY, format='json')
+        resp = self.api.delete(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['revoked'], 1)
+        self.assertFalse(
+            PushSubscription.objects.filter(
+                user=self.user, revoked_at__isnull=True,
+            ).exists(),
+        )
+
+    def test_revoke_specific_endpoint_only(self):
+        self.api.post(self.url, WEBPUSH_BODY, format='json')
+        other = dict(WEBPUSH_BODY, endpoint='https://push.example/ep-2')
+        self.api.post(self.url, other, format='json')
+        resp = self.api.delete(
+            self.url, {'endpoint': WEBPUSH_BODY['endpoint']}, format='json',
+        )
+        self.assertEqual(resp.json()['revoked'], 1)
+        active = PushSubscription.objects.filter(
+            user=self.user, revoked_at__isnull=True,
+        )
+        self.assertEqual(
+            [s.endpoint for s in active], ['https://push.example/ep-2'],
+        )
+
+    def test_reregister_after_revoke_reactivates(self):
+        self.api.post(self.url, WEBPUSH_BODY, format='json')
+        self.api.delete(self.url)
+        resp = self.api.post(self.url, WEBPUSH_BODY, format='json')
+        self.assertEqual(resp.status_code, 200)
+        subscription = PushSubscription.objects.get(user=self.user)
+        self.assertTrue(subscription.is_active)
+
+    def test_revoke_is_idempotent_on_model(self):
+        self.api.post(self.url, WEBPUSH_BODY, format='json')
+        subscription = PushSubscription.objects.get(user=self.user)
+        subscription.revoke()
+        first_stamp = subscription.revoked_at
+        subscription.revoke()
+        self.assertEqual(subscription.revoked_at, first_stamp)
+
+
+class PushPreferencesApiTest(TestCase):
+    """5.2 — per-user notification preference toggles."""
+
+    def setUp(self):
+        self.user = _make_user('push-prefs')
+        self.api = _auth_client(self.user)
+        self.url = reverse('api-push-preferences')
+
+    def test_defaults_all_on(self):
+        body = self.api.get(self.url).json()
+        self.assertEqual(
+            body,
+            {
+                'enabled': True,
+                'notify_steal': True,
+                'notify_conquer': True,
+                'notify_bonus': True,
+            },
+        )
+
+    def test_patch_updates_toggles(self):
+        resp = self.api.patch(self.url, {'notify_steal': False}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.json()['notify_steal'])
+        preference = NotificationPreference.objects.get(user=self.user)
+        self.assertFalse(preference.notify_steal)
+        self.assertTrue(preference.notify_conquer)
+
+    def test_allows_maps_events_to_toggles(self):
+        preference = NotificationPreference.for_user(self.user)
+        self.assertTrue(preference.allows('steal'))
+        preference.notify_steal = False
+        self.assertFalse(preference.allows('steal'))
+        self.assertFalse(preference.allows('unknown-event'))
+        preference.enabled = False
+        self.assertFalse(preference.allows('conquer'))
+
+    def test_requires_authentication(self):
+        self.assertEqual(APIClient().get(self.url).status_code, 403)
+
+
+class VapidKeyEndpointTest(TestCase):
+    """5.2 — the public VAPID key is public material, no auth needed."""
+
+    def test_unconfigured_returns_null(self):
+        resp = APIClient().get(reverse('api-push-vapid-key'))
+        self.assertEqual(resp.status_code, 200)
+        self.assertIsNone(resp.json()['public_key'])
+
+    @override_settings(WEBPUSH_VAPID_PUBLIC_KEY='BPublicKey')
+    def test_configured_returns_key(self):
+        resp = APIClient().get(reverse('api-push-vapid-key'))
+        self.assertEqual(resp.json()['public_key'], 'BPublicKey')
+
+
+class PushDeliveryTest(TestCase):
+    """5.3 / 5.4 / 7.6 — every consent gate, and pruning of gone endpoints."""
+
+    def setUp(self):
+        self.game = _make_game('Push Game')
+        self.session = _default_session(self.game)
+        self.team = _make_team(self.game, name='Pushers')
+        self.user = _make_user('push-member')
+        TeamMembership.objects.create(
+            team=self.team, user=self.user.profile, is_active=True,
+        )
+        Session.objects.filter(pk=self.session.pk).update(
+            push_notifications_enabled=True,
+        )
+        self.session.refresh_from_db()
+        self.subscription = PushSubscription.objects.create(
+            user=self.user, endpoint='https://push.example/member',
+            p256dh='p', auth='a',
+        )
+
+    def _notify(self, recorder=None, event='bonus', **context):
+        recorder = recorder or _RecorderSender()
+        context.setdefault('payload', {'name': 'x2'})
+        with patch('organize.push.get_sender', return_value=recorder):
+            sent = notify_session_event(self.session, event, **context)
+        return sent, recorder
+
+    def test_consented_member_is_notified(self):
+        sent, recorder = self._notify()
+        self.assertEqual(sent, 1)
+        subscription, payload = recorder.sent[0]
+        self.assertEqual(subscription, self.subscription)
+        self.assertEqual(payload['event'], 'bonus')
+        self.assertEqual(payload['session'], self.session.id)
+        self.assertIn('x2', payload['body'])
+
+    def test_feature_off_sends_nothing(self):
+        Session.objects.filter(pk=self.session.pk).update(
+            push_notifications_enabled=None,  # inherit Game default (False)
+        )
+        self.session.refresh_from_db()
+        sent, recorder = self._notify()
+        self.assertEqual(sent, 0)
+        self.assertEqual(recorder.sent, [])
+
+    def test_revoked_subscription_not_notified(self):
+        self.subscription.revoke()
+        sent, recorder = self._notify()
+        self.assertEqual(sent, 0)
+        self.assertEqual(recorder.sent, [])
+
+    def test_preference_master_switch_off_blocks(self):
+        NotificationPreference.objects.create(user=self.user, enabled=False)
+        sent, _ = self._notify()
+        self.assertEqual(sent, 0)
+
+    def test_per_event_toggle_off_blocks(self):
+        NotificationPreference.objects.create(user=self.user, notify_bonus=False)
+        sent, _ = self._notify()
+        self.assertEqual(sent, 0)
+
+    def test_non_member_subscription_not_targeted(self):
+        outsider = _make_user('push-outsider')
+        PushSubscription.objects.create(
+            user=outsider, endpoint='https://push.example/outsider',
+            p256dh='p', auth='a',
+        )
+        sent, recorder = self._notify()
+        self.assertEqual(sent, 1)
+        self.assertEqual(recorder.sent[0][0].user_id, self.user.id)
+
+    def test_inactive_membership_not_targeted(self):
+        TeamMembership.objects.filter(user=self.user.profile).update(is_active=False)
+        sent, _ = self._notify()
+        self.assertEqual(sent, 0)
+
+    def test_unknown_event_sends_nothing(self):
+        sent, recorder = self._notify(event='nonsense')
+        self.assertEqual(sent, 0)
+        self.assertEqual(recorder.sent, [])
+
+    def test_gone_subscription_is_pruned(self):
+        recorder = _RecorderSender(fail_with=SubscriptionGone('410 gone'))
+        sent, _ = self._notify(recorder=recorder)
+        self.assertEqual(sent, 0)
+        self.subscription.refresh_from_db()
+        self.assertFalse(self.subscription.is_active)
+        # And it is never sent to again.
+        sent, second = self._notify()
+        self.assertEqual(sent, 0)
+        self.assertEqual(second.sent, [])
+
+    def test_generic_delivery_failure_is_swallowed_not_pruned(self):
+        recorder = _RecorderSender(fail_with=RuntimeError('boom'))
+        sent, _ = self._notify(recorder=recorder)
+        self.assertEqual(sent, 0)
+        self.subscription.refresh_from_db()
+        self.assertTrue(self.subscription.is_active)
+
+    def test_sender_selection_by_configuration(self):
+        self.assertIsInstance(get_sender(), LoggingPushSender)
+        with override_settings(
+            WEBPUSH_VAPID_PUBLIC_KEY='pub', WEBPUSH_VAPID_PRIVATE_KEY='priv',
+        ):
+            self.assertIsInstance(get_sender(), WebPushSender)
+
+    def test_logging_sender_delivers_nothing(self):
+        # The stub must accept any subscription without side effects.
+        LoggingPushSender().send(self.subscription, {'event': 'bonus'})
+        self.subscription.refresh_from_db()
+        self.assertTrue(self.subscription.is_active)
+
+
+@override_settings(
+    WEBPUSH_VAPID_PUBLIC_KEY='pub-key',
+    WEBPUSH_VAPID_PRIVATE_KEY='priv-key',
+    WEBPUSH_VAPID_CLAIMS_EMAIL='ops@example.com',
+)
+class WebPushSenderTest(TestCase):
+    """The real sender maps push-service errors onto the interface."""
+
+    def setUp(self):
+        self.user = _make_user('webpush-sender')
+        self.subscription = PushSubscription.objects.create(
+            user=self.user, endpoint='https://push.example/wps',
+            p256dh='p-key', auth='a-key',
+        )
+
+    def test_success_forwards_subscription_and_vapid_material(self):
+        with patch('pywebpush.webpush') as webpush:
+            WebPushSender().send(self.subscription, {'event': 'bonus'})
+        kwargs = webpush.call_args.kwargs
+        self.assertEqual(
+            kwargs['subscription_info'],
+            {
+                'endpoint': 'https://push.example/wps',
+                'keys': {'p256dh': 'p-key', 'auth': 'a-key'},
+            },
+        )
+        self.assertEqual(kwargs['vapid_private_key'], 'priv-key')
+        self.assertEqual(
+            kwargs['vapid_claims'], {'sub': 'mailto:ops@example.com'},
+        )
+
+    def test_gone_statuses_map_to_subscription_gone(self):
+        from pywebpush import WebPushException
+        for status_code in (404, 410):
+            exc = WebPushException(
+                'gone', response=SimpleNamespace(status_code=status_code),
+            )
+            with patch('pywebpush.webpush', side_effect=exc):
+                with self.assertRaises(SubscriptionGone):
+                    WebPushSender().send(self.subscription, {'event': 'bonus'})
+
+    def test_other_failures_map_to_push_send_error(self):
+        from pywebpush import WebPushException
+        exc = WebPushException(
+            'server error', response=SimpleNamespace(status_code=500),
+        )
+        with patch('pywebpush.webpush', side_effect=exc):
+            with self.assertRaises(PushSendError):
+                WebPushSender().send(self.subscription, {'event': 'bonus'})
+        with patch('pywebpush.webpush', side_effect=WebPushException('no response')):
+            with self.assertRaises(PushSendError):
+                WebPushSender().send(self.subscription, {'event': 'bonus'})
+
+    def test_fcm_subscription_falls_back_to_logging_stub(self):
+        fcm = PushSubscription.objects.create(
+            user=self.user, kind=PushSubscription.KIND_FCM, fcm_token='tok',
+        )
+        with patch('pywebpush.webpush') as webpush:
+            WebPushSender().send(fcm, {'event': 'bonus'})
+        webpush.assert_not_called()

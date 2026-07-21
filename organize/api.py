@@ -414,9 +414,19 @@ class CurrentSessionSerializer(serializers.Serializer):
     # Effective (Session override, else Game default) player-team-creation
     # toggle for this session.
     allow_player_team_creation = serializers.SerializerMethodField()
+    # Effective realtime/push toggles (realtime-and-notifications) so
+    # clients know whether to open the websocket / offer push opt-in.
+    realtime_enabled = serializers.SerializerMethodField()
+    push_notifications_enabled = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
+
+    def get_realtime_enabled(self, session):
+        return session.effective('realtime_enabled')
+
+    def get_push_notifications_enabled(self, session):
+        return session.effective('push_notifications_enabled')
 
 
 class MySessionsView(APIView):

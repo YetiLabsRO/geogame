@@ -71,6 +71,9 @@ export interface CurrentSession {
   end_time: string;
   game: GameConfig;
   allow_player_team_creation: boolean;
+  /** Effective realtime/push toggles (realtime-and-notifications). */
+  realtime_enabled: boolean;
+  push_notifications_enabled: boolean;
 }
 
 export interface ZoneFeature {

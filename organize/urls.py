@@ -1,8 +1,20 @@
 from django.urls import path
 
-from organize import api
+from organize import api, push_api
 
 urlpatterns = [
+    # Push notifications (realtime-and-notifications).
+    path(
+        'push/subscriptions/',
+        push_api.PushSubscriptionView.as_view(),
+        name='api-push-subscriptions',
+    ),
+    path(
+        'push/preferences/',
+        push_api.PushPreferencesView.as_view(),
+        name='api-push-preferences',
+    ),
+    path('push/vapid-key/', push_api.vapid_key, name='api-push-vapid-key'),
     path('auth/register/', api.register, name='api-auth-register'),
     path('auth/login/', api.login, name='api-auth-login'),
     path('auth/logout/', api.logout, name='api-auth-logout'),

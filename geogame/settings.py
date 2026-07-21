@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.gis',
 
+    'channels',
     'leaflet',
     'rest_framework',
     'rest_framework.authtoken',
@@ -82,6 +83,46 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'geogame.wsgi.application'
+
+# Realtime (realtime-and-notifications): Channels ASGI application. The
+# WSGI entrypoint keeps working for deployments that do not enable
+# real-time; websockets are only served when the app runs under ASGI.
+ASGI_APPLICATION = 'geogame.asgi.application'
+
+# Channel layer: Redis-backed only when REDIS_URL is set (production,
+# cross-process fan-out); otherwise the in-memory layer, which is
+# correct for tests and single-process development and needs no extra
+# services.
+_REDIS_URL = os.environ.get('REDIS_URL')
+if _REDIS_URL:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels_redis.core.RedisChannelLayer',
+            'CONFIG': {'hosts': [_REDIS_URL]},
+        },
+    }
+else:
+    CHANNEL_LAYERS = {
+        'default': {
+            'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
+
+# Coalesce `scoreboard.updated` broadcasts to at most one per this many
+# seconds per Session (0 disables throttling — used by tests).
+REALTIME_SCOREBOARD_THROTTLE_SECONDS = float(
+    os.environ.get('REALTIME_SCOREBOARD_THROTTLE_SECONDS', '2.0'),
+)
+
+# Web Push (VAPID) / FCM credentials. Without keys the push sender
+# degrades to a logging stub — nothing is actually delivered, and no
+# external service is contacted (see organize/push.py).
+WEBPUSH_VAPID_PUBLIC_KEY = os.environ.get('WEBPUSH_VAPID_PUBLIC_KEY', '')
+WEBPUSH_VAPID_PRIVATE_KEY = os.environ.get('WEBPUSH_VAPID_PRIVATE_KEY', '')
+WEBPUSH_VAPID_CLAIMS_EMAIL = os.environ.get(
+    'WEBPUSH_VAPID_CLAIMS_EMAIL', 'noreply@cercetador.albascout.ro',
+)
+FCM_SERVER_KEY = os.environ.get('FCM_SERVER_KEY', '')
 
 
 # Database
