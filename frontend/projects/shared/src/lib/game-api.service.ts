@@ -10,6 +10,17 @@ export interface RoleRequirementInfo {
   missing_roles: string[];
 }
 
+/** Player-facing presence status for a tower (presence-rules capability). */
+export interface PresenceStatus {
+  required_members: number;
+  present_members: number;
+  present_member_ids: number[];
+  method: 'GEOFENCE' | 'PHOTO' | 'GEOFENCE_OR_PHOTO';
+  photo_fallback_offered: boolean;
+  geofence_radius_meters: number;
+  window_seconds: number;
+}
+
 export interface TowerState {
   id: number;
   name: string;
@@ -24,6 +35,8 @@ export interface TowerState {
     tower: number | null;
     role_requirement: RoleRequirementInfo | null;
   } | null;
+  /** null = no presence requirement (presence-rules capability). */
+  presence: PresenceStatus | null;
   pending_submission: boolean;
   cooloff_until: string | null;
   proximity_meters: number;
@@ -60,6 +73,16 @@ export interface GameConfig {
   team_groups: { id: number; name: string; slug: string }[];
 }
 
+/** Effective live-location config for a Session (live-location capability). */
+export interface LocationConfig {
+  tracking_enabled: boolean;
+  /** Game-level pacing; the player app streams at this cadence and never
+   *  exposes a control to change it. */
+  ping_interval_seconds: number;
+  visibility: 'NONE' | 'OWN_TEAM' | 'EVERYONE';
+  consent_text: string;
+}
+
 export interface CurrentSession {
   id: number;
   slug: string;
@@ -71,6 +94,7 @@ export interface CurrentSession {
   end_time: string;
   game: GameConfig;
   allow_player_team_creation: boolean;
+  location: LocationConfig;
 }
 
 export interface ZoneFeature {
@@ -156,6 +180,79 @@ export class GameApiService {
   myTeam(): Observable<MyTeam> {
     return this.http.get<MyTeam>('/api/my-team/');
   }
+
+  // ---- live-location --------------------------------------------------------
+
+  locationConsent(): Observable<LocationConsentStatus> {
+    return this.http.get<LocationConsentStatus>('/api/location/consent/');
+  }
+
+  grantLocationConsent(): Observable<LocationConsentStatus> {
+    return this.http.post<LocationConsentStatus>('/api/location/consent/', {});
+  }
+
+  withdrawLocationConsent(): Observable<void> {
+    return this.http.delete<void>('/api/location/consent/');
+  }
+
+  sendLocationPing(payload: LocationPingPayload): Observable<LocationPingResponse> {
+    return this.http.post<LocationPingResponse>('/api/location/ping/', payload);
+  }
+
+  liveLocations(): Observable<LiveLocations> {
+    return this.http.get<LiveLocations>('/api/location/live/');
+  }
+}
+
+// ---- live-location ---------------------------------------------------------
+
+export interface LocationConsentStatus {
+  session: number;
+  tracking_enabled?: boolean;
+  consent_required?: boolean;
+  has_consent: boolean;
+  agreed_at: string | null;
+  consent_text: string;
+  ping_interval_seconds?: number;
+}
+
+export interface LocationPingPayload {
+  lat: number;
+  lng: number;
+  accuracy?: number;
+  recorded_at?: string;
+}
+
+export interface LocationPingResponse {
+  id: number;
+  recorded_at: string;
+  received_at: string;
+  ping_interval_seconds: number;
+}
+
+export interface LivePlayer {
+  user_id: number;
+  username: string;
+  team_id: number | null;
+  team_name: string | null;
+  team_color: string | null;
+  lat: number;
+  lng: number;
+  accuracy: number | null;
+  recorded_at: string;
+  received_at: string;
+}
+
+export interface LiveLocations {
+  session: number;
+  tracking_enabled: boolean;
+  visibility: 'NONE' | 'OWN_TEAM' | 'EVERYONE';
+  /** presence-rules refinement the plotting consumes (SELECT_COUNT = nearest N). */
+  teammate_visibility: {
+    mode: 'OWN_TEAM' | 'EVERYONE' | 'SELECT_COUNT';
+    count: number;
+  };
+  players: LivePlayer[];
 }
 
 // ---- team-roles ------------------------------------------------------------

@@ -2,7 +2,14 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { FormsModule } from '@angular/forms';
 
-import { AdminChallenge, AdminGameRole, AdminTower, StaffApiService } from 'shared';
+import {
+  AdminChallenge,
+  AdminGameRole,
+  AdminPresenceRequirement,
+  AdminTower,
+  PresenceMethod,
+  StaffApiService,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -75,6 +82,120 @@ interface Row {
       </div>
     </div>
 
+    <div class="card mb-4">
+      <div class="card-body">
+        <h2 class="h6">
+          Presence requirements
+          <span class="text-body-secondary small fw-normal">
+            — reusable "≥N people together" rules challenges can reference
+            (presence-rules)
+          </span>
+        </h2>
+        @if (requirements().length === 0) {
+          <p class="small text-body-secondary mb-2">
+            None yet. A challenge without a requirement imposes no presence
+            constraint beyond the submitter.
+          </p>
+        } @else {
+          <div class="table-responsive mb-2">
+            <table class="table table-sm align-middle mb-0">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th class="text-end">Min members</th>
+                  <th>Method</th>
+                  <th class="text-end">Radius (m)</th>
+                  <th class="text-end">Window (s)</th>
+                  <th class="text-end">Used by</th>
+                  <th></th>
+                </tr>
+              </thead>
+              <tbody>
+                @for (req of requirements(); track req.id) {
+                  <tr>
+                    <td>{{ req.name }}</td>
+                    <td class="text-end">{{ req.min_members_present }}</td>
+                    <td><code>{{ req.method }}</code></td>
+                    <td class="text-end">
+                      {{ req.geofence_radius_meters ?? 'tower prox.' }}
+                    </td>
+                    <td class="text-end">{{ req.window_seconds ?? 'session' }}</td>
+                    <td class="text-end">{{ req.challenge_count }}</td>
+                    <td class="text-end">
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-outline-danger"
+                        (click)="removeRequirement(req)"
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                }
+              </tbody>
+            </table>
+          </div>
+        }
+        <form [formGroup]="requirementForm" (ngSubmit)="createRequirement()" novalidate>
+          <div class="row g-2 align-items-end">
+            <div class="col-md-3">
+              <label class="form-label small mb-0">Name</label>
+              <input class="form-control form-control-sm" formControlName="name" />
+            </div>
+            <div class="col-md-2">
+              <label class="form-label small mb-0">Min members</label>
+              <input
+                class="form-control form-control-sm"
+                type="number"
+                min="1"
+                formControlName="min_members_present"
+              />
+            </div>
+            <div class="col-md-3">
+              <label class="form-label small mb-0">Method</label>
+              <select class="form-select form-select-sm" formControlName="method">
+                <option [ngValue]="'GEOFENCE'">Geofence</option>
+                <option [ngValue]="'PHOTO'">Photo (staff-reviewed)</option>
+                <option [ngValue]="'GEOFENCE_OR_PHOTO'">Geofence or photo</option>
+              </select>
+            </div>
+            <div class="col-md-1">
+              <label class="form-label small mb-0">Radius</label>
+              <input
+                class="form-control form-control-sm"
+                type="number"
+                min="0"
+                placeholder="prox."
+                formControlName="geofence_radius_meters"
+              />
+            </div>
+            <div class="col-md-1">
+              <label class="form-label small mb-0">Window</label>
+              <input
+                class="form-control form-control-sm"
+                type="number"
+                min="0"
+                placeholder="sess."
+                formControlName="window_seconds"
+              />
+            </div>
+            <div class="col-md-2 d-grid">
+              <button
+                type="submit"
+                class="btn btn-sm btn-outline-primary"
+                [disabled]="requirementForm.invalid || requirementBusy()"
+              >
+                Add requirement
+              </button>
+            </div>
+          </div>
+          @if (requirementError(); as msg) {
+            <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
+          }
+        </form>
+      </div>
+    </div>
+
     @if (loadError(); as msg) {
       <div class="alert alert-danger">{{ msg }}</div>
     }
@@ -95,6 +216,7 @@ interface Row {
               <th style="min-width: 12rem">Tower</th>
               <th style="max-width: 6rem">Difficulty</th>
               <th style="min-width: 14rem">Role requirement</th>
+              <th style="min-width: 12rem">Presence</th>
               <th></th>
             </tr>
           </thead>
@@ -185,6 +307,21 @@ interface Row {
                     </div>
                   }
                 </td>
+                <td>
+                  <select
+                    class="form-select form-select-sm"
+                    [ngModel]="row.draft.presence_requirement"
+                    (ngModelChange)="update(row, 'presence_requirement', $event)"
+                  >
+                    <option [ngValue]="null">No presence requirement</option>
+                    @for (req of requirements(); track req.id) {
+                      <option [ngValue]="req.id">
+                        {{ req.name }} (≥{{ req.min_members_present }},
+                        {{ req.method }})
+                      </option>
+                    }
+                  </select>
+                </td>
                 <td class="text-end">
                   <div class="d-flex gap-2 justify-content-end">
                     <button
@@ -226,15 +363,26 @@ export class ChallengesComponent {
   protected readonly rows = signal<Row[]>([]);
   protected readonly towers = signal<AdminTower[]>([]);
   protected readonly roles = signal<AdminGameRole[]>([]);
+  protected readonly requirements = signal<AdminPresenceRequirement[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
   protected readonly creating = signal(false);
   protected readonly createError = signal<string | null>(null);
+  protected readonly requirementBusy = signal(false);
+  protected readonly requirementError = signal<string | null>(null);
 
   protected readonly createForm = this.fb.group({
     text: ['', [Validators.required]],
     tower: [null as number | null],
     difficulty: [1, [Validators.required, Validators.min(1)]],
+  });
+
+  protected readonly requirementForm = this.fb.group({
+    name: ['', [Validators.required]],
+    min_members_present: [2, [Validators.required, Validators.min(1)]],
+    method: ['GEOFENCE' as PresenceMethod, [Validators.required]],
+    geofence_radius_meters: [null as number | null],
+    window_seconds: [null as number | null],
   });
 
   constructor() {
@@ -247,6 +395,63 @@ export class ChallengesComponent {
     this.api.listGameRoles().subscribe({
       next: (list) => this.roles.set(list),
       error: () => {},
+    });
+    this.refreshRequirements();
+  }
+
+  private refreshRequirements(): void {
+    this.api.listPresenceRequirements().subscribe({
+      next: (list) => this.requirements.set(list),
+      error: () => {},
+    });
+  }
+
+  protected createRequirement(): void {
+    if (this.requirementForm.invalid || this.requirementBusy()) return;
+    this.requirementBusy.set(true);
+    this.requirementError.set(null);
+    const raw = this.requirementForm.getRawValue();
+    this.api
+      .createPresenceRequirement({
+        name: raw.name,
+        min_members_present: raw.min_members_present,
+        method: raw.method,
+        geofence_radius_meters: raw.geofence_radius_meters,
+        window_seconds: raw.window_seconds,
+      })
+      .subscribe({
+        next: () => {
+          this.requirementBusy.set(false);
+          this.requirementForm.reset({
+            name: '',
+            min_members_present: 2,
+            method: 'GEOFENCE',
+            geofence_radius_meters: null,
+            window_seconds: null,
+          });
+          this.refreshRequirements();
+        },
+        error: (err) => {
+          this.requirementBusy.set(false);
+          this.requirementError.set(extractErrorMessage(err));
+        },
+      });
+  }
+
+  protected removeRequirement(req: AdminPresenceRequirement): void {
+    const suffix =
+      req.challenge_count > 0
+        ? ` It is referenced by ${req.challenge_count} challenge(s); they will ` +
+          'simply lose the requirement.'
+        : '';
+    if (!confirm(`Delete presence requirement "${req.name}"?${suffix}`)) return;
+    this.api.deletePresenceRequirement(req.id).subscribe({
+      next: () => {
+        this.refreshRequirements();
+        // Detached challenges now have presence_requirement = null.
+        this.refresh();
+      },
+      error: (err) => this.requirementError.set(extractErrorMessage(err)),
     });
   }
 
@@ -299,6 +504,8 @@ export class ChallengesComponent {
         role_requirement_mode: 'NONE',
         required_roles: [],
         require_holders_present: false,
+        // Presence requirement defaults to none (presence-rules).
+        presence_requirement: null,
       })
       .subscribe({
         next: () => {

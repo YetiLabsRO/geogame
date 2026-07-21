@@ -9,6 +9,8 @@ import {
   FailCounterReset,
   StaffApiService,
   TeamJoinConfirmation,
+  TeammateVisibilityMode,
+  TogethernessMode,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -381,6 +383,69 @@ interface Row {
                         </div>
                       </div>
                       <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">
+                          Presence rules
+                          <i
+                            class="bi bi-info-circle text-body-secondary"
+                            title="How teams must stay together and who players see on the map (presence-rules)"
+                          ></i>
+                        </div>
+                        <div class="row g-2">
+                          <div class="col-12">
+                            <label class="form-label small mb-0">Togetherness</label>
+                            <select
+                              class="form-select form-select-sm"
+                              [ngModel]="row.draft.togetherness_mode"
+                              (ngModelChange)="update(row, 'togetherness_mode', $event)"
+                            >
+                              @for (o of togethernessOptions; track o.value) {
+                                <option [ngValue]="o.value">{{ o.label }}</option>
+                              }
+                            </select>
+                          </div>
+                          <div class="col-7">
+                            <label class="form-label small mb-0">Teammate map visibility</label>
+                            <select
+                              class="form-select form-select-sm"
+                              [ngModel]="row.draft.teammate_visibility_mode"
+                              (ngModelChange)="update(row, 'teammate_visibility_mode', $event)"
+                            >
+                              @for (o of teammateVisibilityOptions; track o.value) {
+                                <option [ngValue]="o.value">{{ o.label }}</option>
+                              }
+                            </select>
+                          </div>
+                          <div class="col-5">
+                            <label class="form-label small mb-0">Nearest N</label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="0"
+                              [disabled]="row.draft.teammate_visibility_mode !== 'SELECT_COUNT'"
+                              [ngModel]="row.draft.teammate_visibility_count"
+                              (ngModelChange)="update(row, 'teammate_visibility_count', $event)"
+                            />
+                          </div>
+                          <div class="col-7">
+                            <label class="form-label small mb-0">
+                              Presence window (s, 0 = point-in-time)
+                            </label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="0"
+                              [ngModel]="row.draft.presence_window_seconds"
+                              (ngModelChange)="update(row, 'presence_window_seconds', $event)"
+                            />
+                          </div>
+                          <div class="col-12 text-body-secondary small">
+                            A window &gt; 0 requires each counted member's live
+                            track to stay inside the geofence for that long —
+                            harder to spoof than one GPS fix.
+                          </div>
+                        </div>
+                      </div>
+                      <div class="col-md-6">
                         <div class="fw-semibold small mb-2">Team formation</div>
                         <div class="form-check form-switch">
                           <input
@@ -452,6 +517,20 @@ export class GamesComponent {
     { value: 'TOWER_SUCCESS_ONLY', label: 'Reset only on success at the same tower' },
     { value: 'ANY_SUCCESS_ELSEWHERE', label: 'Reset on any confirmed submission' },
     { value: 'ANY_ATTEMPT_ELSEWHERE', label: 'Reset on any submission anywhere' },
+  ];
+
+  protected readonly togethernessOptions: { value: TogethernessMode; label: string }[] = [
+    { value: 'SPLIT_ALLOWED', label: 'Members may split up' },
+    { value: 'WHOLE_TEAM_TOGETHER', label: 'Whole team must be together' },
+  ];
+
+  protected readonly teammateVisibilityOptions: {
+    value: TeammateVisibilityMode;
+    label: string;
+  }[] = [
+    { value: 'OWN_TEAM', label: 'Own team only' },
+    { value: 'EVERYONE', label: 'Everyone in the session' },
+    { value: 'SELECT_COUNT', label: 'The nearest N players' },
   ];
 
   protected readonly teamRuleKnobs: { field: TeamRuleKnob; label: string; min: number }[] = [
@@ -632,6 +711,10 @@ export class GamesComponent {
         max_members_per_team: row.draft.max_members_per_team,
         allow_player_team_creation: row.draft.allow_player_team_creation,
         team_join_confirmation: row.draft.team_join_confirmation,
+        togetherness_mode: row.draft.togetherness_mode,
+        teammate_visibility_mode: row.draft.teammate_visibility_mode,
+        teammate_visibility_count: row.draft.teammate_visibility_count,
+        presence_window_seconds: row.draft.presence_window_seconds,
       })
       .subscribe({
         next: (updated) => {

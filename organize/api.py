@@ -414,9 +414,21 @@ class CurrentSessionSerializer(serializers.Serializer):
     # Effective (Session override, else Game default) player-team-creation
     # toggle for this session.
     allow_player_team_creation = serializers.SerializerMethodField()
+    # Effective live-location config (live-location capability). The app
+    # paces streaming off `location_ping_interval_seconds`; there is no
+    # player-facing frequency control.
+    location = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
+
+    def get_location(self, session):
+        return {
+            'tracking_enabled': bool(session.effective('location_tracking_enabled')),
+            'ping_interval_seconds': session.effective('location_ping_interval_seconds'),
+            'visibility': session.effective('location_visibility'),
+            'consent_text': session.effective('location_consent_text') or '',
+        }
 
 
 class MySessionsView(APIView):

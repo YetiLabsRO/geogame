@@ -24,6 +24,7 @@ from game.admin_api import (
     AdminCollectionViewSet,
     AdminGameRoleViewSet,
     AdminGameViewSet,
+    AdminPresenceRequirementViewSet,
     AdminSessionViewSet,
     AdminTeamGroupList,
     AdminTeamMembershipViewSet,
@@ -36,6 +37,12 @@ from game.api import (
     StaffSubmissionList,
     StaffSubmissionReview,
     TowerStateView,
+)
+from game.location_api import (
+    LocationConsentView,
+    LocationLiveView,
+    LocationPingView,
+    StaffLocationHistoryView,
 )
 from game.views import (
     ChallengeViewSet,
@@ -76,12 +83,30 @@ admin_router.register(
 admin_router.register(
     r'sessions', AdminSessionViewSet, basename='admin-session',
 )
+admin_router.register(
+    r'presence-requirements',
+    AdminPresenceRequirementViewSet,
+    basename='admin-presence-requirement',
+)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('health/', health, name="health"),
     path('api/', include(router.urls)),
     path('api/towers/<int:pk>/state/', TowerStateView.as_view(), name='api-tower-state'),
+    # Live-location (live-location capability).
+    path('api/location/ping/', LocationPingView.as_view(), name='api-location-ping'),
+    path('api/location/live/', LocationLiveView.as_view(), name='api-location-live'),
+    path(
+        'api/location/consent/',
+        LocationConsentView.as_view(),
+        name='api-location-consent',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/location-history/',
+        StaffLocationHistoryView.as_view(),
+        name='api-staff-location-history',
+    ),
     path(
         'api/staff/submissions/',
         StaffSubmissionList.as_view(),

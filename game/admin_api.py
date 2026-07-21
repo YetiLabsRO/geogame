@@ -16,6 +16,7 @@ from game.models import (
     ROLE_REQUIREMENT_NONE,
     Challenge,
     Collection,
+    PresenceRequirement,
     TeamTowerFailCounter,
     TeamTowerOwnership,
     TeamZoneOwnership,
@@ -134,6 +135,8 @@ class AdminChallengeSerializer(serializers.ModelSerializer):
         fields = (
             'id', 'game', 'text', 'tower', 'difficulty',
             'role_requirement_mode', 'required_roles', 'require_holders_present',
+            # presence-rules: null = no presence requirement.
+            'presence_requirement',
         )
 
     def validate(self, attrs):
@@ -289,6 +292,45 @@ class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         self._require_edit(instance.game)
         instance.delete()
+
+
+# ---------------------------------------------------------------------------
+# Presence requirements (presence-rules)
+# ---------------------------------------------------------------------------
+
+
+class AdminPresenceRequirementSerializer(serializers.ModelSerializer):
+    challenge_count = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = PresenceRequirement
+        fields = (
+            'id', 'name', 'min_members_present', 'method',
+            'geofence_radius_meters', 'window_seconds', 'challenge_count',
+        )
+
+    def get_challenge_count(self, requirement):
+        return requirement.challenges.count()
+
+    def validate_min_members_present(self, value):
+        if value < 1:
+            raise serializers.ValidationError(
+                'At least one member must be required present.',
+            )
+        return value
+
+
+class AdminPresenceRequirementViewSet(viewsets.ModelViewSet):
+    """Staff CRUD for reusable presence requirements (presence-rules).
+
+    A requirement is a named, shareable row ("≥2 people, geofence,
+    30s window") referenced by any number of Challenges; deleting one
+    detaches it (`SET_NULL`) without touching the Challenges.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = PresenceRequirement.objects.all().order_by('name')
+    serializer_class = AdminPresenceRequirementSerializer
 
 
 # ---------------------------------------------------------------------------
@@ -624,6 +666,13 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'min_members_per_team', 'max_members_per_team',
             # Team-formation knobs (defaults preserve staff-only rosters).
             'allow_player_team_creation', 'team_join_confirmation',
+            # Live-location knobs (tracking defaults OFF).
+            'location_tracking_enabled', 'location_ping_interval_seconds',
+            'location_visibility', 'location_retention_days',
+            'location_consent_text',
+            # Presence-rules knobs (defaults preserve base behavior).
+            'togetherness_mode', 'teammate_visibility_mode',
+            'teammate_visibility_count', 'presence_window_seconds',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -784,6 +833,13 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'min_members_per_team', 'max_members_per_team',
             # Team-formation override (null = inherit Game default).
             'allow_player_team_creation',
+            # Live-location overrides (null = inherit Game default).
+            'location_tracking_enabled', 'location_ping_interval_seconds',
+            'location_visibility', 'location_retention_days',
+            'location_consent_text',
+            # Presence-rules overrides (null = inherit Game default).
+            'togetherness_mode', 'teammate_visibility_mode',
+            'teammate_visibility_count', 'presence_window_seconds',
             'created_at',
         )
         read_only_fields = (

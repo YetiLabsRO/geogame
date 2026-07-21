@@ -22,6 +22,21 @@ export interface StaffSubmission {
   timestamp_verified: string | null;
   outcome: SubmissionOutcome;
   response_text: string;
+  /** Presence evidence (presence-rules); null for ungated submissions. */
+  presence_check: PresenceCheckInfo | null;
+}
+
+/** Persisted presence evidence for a submission (presence-rules capability). */
+export interface PresenceCheckInfo {
+  required_count: number;
+  present_count: number;
+  method: PresenceMethod;
+  verified_member_ids: number[];
+  window_seconds: number;
+  /** null = the window could not be evaluated (live-location unavailable). */
+  window_satisfied: boolean | null;
+  satisfied: boolean;
+  reason_code: string;
 }
 
 /** A Collection or Game referencing a repository asset (usage reporting). */
@@ -104,7 +119,45 @@ export interface AdminChallenge {
   role_requirement_mode: RoleRequirementMode;
   required_roles: number[];
   require_holders_present: boolean;
+  /** presence-rules: null = no presence requirement. */
+  presence_requirement: number | null;
 }
+
+// ---- presence-rules ---------------------------------------------------------
+
+export type PresenceMethod = 'GEOFENCE' | 'PHOTO' | 'GEOFENCE_OR_PHOTO';
+export type TogethernessMode = 'SPLIT_ALLOWED' | 'WHOLE_TEAM_TOGETHER';
+export type TeammateVisibilityMode = 'OWN_TEAM' | 'EVERYONE' | 'SELECT_COUNT';
+
+/** A named, reusable presence requirement referenced by challenges. */
+export interface AdminPresenceRequirement {
+  id: number;
+  name: string;
+  min_members_present: number;
+  method: PresenceMethod;
+  /** null falls back to the tower's effective proximity_meters. */
+  geofence_radius_meters: number | null;
+  /** null falls back to the Session's effective presence_window_seconds. */
+  window_seconds: number | null;
+  challenge_count: number;
+}
+
+export type AdminPresenceRequirementPayload = Partial<
+  Omit<AdminPresenceRequirement, 'id' | 'challenge_count'>
+>;
+
+/** Presence knobs shared by Game (defaults) and Session (overrides). */
+export interface PresenceRulesConfig {
+  togetherness_mode: TogethernessMode;
+  teammate_visibility_mode: TeammateVisibilityMode;
+  teammate_visibility_count: number;
+  presence_window_seconds: number;
+}
+
+/** Per-session presence overrides: null inherits the Game default. */
+export type PresenceRulesOverrides = {
+  [K in keyof PresenceRulesConfig]: PresenceRulesConfig[K] | null;
+};
 
 export type BuiltinPower = 'NONE' | 'INVITER';
 
@@ -171,7 +224,27 @@ export type TeamRulesOverrides = {
 
 export type TeamJoinConfirmation = 'AUTO_APPROVE' | 'CAPTAIN' | 'STAFF';
 
-export interface AdminGame extends Phase10Config, TeamRulesConfig {
+export type LocationVisibility = 'NONE' | 'OWN_TEAM' | 'EVERYONE';
+
+/** Live-location knobs shared by Game (defaults) and Session (overrides). */
+export interface LocationTrackingConfig {
+  location_tracking_enabled: boolean;
+  location_ping_interval_seconds: number;
+  location_visibility: LocationVisibility;
+  location_retention_days: number;
+  location_consent_text: string;
+}
+
+/** Per-session live-location overrides: null inherits the Game default. */
+export type LocationTrackingOverrides = {
+  [K in keyof LocationTrackingConfig]: LocationTrackingConfig[K] | null;
+};
+
+export interface AdminGame
+  extends Phase10Config,
+    TeamRulesConfig,
+    LocationTrackingConfig,
+    PresenceRulesConfig {
   id: number;
   slug: string;
   name: string;
@@ -222,7 +295,11 @@ export type SessionTransitionAction =
   | 'resume'
   | 'finish';
 
-export interface AdminSession extends Phase10Overrides, TeamRulesOverrides {
+export interface AdminSession
+  extends Phase10Overrides,
+    TeamRulesOverrides,
+    LocationTrackingOverrides,
+    PresenceRulesOverrides {
   id: number;
   /** Per-session override; null inherits the Game default. */
   allow_player_team_creation: boolean | null;
@@ -597,4 +674,71 @@ export class StaffApiService {
       `/api/staff/sessions/${id}/start_blockers/`,
     );
   }
+
+  // ---- presence-rules: reusable presence requirements -----------------------
+
+  listPresenceRequirements(): Observable<AdminPresenceRequirement[]> {
+    return this.http.get<AdminPresenceRequirement[]>('/api/staff/presence-requirements/');
+  }
+
+  createPresenceRequirement(
+    payload: AdminPresenceRequirementPayload,
+  ): Observable<AdminPresenceRequirement> {
+    return this.http.post<AdminPresenceRequirement>(
+      '/api/staff/presence-requirements/',
+      payload,
+    );
+  }
+
+  updatePresenceRequirement(
+    id: number,
+    payload: AdminPresenceRequirementPayload,
+  ): Observable<AdminPresenceRequirement> {
+    return this.http.patch<AdminPresenceRequirement>(
+      `/api/staff/presence-requirements/${id}/`,
+      payload,
+    );
+  }
+
+  deletePresenceRequirement(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/presence-requirements/${id}/`);
+  }
+
+  // ---- live-location: after-game replay feed --------------------------------
+
+  sessionLocationHistory(
+    id: number,
+    filters: { user?: number; team?: number; from?: string; to?: string } = {},
+  ): Observable<LocationHistory> {
+    const parts: string[] = [];
+    if (filters.user) parts.push(`user=${filters.user}`);
+    if (filters.team) parts.push(`team=${filters.team}`);
+    if (filters.from) parts.push(`from=${encodeURIComponent(filters.from)}`);
+    if (filters.to) parts.push(`to=${encodeURIComponent(filters.to)}`);
+    const query = parts.length ? `?${parts.join('&')}` : '';
+    return this.http.get<LocationHistory>(
+      `/api/staff/sessions/${id}/location-history/${query}`,
+    );
+  }
+}
+
+// ---- live-location ----------------------------------------------------------
+
+export interface LocationHistoryPing {
+  user_id: number;
+  username: string;
+  team_id: number | null;
+  team_name: string | null;
+  team_color: string | null;
+  lat: number;
+  lng: number;
+  accuracy: number | null;
+  recorded_at: string;
+  received_at: string;
+}
+
+export interface LocationHistory {
+  session: number;
+  retention_days: number;
+  pings: LocationHistoryPing[];
 }
