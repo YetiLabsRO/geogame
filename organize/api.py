@@ -414,9 +414,15 @@ class CurrentSessionSerializer(serializers.Serializer):
     # Effective (Session override, else Game default) player-team-creation
     # toggle for this session.
     allow_player_team_creation = serializers.SerializerMethodField()
+    # Effective dementors-mode opt-in (mode-dementors-ble) so the player
+    # app knows whether to surface the Dementors screen.
+    dementors_enabled = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
+
+    def get_dementors_enabled(self, session):
+        return bool(session.effective('dementors_enabled'))
 
 
 class MySessionsView(APIView):
