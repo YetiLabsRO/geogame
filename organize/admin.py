@@ -5,6 +5,7 @@ from organize.models import (
     GameRole,
     Invite,
     Session,
+    TeamJoinRequest,
     TeamMembership,
     TeamRole,
     UserProfile,
@@ -13,8 +14,11 @@ from organize.models import (
 
 @admin.register(Game)
 class GameAdmin(admin.ModelAdmin):
-    list_display = ('name', 'slug', 'is_active', 'proximity_meters', 'cooloff_minutes')
-    list_filter = ('is_active',)
+    list_display = (
+        'name', 'slug', 'is_active', 'proximity_meters', 'cooloff_minutes',
+        'allow_player_team_creation', 'team_join_confirmation',
+    )
+    list_filter = ('is_active', 'allow_player_team_creation')
     search_fields = ('name', 'slug')
 
 
@@ -71,8 +75,23 @@ class TeamRoleAdmin(admin.ModelAdmin):
 
 @admin.register(Invite)
 class InviteAdmin(admin.ModelAdmin):
-    list_display = ('team', 'email', 'created_by', 'created_at', 'expires_at', 'accepted_by', 'revoked')
-    list_filter = ('revoked', 'team')
+    list_display = (
+        'team', 'email', 'kind', 'created_by', 'created_at', 'expires_at',
+        'accepted_by', 'revoked',
+    )
+    list_filter = ('revoked', 'kind', 'team')
     search_fields = ('email', 'team__name', 'token')
     autocomplete_fields = ('team', 'created_by', 'accepted_by')
     readonly_fields = ('token', 'created_at', 'accepted_at')
+
+
+@admin.register(TeamJoinRequest)
+class TeamJoinRequestAdmin(admin.ModelAdmin):
+    list_display = (
+        'team', 'user', 'status', 'source', 'requested_at',
+        'decided_by', 'decided_at',
+    )
+    list_filter = ('status', 'source', 'team')
+    search_fields = ('team__name', 'user__user__username', 'user__user__email')
+    autocomplete_fields = ('team', 'user', 'decided_by')
+    readonly_fields = ('requested_at',)

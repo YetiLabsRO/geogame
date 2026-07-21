@@ -11,3 +11,4 @@ export * from './lib/invites.service';
 export * from './lib/game-api.service';
 export * from './lib/staff-api.service';
 export * from './lib/qr-code.component';
+export * from './lib/team-formation.service';

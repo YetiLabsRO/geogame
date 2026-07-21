@@ -1259,10 +1259,12 @@ class SessionStateMigrationTest(TransactionTestCase):
 
     migrate_from = [
         ('organize', '0011_session_state'),
-        # Sibling branch head (game-config-team-rules): its NOT NULL
-        # columns exist in the test DB, so the historical project state
-        # must include it for inserts through the old model to succeed.
+        # Sibling branch heads (game-config-team-rules and
+        # player-team-formation): their NOT NULL columns exist in the
+        # test DB, so the historical project state must include them for
+        # inserts through the old model to succeed.
         ('organize', '0011_game_team_rules'),
+        ('organize', '0012_backfill_invite_kind'),
         ('game', '0021_pausewindow_teamtowerfailcounter'),
     ]
     migrate_to = [('organize', '0012_backfill_session_state')]
@@ -1601,3 +1603,882 @@ class JoinCapTest(TestCase):
         _member_user(self.team, 'seat2')
         membership = self.team.memberships.filter(is_active=True).first()
         membership.full_clean()  # editing an existing row must not trip the cap
+
+
+# ---------------------------------------------------------------------------
+# Player team formation (player-team-formation change)
+# ---------------------------------------------------------------------------
+
+import uuid  # noqa: E402
+
+from organize.models import (  # noqa: E402
+    JOIN_CONFIRM_AUTO_APPROVE,
+    JOIN_CONFIRM_CAPTAIN,
+    JOIN_CONFIRM_STAFF,
+    TeamGroup,
+    TeamJoinRequest,
+    effective_allow_player_team_creation,
+    effective_team_join_confirmation,
+)
+
+
+def _auth_client(user):
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {Token.objects.create(user=user).key}')
+    return client
+
+
+def _make_user(username, email=None, **kwargs):
+    return User.objects.create_user(
+        username=username,
+        email=email or f'{username}@example.com',
+        password='password123',
+        **kwargs,
+    )
+
+
+class TeamFormationBase(TestCase):
+    """Common fixture: an active game + session and a few users."""
+
+    def setUp(self):
+        self.game = _make_game(name='Form', slug='form')
+        self.game.is_active = True
+        self.game.save()
+        now = timezone.now()
+        # Lifecycle semantics: "open for joining" is the
+        # OPEN_FOR_PARTICIPANTS state (active + accepts roster changes).
+        self.session = Session.objects.create(
+            game=self.game, slug='default', name='Default',
+            start_time=now, end_time=now + timedelta(hours=4),
+            state=Session.OPEN_FOR_PARTICIPANTS,
+        )
+
+    def _enable_toggle(self):
+        self.game.allow_player_team_creation = True
+        self.game.save(update_fields=['allow_player_team_creation'])
+
+    def _player(self, username, session=None):
+        user = _make_user(username)
+        user.profile.current_session = session or self.session
+        user.profile.save(update_fields=['current_session'])
+        return user, _auth_client(user)
+
+    def _captain_team(self, username='cap', name='Foxes'):
+        user = _make_user(username)
+        team = Team.objects.create(
+            name=name, session=self.session, color='#123456',
+            captain=user, join_code=uuid.uuid4(),
+        )
+        TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+        user.profile.current_session = self.session
+        user.profile.save(update_fields=['current_session'])
+        return user, team, _auth_client(user)
+
+
+class ToggleResolutionTest(TeamFormationBase):
+    """9.1 — effective-value resolution for the creation toggle."""
+
+    def test_defaults_preserve_staff_only(self):
+        self.assertFalse(self.game.allow_player_team_creation)
+        self.assertIsNone(self.session.allow_player_team_creation)
+        self.assertFalse(effective_allow_player_team_creation(self.session))
+
+    def test_session_override_wins(self):
+        self.session.allow_player_team_creation = True
+        self.session.save()
+        self.assertTrue(effective_allow_player_team_creation(self.session))
+        # Game turned on but session explicitly off → off.
+        self._enable_toggle()
+        self.session.allow_player_team_creation = False
+        self.session.save()
+        self.session.refresh_from_db()
+        self.assertFalse(effective_allow_player_team_creation(self.session))
+
+    def test_null_session_value_falls_back_to_game(self):
+        self._enable_toggle()
+        self.session.refresh_from_db()
+        self.assertTrue(effective_allow_player_team_creation(self.session))
+
+    def test_effective_team_join_confirmation(self):
+        team = Team.objects.create(name='t', session=self.session, color='#111')
+        self.assertEqual(
+            effective_team_join_confirmation(team), JOIN_CONFIRM_AUTO_APPROVE,
+        )
+        self.game.team_join_confirmation = JOIN_CONFIRM_STAFF
+        self.game.save()
+        team.refresh_from_db()
+        self.assertEqual(
+            effective_team_join_confirmation(team), JOIN_CONFIRM_STAFF,
+        )
+        team.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        team.save()
+        self.assertEqual(
+            effective_team_join_confirmation(team), JOIN_CONFIRM_CAPTAIN,
+        )
+
+
+class PlayerTeamCreateAPITest(TeamFormationBase):
+    """9.2 — POST /api/teams/ player create."""
+
+    url = '/api/teams/'
+
+    def test_denied_when_toggle_off(self):
+        _, client = self._player('p1')
+        resp = client.post(self.url, {'name': 'Wolves'}, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertEqual(Team.objects.count(), 0)
+
+    def test_create_when_enabled_makes_creator_captain(self):
+        self._enable_toggle()
+        user, client = self._player('p2')
+        resp = client.post(self.url, {'name': 'Wolves'}, format='json')
+        self.assertEqual(resp.status_code, 201)
+        team = Team.objects.get(name='Wolves')
+        self.assertEqual(team.captain, user)
+        self.assertEqual(team.session, self.session)
+        self.assertIsNotNone(team.join_code)
+        self.assertTrue(team.color.startswith('#'))
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=team, user=user.profile, is_active=True,
+            ).exists()
+        )
+
+    def test_session_override_enables_creation(self):
+        self.session.allow_player_team_creation = True
+        self.session.save()
+        _, client = self._player('p3')
+        resp = client.post(self.url, {'name': 'Owls'}, format='json')
+        self.assertEqual(resp.status_code, 201)
+
+    def test_group_must_belong_to_same_game(self):
+        self._enable_toggle()
+        other_game = _make_game(name='Other', slug='other-form')
+        group = TeamGroup.objects.create(name='G', game=other_game, slug='g')
+        _, client = self._player('p4')
+        resp = client.post(
+            self.url, {'name': 'Bad', 'group': group.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_staff_can_create_regardless_of_toggle(self):
+        staff = _make_user('tf-staff', is_staff=True)
+        staff.profile.current_session = self.session
+        staff.profile.save(update_fields=['current_session'])
+        client = _auth_client(staff)
+        resp = client.post(self.url, {'name': 'StaffTeam'}, format='json')
+        self.assertEqual(resp.status_code, 201)
+        team = Team.objects.get(name='StaffTeam')
+        self.assertIsNone(team.captain)
+
+    def test_second_team_same_session_denied(self):
+        self._enable_toggle()
+        _, client = self._player('p5')
+        self.assertEqual(
+            client.post(self.url, {'name': 'One'}, format='json').status_code, 201,
+        )
+        resp = client.post(self.url, {'name': 'Two'}, format='json')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_conflicts_with_existing_membership(self):
+        self._enable_toggle()
+        user, client = self._player('p6')
+        team = Team.objects.create(name='Existing', session=self.session, color='#222')
+        TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+        resp = client.post(self.url, {'name': 'Second'}, format='json')
+        self.assertEqual(resp.status_code, 409)
+
+    def test_404_without_current_session(self):
+        self._enable_toggle()
+        user = _make_user('p7')
+        client = _auth_client(user)
+        resp = client.post(self.url, {'name': 'NoSession'}, format='json')
+        self.assertEqual(resp.status_code, 404)
+
+
+class OpenSessionSelectionTest(TeamFormationBase):
+    """Teamless players may enter an 'open' (formation-enabled) session."""
+
+    url = reverse('api-current-session')
+
+    def test_player_can_enter_open_session(self):
+        self._enable_toggle()
+        user = _make_user('walkup')
+        client = _auth_client(user)
+        resp = client.post(self.url, {'session_id': self.session.id}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        user.profile.refresh_from_db()
+        self.assertEqual(user.profile.current_session_id, self.session.id)
+
+    def test_closed_session_still_403(self):
+        user = _make_user('walkup2')
+        client = _auth_client(user)
+        resp = client.post(self.url, {'session_id': self.session.id}, format='json')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_open_session_survives_get_auto_resolve(self):
+        self._enable_toggle()
+        user, client = self._player('walkup3')
+        resp = client.get(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['id'], self.session.id)
+        self.assertTrue(resp.json()['allow_player_team_creation'])
+
+
+class JoinCodeAPITest(TeamFormationBase):
+    """Untied, rotatable/revocable team join code."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_toggle()
+        self.captain, self.team, self.captain_client = self._captain_team()
+
+    def _url(self, team=None):
+        return f'/api/teams/{(team or self.team).id}/join-code/'
+
+    def test_captain_reads_code_and_join_url(self):
+        resp = self.captain_client.get(self._url())
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['join_code'], str(self.team.join_code))
+        self.assertIn(f'/join/{self.team.join_code}', body['join_url'])
+
+    def test_rotate_supersedes_old_code(self):
+        old = self.team.join_code
+        resp = self.captain_client.post(self._url(), {'action': 'rotate'}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.team.refresh_from_db()
+        self.assertNotEqual(self.team.join_code, old)
+        self.assertEqual(resp.json()['join_code'], str(self.team.join_code))
+
+    def test_revoke_clears_code(self):
+        resp = self.captain_client.post(self._url(), {'action': 'revoke'}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        self.team.refresh_from_db()
+        self.assertIsNone(self.team.join_code)
+        self.assertIsNone(resp.json()['join_code'])
+
+    def test_unknown_action_400(self):
+        resp = self.captain_client.post(self._url(), {'action': 'meh'}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_non_captain_member_denied(self):
+        member, client = self._player('member1')
+        TeamMembership.objects.create(team=self.team, user=member.profile, is_active=True)
+        self.assertEqual(client.get(self._url()).status_code, 403)
+        self.assertEqual(
+            client.post(self._url(), {'action': 'rotate'}, format='json').status_code, 403,
+        )
+
+    def test_staff_can_manage_any_code(self):
+        staff = _make_user('code-staff', is_staff=True)
+        client = _auth_client(staff)
+        resp = client.post(self._url(), {'action': 'rotate'}, format='json')
+        self.assertEqual(resp.status_code, 200)
+
+    def test_captain_cannot_manage_other_teams_code(self):
+        _, other_team, _ = self._captain_team(username='cap2', name='Hawks')
+        resp = self.captain_client.post(
+            self._url(other_team), {'action': 'rotate'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_public_preview(self):
+        resp = self.client.get(f'/api/join-codes/{self.team.join_code}/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['team_name'], self.team.name)
+
+    def test_public_preview_404_for_revoked(self):
+        code = self.team.join_code
+        self.team.revoke_join_code()
+        resp = self.client.get(f'/api/join-codes/{code}/')
+        self.assertEqual(resp.status_code, 404)
+
+
+class JoinViaCodeTest(TeamFormationBase):
+    """9.3 / 9.5 — untied QR joins routed through the confirmation policy."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_toggle()
+        self.captain, self.team, self.captain_client = self._captain_team()
+        self.url = '/api/join-requests/'
+
+    def test_auto_approve_creates_membership(self):
+        user = _make_user('scanner')
+        client = _auth_client(user)
+        resp = client.post(
+            self.url, {'code': str(self.team.join_code)}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(body['status'], TeamJoinRequest.STATUS_APPROVED)
+        self.assertEqual(body['source'], TeamJoinRequest.SOURCE_QR)
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=self.team, user=user.profile, is_active=True,
+            ).exists()
+        )
+        user.profile.refresh_from_db()
+        self.assertEqual(user.profile.current_session_id, self.session.id)
+
+    def test_confirmation_policy_defers_membership(self):
+        self.game.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.game.save()
+        user = _make_user('scanner2')
+        client = _auth_client(user)
+        resp = client.post(
+            self.url, {'code': str(self.team.join_code)}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['status'], TeamJoinRequest.STATUS_PENDING)
+        self.assertFalse(
+            TeamMembership.objects.filter(team=self.team, user=user.profile).exists()
+        )
+
+    def test_per_team_override_wins_over_game_default(self):
+        # Game auto-approves, but this team demands captain approval.
+        self.team.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.team.save()
+        user = _make_user('scanner3')
+        client = _auth_client(user)
+        resp = client.post(
+            self.url, {'code': str(self.team.join_code)}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['status'], TeamJoinRequest.STATUS_PENDING)
+
+    def test_stale_code_404(self):
+        old = str(self.team.join_code)
+        self.team.rotate_join_code()
+        user = _make_user('scanner4')
+        client = _auth_client(user)
+        resp = client.post(self.url, {'code': old}, format='json')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_conflicting_membership_409(self):
+        user = _make_user('scanner5')
+        other = Team.objects.create(name='Rival', session=self.session, color='#333')
+        TeamMembership.objects.create(team=other, user=user.profile, is_active=True)
+        client = _auth_client(user)
+        resp = client.post(
+            self.url, {'code': str(self.team.join_code)}, format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+
+class BrowseAndRequestTest(TeamFormationBase):
+    """Browse joinable teams and request to join (source BROWSE)."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_toggle()
+        self.captain, self.team, self.captain_client = self._captain_team()
+        self.other_team = Team.objects.create(
+            name='Bears', session=self.session, color='#444',
+        )
+        self.requester, self.requester_client = self._player('req1')
+
+    def test_joinable_teams_lists_session_teams(self):
+        resp = self.requester_client.get('/api/joinable-teams/')
+        self.assertEqual(resp.status_code, 200)
+        names = {t['name'] for t in resp.json()}
+        self.assertEqual(names, {'Foxes', 'Bears'})
+        entry = next(t for t in resp.json() if t['name'] == 'Foxes')
+        self.assertEqual(entry['member_count'], 1)
+        self.assertEqual(entry['join_confirmation'], JOIN_CONFIRM_AUTO_APPROVE)
+        self.assertIsNone(entry['my_request_status'])
+
+    def test_joinable_teams_403_when_toggle_off(self):
+        self.game.allow_player_team_creation = False
+        self.game.save()
+        resp = self.requester_client.get('/api/joinable-teams/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_joinable_teams_excludes_own_team(self):
+        resp = self.captain_client.get('/api/joinable-teams/')
+        names = {t['name'] for t in resp.json()}
+        self.assertEqual(names, {'Bears'})
+
+    def test_browse_request_pending_under_captain_policy(self):
+        self.game.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.game.save()
+        resp = self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(body['status'], TeamJoinRequest.STATUS_PENDING)
+        self.assertEqual(body['source'], TeamJoinRequest.SOURCE_BROWSE)
+        self.assertFalse(
+            TeamMembership.objects.filter(
+                team=self.team, user=self.requester.profile,
+            ).exists()
+        )
+
+    def test_browse_request_auto_approves(self):
+        resp = self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['status'], TeamJoinRequest.STATUS_APPROVED)
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=self.team, user=self.requester.profile, is_active=True,
+            ).exists()
+        )
+
+    def test_duplicate_pending_request_returns_existing(self):
+        self.game.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.game.save()
+        first = self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        second = self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual(first.json()['id'], second.json()['id'])
+
+    def test_browse_request_needs_team_or_code(self):
+        resp = self.requester_client.post('/api/join-requests/', {}, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_browse_request_other_session_team_404(self):
+        other_game = _make_game(name='Elsewhere', slug='elsewhere')
+        foreign = _make_team(other_game, name='Foreign')
+        resp = self.requester_client.post(
+            '/api/join-requests/', {'team': foreign.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_already_member_400(self):
+        TeamMembership.objects.create(
+            team=self.team, user=self.requester.profile, is_active=True,
+        )
+        resp = self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_visibility_and_status_filter(self):
+        self.game.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.game.save()
+        self.requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        # Requester sees their own request.
+        own = self.requester_client.get('/api/join-requests/')
+        self.assertEqual(len(own.json()), 1)
+        # Captain sees their team's requests.
+        cap = self.captain_client.get('/api/join-requests/')
+        self.assertEqual(len(cap.json()), 1)
+        # An unrelated player sees nothing.
+        _, outsider_client = self._player('outsider')
+        self.assertEqual(outsider_client.get('/api/join-requests/').json(), [])
+        # Staff (scoped to the session) see the request; status filter works.
+        staff = _make_user('queue-staff', is_staff=True)
+        staff.profile.current_session = self.session
+        staff.profile.save(update_fields=['current_session'])
+        staff_client = _auth_client(staff)
+        self.assertEqual(len(staff_client.get('/api/join-requests/').json()), 1)
+        self.assertEqual(
+            len(staff_client.get('/api/join-requests/?status=pending').json()), 1,
+        )
+        self.assertEqual(
+            len(staff_client.get('/api/join-requests/?status=rejected').json()), 0,
+        )
+
+
+class JoinRequestDecisionTest(TeamFormationBase):
+    """9.4 / 9.6 — approve/reject lifecycle and captain scope isolation."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_toggle()
+        self.game.team_join_confirmation = JOIN_CONFIRM_CAPTAIN
+        self.game.save()
+        self.captain, self.team, self.captain_client = self._captain_team()
+        self.requester, requester_client = self._player('req2')
+        resp = requester_client.post(
+            '/api/join-requests/', {'team': self.team.id}, format='json',
+        )
+        self.request_id = resp.json()['id']
+        self.requester_client = requester_client
+
+    def _approve_url(self, pk=None):
+        return f'/api/join-requests/{pk or self.request_id}/approve/'
+
+    def _reject_url(self, pk=None):
+        return f'/api/join-requests/{pk or self.request_id}/reject/'
+
+    def test_captain_approval_creates_membership(self):
+        resp = self.captain_client.post(self._approve_url())
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['status'], TeamJoinRequest.STATUS_APPROVED)
+        self.assertEqual(body['decided_by_username'], 'cap')
+        self.assertIsNotNone(body['decided_at'])
+        self.assertTrue(
+            TeamMembership.objects.filter(
+                team=self.team, user=self.requester.profile, is_active=True,
+            ).exists()
+        )
+
+    def test_captain_rejection_creates_no_membership(self):
+        resp = self.captain_client.post(self._reject_url())
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['status'], TeamJoinRequest.STATUS_REJECTED)
+        self.assertFalse(
+            TeamMembership.objects.filter(
+                team=self.team, user=self.requester.profile,
+            ).exists()
+        )
+
+    def test_requester_cannot_decide_own_request(self):
+        self.assertEqual(
+            self.requester_client.post(self._approve_url()).status_code, 403,
+        )
+
+    def test_other_captain_cannot_decide(self):
+        _, _, other_captain_client = self._captain_team(username='cap3', name='Kites')
+        self.assertEqual(
+            other_captain_client.post(self._approve_url()).status_code, 403,
+        )
+        self.assertEqual(
+            other_captain_client.post(self._reject_url()).status_code, 403,
+        )
+
+    def test_staff_can_decide(self):
+        staff = _make_user('decider', is_staff=True)
+        client = _auth_client(staff)
+        resp = client.post(self._approve_url())
+        self.assertEqual(resp.status_code, 200)
+
+    def test_double_decision_conflicts(self):
+        self.captain_client.post(self._approve_url())
+        self.assertEqual(
+            self.captain_client.post(self._approve_url()).status_code, 409,
+        )
+        self.assertEqual(
+            self.captain_client.post(self._reject_url()).status_code, 409,
+        )
+
+    def test_approval_conflicts_when_requester_joined_elsewhere(self):
+        other = Team.objects.create(name='Else', session=self.session, color='#555')
+        TeamMembership.objects.create(
+            team=other, user=self.requester.profile, is_active=True,
+        )
+        resp = self.captain_client.post(self._approve_url())
+        self.assertEqual(resp.status_code, 409)
+        jr = TeamJoinRequest.objects.get(pk=self.request_id)
+        self.assertEqual(jr.status, TeamJoinRequest.STATUS_PENDING)
+
+
+class InviteKindTest(TeamFormationBase):
+    """9.3 — untied QR invites vs recipient-bound LINK invites."""
+
+    def setUp(self):
+        super().setUp()
+        self.team = Team.objects.create(name='Kind', session=self.session, color='#666')
+        self.staff = _make_user('kind-staff', is_staff=True)
+        self.staff.profile.current_session = self.session
+        self.staff.profile.save(update_fields=['current_session'])
+        self.staff_client = _auth_client(self.staff)
+
+    def test_default_kind_is_qr(self):
+        invite = Invite.objects.create(team=self.team, created_by=self.staff)
+        self.assertEqual(invite.kind, Invite.KIND_QR)
+        self.assertFalse(invite.is_recipient_bound())
+
+    def test_link_invite_requires_email_on_create(self):
+        resp = self.staff_client.post(
+            reverse('api-invites'),
+            {'team': self.team.id, 'kind': 'LINK'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_qr_invite_accepted_by_anyone(self):
+        invite = Invite.objects.create(team=self.team, created_by=self.staff)
+        stranger = _make_user('stranger')
+        client = _auth_client(stranger)
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['membership_status'], 'ACTIVE')
+
+    def test_link_invite_403_for_mismatched_account(self):
+        invite = Invite.objects.create(
+            team=self.team, created_by=self.staff,
+            email='bound@example.com', kind=Invite.KIND_LINK,
+        )
+        interloper = _make_user('interloper', email='other@example.com')
+        client = _auth_client(interloper)
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 403)
+        invite.refresh_from_db()
+        self.assertIsNone(invite.accepted_at)
+
+    def test_link_invite_accepted_by_bound_recipient(self):
+        invite = Invite.objects.create(
+            team=self.team, created_by=self.staff,
+            email='Bound@Example.com', kind=Invite.KIND_LINK,
+        )
+        recipient = _make_user('recipient', email='bound@example.com')
+        client = _auth_client(recipient)
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['membership_status'], 'ACTIVE')
+
+    def test_link_invite_anon_signup_must_use_bound_email(self):
+        invite = Invite.objects.create(
+            team=self.team, created_by=self.staff,
+            email='bound2@example.com', kind=Invite.KIND_LINK,
+        )
+        resp = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'sneak', 'email': 'sneak@example.com', 'password': 'password12345'},
+            content_type='application/json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        self.assertFalse(User.objects.filter(username='sneak').exists())
+        ok = self.client.post(
+            reverse('api-invite-accept', args=[invite.token]),
+            {'username': 'legit', 'email': 'bound2@example.com', 'password': 'password12345'},
+            content_type='application/json',
+        )
+        self.assertEqual(ok.status_code, 200)
+
+    def test_preview_reports_kind_and_binding(self):
+        invite = Invite.objects.create(
+            team=self.team, created_by=self.staff,
+            email='bound3@example.com', kind=Invite.KIND_LINK,
+        )
+        resp = self.client.get(reverse('api-invite-preview', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['kind'], 'LINK')
+        self.assertTrue(body['recipient_bound'])
+
+    def test_accept_defers_to_pending_when_confirmation_required(self):
+        self.game.team_join_confirmation = JOIN_CONFIRM_STAFF
+        self.game.save()
+        invite = Invite.objects.create(team=self.team, created_by=self.staff)
+        joiner = _make_user('joiner')
+        client = _auth_client(joiner)
+        resp = client.post(reverse('api-invite-accept', args=[invite.token]))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['membership_status'], 'PENDING')
+        self.assertIsNotNone(body['join_request_id'])
+        self.assertFalse(
+            TeamMembership.objects.filter(team=self.team, user=joiner.profile).exists()
+        )
+        jr = TeamJoinRequest.objects.get(pk=body['join_request_id'])
+        self.assertEqual(jr.source, TeamJoinRequest.SOURCE_QR)
+        invite.refresh_from_db()
+        self.assertIsNotNone(invite.accepted_at)
+
+
+class CaptainInviteManagementTest(TeamFormationBase):
+    """6.1 — captains manage their own team's invites when enabled."""
+
+    def setUp(self):
+        super().setUp()
+        self._enable_toggle()
+        self.captain, self.team, self.captain_client = self._captain_team()
+        _, self.other_team, _ = self._captain_team(username='cap-b', name='Storks')
+
+    def test_captain_creates_invite_for_own_team(self):
+        resp = self.captain_client.post(
+            reverse('api-invites'), {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['kind'], 'QR')
+
+    def test_captain_denied_when_toggle_off(self):
+        self.game.allow_player_team_creation = False
+        self.game.save()
+        resp = self.captain_client.post(
+            reverse('api-invites'), {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_captain_cannot_invite_for_other_team(self):
+        resp = self.captain_client.post(
+            reverse('api-invites'), {'team': self.other_team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_captain_list_scoped_to_own_team(self):
+        Invite.objects.create(team=self.team, created_by=self.captain)
+        Invite.objects.create(team=self.other_team, created_by=self.captain)
+        resp = self.captain_client.get(reverse('api-invites'))
+        self.assertEqual(resp.status_code, 200)
+        teams = {i['team'] for i in resp.json()}
+        self.assertEqual(teams, {self.team.id})
+
+    def test_captain_revokes_own_invite(self):
+        invite = Invite.objects.create(team=self.team, created_by=self.captain)
+        resp = self.captain_client.delete(
+            reverse('api-invite-destroy', args=[invite.id]),
+        )
+        self.assertEqual(resp.status_code, 204)
+        invite.refresh_from_db()
+        self.assertTrue(invite.revoked)
+
+    def test_captain_cannot_revoke_other_teams_invite(self):
+        invite = Invite.objects.create(team=self.other_team, created_by=self.captain)
+        resp = self.captain_client.delete(
+            reverse('api-invite-destroy', args=[invite.id]),
+        )
+        self.assertEqual(resp.status_code, 404)
+        invite.refresh_from_db()
+        self.assertFalse(invite.revoked)
+
+    def test_captain_resends_own_email_invite(self):
+        invite = Invite.objects.create(
+            team=self.team, created_by=self.captain,
+            email='friend@example.com', kind=Invite.KIND_LINK,
+        )
+        resp = self.captain_client.post(reverse('api-invite-resend', args=[invite.id]))
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(len(mail.outbox), 1)
+
+    def test_plain_member_cannot_create_invites(self):
+        member, client = self._player('plainmember')
+        TeamMembership.objects.create(team=self.team, user=member.profile, is_active=True)
+        resp = client.post(
+            reverse('api-invites'), {'team': self.team.id}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+class ShuffleBalanceTest(TeamFormationBase):
+    """9.7 — staff shuffle / balanced team building."""
+
+    def setUp(self):
+        super().setUp()
+        self.staff = _make_user('mixer', is_staff=True)
+        self.staff.profile.current_session = self.session
+        self.staff.profile.save(update_fields=['current_session'])
+        self.staff_client = _auth_client(self.staff)
+
+    def _unassigned(self, username, attributes=None):
+        user = _make_user(username)
+        user.profile.current_session = self.session
+        if attributes is not None:
+            user.profile.attributes = attributes
+        user.profile.save()
+        return user
+
+    def _shuffle(self, payload):
+        return self.staff_client.post(
+            f'/api/staff/sessions/{self.session.id}/shuffle-teams/',
+            payload, format='json',
+        )
+
+    def _balance(self, payload):
+        return self.staff_client.post(
+            f'/api/staff/sessions/{self.session.id}/balance-teams/',
+            payload, format='json',
+        )
+
+    def test_shuffle_distributes_all_unassigned(self):
+        for i in range(7):
+            self._unassigned(f'sh{i}')
+        resp = self._shuffle({'team_count': 3})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['assigned'], 7)
+        self.assertEqual(len(body['teams']), 3)
+        sizes = sorted(len(t['members']) for t in body['teams'])
+        self.assertEqual(sizes, [2, 2, 3])
+        self.assertEqual(
+            TeamMembership.objects.filter(
+                team__session=self.session, is_active=True,
+            ).count(),
+            7,
+        )
+
+    def test_shuffle_skips_already_assigned_players(self):
+        assigned = self._unassigned('taken')
+        team = Team.objects.create(name='Set', session=self.session, color='#777')
+        TeamMembership.objects.create(team=team, user=assigned.profile, is_active=True)
+        self._unassigned('free')
+        resp = self._shuffle({'team_count': 1})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.json()['assigned'], 1)
+        self.assertEqual(resp.json()['teams'][0]['members'], ['free'])
+
+    def test_shuffle_requires_team_count(self):
+        self._unassigned('lonely')
+        self.assertEqual(self._shuffle({}).status_code, 400)
+
+    def test_shuffle_400_with_no_unassigned_players(self):
+        self.assertEqual(self._shuffle({'team_count': 2}).status_code, 400)
+
+    def test_shuffle_requires_staff(self):
+        _, player_client = self._player('nobody')
+        resp = player_client.post(
+            f'/api/staff/sessions/{self.session.id}/shuffle-teams/',
+            {'team_count': 2}, format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+    def test_balance_spreads_attribute_buckets(self):
+        for i in range(3):
+            self._unassigned(f'young{i}', attributes={'age': 'young'})
+        for i in range(3):
+            self._unassigned(f'old{i}', attributes={'age': 'old'})
+        resp = self._balance({'team_count': 3, 'attribute_keys': ['age']})
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['assigned'], 6)
+        for team in body['teams']:
+            self.assertEqual(len(team['members']), 2)
+            ages = {
+                UserProfile.objects.get(user__username=m).attributes['age']
+                for m in team['members']
+            }
+            self.assertEqual(ages, {'young', 'old'})
+
+    def test_balance_requires_keys(self):
+        self._unassigned('kv')
+        self.assertEqual(self._balance({'team_count': 2}).status_code, 400)
+
+
+class EffectiveConfigPayloadTest(TeamFormationBase):
+    """1.4 — effective values surface on /api/me/ and current-session."""
+
+    def test_current_session_payload_carries_toggle_and_policy(self):
+        self.session.allow_player_team_creation = True
+        self.session.save()
+        TeamGroup.objects.create(name='Cubs', game=self.game, slug='cubs')
+        _, client = self._player('payload')
+        resp = client.get(reverse('api-current-session'))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body['allow_player_team_creation'])
+        self.assertFalse(body['game']['allow_player_team_creation'])
+        self.assertEqual(body['game']['team_join_confirmation'], JOIN_CONFIRM_AUTO_APPROVE)
+        self.assertEqual(
+            body['game']['team_groups'], [{'id': TeamGroup.objects.get().id, 'name': 'Cubs', 'slug': 'cubs'}],
+        )
+
+    def test_me_payload_carries_effective_toggle_and_captaincy(self):
+        self._enable_toggle()
+        _, _, client = self._captain_team(username='me-cap', name='MeTeam')
+        resp = client.get(reverse('api-me'))
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body['allow_player_team_creation'])
+        self.assertEqual(body['captain_of_team_id'], body['active_team_id'])
+
+    def test_me_toggle_false_without_session(self):
+        user = _make_user('sessionless')
+        client = _auth_client(user)
+        body = client.get(reverse('api-me')).json()
+        self.assertFalse(body['allow_player_team_creation'])
+        self.assertIsNone(body['captain_of_team_id'])

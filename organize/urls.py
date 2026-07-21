@@ -27,4 +27,34 @@ urlpatterns = [
     path('invites/<uuid:token>/', api.invite_preview, name='api-invite-preview'),
     path('invites/<int:pk>/', api.InviteDestroy.as_view(), name='api-invite-destroy'),
     path('invites/<int:pk>/resend/', api.invite_resend, name='api-invite-resend'),
+    # Team formation (player-team-formation change). The teams/<pk>/…
+    # route intentionally lives here: the DRF router registered at
+    # api/teams/ never matches the extra /join-code/ suffix, so URL
+    # resolution falls through to this include.
+    path(
+        'teams/<int:pk>/join-code/',
+        api.TeamJoinCodeView.as_view(),
+        name='api-team-join-code',
+    ),
+    path(
+        'join-codes/<uuid:code>/',
+        api.join_code_preview,
+        name='api-join-code-preview',
+    ),
+    path('joinable-teams/', api.JoinableTeamsView.as_view(), name='api-joinable-teams'),
+    path(
+        'join-requests/',
+        api.JoinRequestListCreateView.as_view(),
+        name='api-join-requests',
+    ),
+    path(
+        'join-requests/<int:pk>/approve/',
+        api.join_request_approve,
+        name='api-join-request-approve',
+    ),
+    path(
+        'join-requests/<int:pk>/reject/',
+        api.join_request_reject,
+        name='api-join-request-reject',
+    ),
 ]

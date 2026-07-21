@@ -28,6 +28,8 @@ export interface UserProfile {
   active_team_id: number | null;
   active_roles: ActiveRole[];
   is_staff: boolean;
+  allow_player_team_creation: boolean;
+  captain_of_team_id: number | null;
 }
 
 @Injectable({ providedIn: 'root' })

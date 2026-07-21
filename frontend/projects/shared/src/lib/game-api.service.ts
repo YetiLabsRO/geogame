@@ -55,6 +55,9 @@ export interface GameConfig {
   proximity_meters: number;
   cooloff_minutes: number;
   initial_bonus_default: number;
+  allow_player_team_creation: boolean;
+  team_join_confirmation: string;
+  team_groups: { id: number; name: string; slug: string }[];
 }
 
 export interface CurrentSession {
@@ -67,6 +70,7 @@ export interface CurrentSession {
   start_time: string;
   end_time: string;
   game: GameConfig;
+  allow_player_team_creation: boolean;
 }
 
 export interface ZoneFeature {

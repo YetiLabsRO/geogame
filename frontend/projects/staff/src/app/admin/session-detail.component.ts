@@ -20,6 +20,7 @@ import {
   SessionTransitionAction,
   StaffApiService,
   StartReadiness,
+  TeamBuildResult,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -327,6 +328,18 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
                 </select>
               </div>
             }
+            <div class="mb-2">
+              <label class="form-label small mb-0">Players may create teams</label>
+              <select
+                class="form-select form-select-sm"
+                [ngModel]="teamFormationOverride()"
+                (ngModelChange)="setTeamFormationOverride($event)"
+              >
+                <option [ngValue]="null">Inherit</option>
+                <option [ngValue]="true">On</option>
+                <option [ngValue]="false">Off</option>
+              </select>
+            </div>
           </div>
           <div class="col-md-6">
             @for (n of numOverrides; track n.field) {
@@ -372,6 +385,80 @@ const OVERRIDE_FIELDS: (keyof Phase10Overrides)[] = [
           <div class="small text-danger mt-1">{{ msg }}</div>
         }
       }
+
+      <!-- Team building (shuffle / balance) -------------------------------- -->
+      <h2 class="h5 mt-4 mb-2">Team building</h2>
+      <div class="card mb-4">
+        <div class="card-body">
+          <p class="text-body-secondary small">
+            Distribute unassigned players (players in this session without a
+            team) into new teams. Best-effort — edit the result on the
+            <a routerLink="/teams">Teams</a> page before the session starts.
+          </p>
+          <div class="row g-2 align-items-end">
+            <div class="col-auto">
+              <label class="form-label small mb-0" for="team-count">Number of teams</label>
+              <input
+                id="team-count"
+                class="form-control form-control-sm"
+                type="number"
+                min="1"
+                [ngModel]="buildCount()"
+                (ngModelChange)="buildCount.set($event)"
+              />
+            </div>
+            <div class="col-auto">
+              <button
+                type="button"
+                class="btn btn-sm btn-outline-primary"
+                [disabled]="buildBusy() || !buildCount()"
+                (click)="shuffleTeams()"
+              >
+                <i class="bi bi-shuffle"></i> Random shuffle
+              </button>
+            </div>
+            <div class="col-auto">
+              <label class="form-label small mb-0" for="balance-keys">
+                Balance by attribute keys (comma-separated)
+              </label>
+              <input
+                id="balance-keys"
+                class="form-control form-control-sm"
+                type="text"
+                placeholder="e.g. age_group, experience"
+                [ngModel]="buildKeys()"
+                (ngModelChange)="buildKeys.set($event)"
+              />
+            </div>
+            <div class="col-auto">
+              <button
+                type="button"
+                class="btn btn-sm btn-outline-primary"
+                [disabled]="buildBusy() || !buildCount() || !buildKeys().trim()"
+                (click)="balanceTeams()"
+              >
+                <i class="bi bi-sliders"></i> Balanced build
+              </button>
+            </div>
+          </div>
+          @if (buildError(); as msg) {
+            <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
+          }
+          @if (buildResult(); as res) {
+            <div class="alert alert-success py-2 mt-2 mb-2">
+              Assigned {{ res.assigned }} player(s) into {{ res.teams.length }} team(s).
+            </div>
+            <ul class="list-group">
+              @for (t of res.teams; track t.id) {
+                <li class="list-group-item py-1 small">
+                  <span class="fw-semibold">{{ t.name }}</span>:
+                  {{ t.members.join(', ') || '—' }}
+                </li>
+              }
+            </ul>
+          }
+        </div>
+      </div>
 
       <!-- Ownership timeline ----------------------------------------------- -->
       <h2 class="h5 mt-4 mb-2">Ownership timeline</h2>
@@ -446,6 +533,13 @@ export class StaffSessionDetailComponent {
   protected readonly readiness = signal<StartReadiness | null>(null);
 
   protected readonly override = signal<Phase10Overrides>(blankOverrides());
+  protected readonly teamFormationOverride = signal<boolean | null>(null);
+
+  protected readonly buildCount = signal<number | null>(null);
+  protected readonly buildKeys = signal('');
+  protected readonly buildBusy = signal(false);
+  protected readonly buildError = signal<string | null>(null);
+  protected readonly buildResult = signal<TeamBuildResult | null>(null);
   protected readonly overrideDirty = signal(false);
   protected readonly overrideSaving = signal(false);
   protected readonly overrideError = signal<string | null>(null);
@@ -497,6 +591,7 @@ export class StaffSessionDetailComponent {
   private setSession(s: AdminSession): void {
     this.session.set(s);
     this.override.set(pickOverrides(s));
+    this.teamFormationOverride.set(s.allow_player_team_creation);
     this.overrideDirty.set(false);
     this.refreshReadiness();
   }
@@ -627,11 +722,48 @@ export class StaffSessionDetailComponent {
     this.overrideDirty.set(true);
   }
 
+  protected setTeamFormationOverride(value: boolean | null): void {
+    this.teamFormationOverride.set(value);
+    this.overrideDirty.set(true);
+  }
+
+  protected shuffleTeams(): void {
+    this.runBuild(this.staff.shuffleTeams(this.sessionId, this.buildCount() ?? 0));
+  }
+
+  protected balanceTeams(): void {
+    const keys = this.buildKeys()
+      .split(',')
+      .map((k) => k.trim())
+      .filter((k) => k.length > 0);
+    this.runBuild(this.staff.balanceTeams(this.sessionId, this.buildCount() ?? 0, keys));
+  }
+
+  private runBuild(call: ReturnType<StaffApiService['shuffleTeams']>): void {
+    this.buildBusy.set(true);
+    this.buildError.set(null);
+    this.buildResult.set(null);
+    call.subscribe({
+      next: (res) => {
+        this.buildBusy.set(false);
+        this.buildResult.set(res);
+        this.reloadState();
+      },
+      error: (err) => {
+        this.buildBusy.set(false);
+        this.buildError.set(extractErrorMessage(err));
+      },
+    });
+  }
+
   protected saveOverrides(id: number): void {
     if (!this.overrideDirty() || this.overrideSaving()) return;
     this.overrideSaving.set(true);
     this.overrideError.set(null);
-    const payload: AdminSessionPayload = { ...this.override() };
+    const payload: AdminSessionPayload = {
+      ...this.override(),
+      allow_player_team_creation: this.teamFormationOverride(),
+    };
     this.staff.updateSession(id, payload).subscribe({
       next: (s) => {
         this.overrideSaving.set(false);

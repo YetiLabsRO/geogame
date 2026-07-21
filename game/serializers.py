@@ -67,6 +67,9 @@ class TeamSerializer(serializers.ModelSerializer):
     active_member_count = serializers.SerializerMethodField()
     is_ready = serializers.SerializerMethodField()
     members_needed = serializers.SerializerMethodField()
+    # Optional on create — the viewset fills in a random color for
+    # player-created teams (team-formation capability).
+    color = serializers.CharField(required=False)
 
     class Meta:
         model = Team

@@ -4,10 +4,14 @@ import { Observable, tap } from 'rxjs';
 
 import { AuthService } from './auth.service';
 
+export type InviteKind = 'QR' | 'LINK';
+
 export interface InvitePreview {
   team_name: string;
   team_group: string;
   expires_at: string;
+  kind: InviteKind;
+  recipient_bound: boolean;
 }
 
 export interface InviteAcceptResponse {
@@ -16,6 +20,8 @@ export interface InviteAcceptResponse {
   username: string;
   team_id: number;
   team_name: string;
+  membership_status: 'ACTIVE' | 'PENDING';
+  join_request_id: number | null;
 }
 
 export interface InviteAcceptPayload {
@@ -34,6 +40,7 @@ export interface Invite {
   team: number;
   team_name: string;
   email: string | null;
+  kind: InviteKind;
   created_by: number | null;
   created_by_username: string | null;
   created_at: string;
@@ -47,6 +54,7 @@ export interface Invite {
 export interface InviteCreatePayload {
   team: number;
   email?: string;
+  kind?: InviteKind;
 }
 
 @Injectable({ providedIn: 'root' })
