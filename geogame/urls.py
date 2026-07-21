@@ -56,6 +56,13 @@ from game.multipliers_api import (
     SessionScoreMultiplierListCreate,
     SessionScoreMultiplierToggle,
 )
+from game.proximity_api import (
+    DementorMeView,
+    ProximityCapabilityView,
+    ProximityIdentityView,
+    ProximityReportView,
+    StaffDementorTotalsView,
+)
 from game.trail_api import (
     AdminTrailEdgeViewSet,
     AdminTrailStepViewSet,
@@ -235,6 +242,28 @@ urlpatterns = [
         'api/sessions/<int:pk>/score-multipliers/active/',
         SessionActiveMultipliersView.as_view(),
         name='api-session-active-multipliers',
+    ),
+    # BLE proximity substrate + dementors mode (mode-dementors-ble).
+    path(
+        'api/proximity/identity/',
+        ProximityIdentityView.as_view(),
+        name='api-proximity-identity',
+    ),
+    path(
+        'api/proximity/reports/',
+        ProximityReportView.as_view(),
+        name='api-proximity-reports',
+    ),
+    path(
+        'api/proximity/capability/',
+        ProximityCapabilityView.as_view(),
+        name='api-proximity-capability',
+    ),
+    path('api/dementors/me/', DementorMeView.as_view(), name='api-dementors-me'),
+    path(
+        'api/staff/dementors/session/<int:pk>/totals/',
+        StaffDementorTotalsView.as_view(),
+        name='api-staff-dementor-totals',
     ),
     path('api/staff/', include(admin_router.urls)),
     path(

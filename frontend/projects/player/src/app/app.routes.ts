@@ -51,6 +51,12 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'dementors',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./dementors/dementors.component').then((m) => m.DementorsComponent),
+  },
+  {
     path: 'team',
     canActivate: [authGuard],
     loadComponent: () =>

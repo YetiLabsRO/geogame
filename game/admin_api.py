@@ -1153,6 +1153,23 @@ TEAM_RULE_FIELDS = (
     'min_teams', 'max_teams', 'min_members_per_team', 'max_members_per_team',
 )
 
+# BLE proximity substrate + dementors mode knobs (mode-dementors-ble):
+# Game defaults with nullable Session overrides, same shape as the
+# Phase-10 knobs above.
+DEMENTOR_BLE_FIELDS = (
+    'require_ble_capable', 'ble_report_interval_seconds',
+    'ble_scan_duty_cycle_percent', 'ble_freshness_window_seconds',
+    'ble_identity_rotation_minutes', 'ble_rssi_very_close_dbm',
+    'ble_rssi_near_dbm', 'ble_rssi_hysteresis_db',
+    'dementors_enabled', 'dementor_initial_dementors',
+    'dementor_starting_energy', 'dementor_drain_per_second',
+    'dementor_drain_range_bucket', 'dementor_empty_outcome',
+    'dementor_safety_in_numbers', 'dementor_reverse_group_size',
+    'dementor_reverse_hold_seconds', 'dementor_conversion_threshold',
+    'dementor_restore_per_second', 'dementor_wizard_regen_per_second',
+    'dementor_tick_seconds',
+)
+
 
 def _validate_team_rules(resolved):
     """Shared team-rule sanity checks for the Game and Session serializers.
@@ -1239,6 +1256,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'nfc_secure_mode', 'nfc_require_app', 'nfc_replay_hardening',
             # Tower-locking knobs (default FREE_FOR_ALL = today's behavior).
             'tower_lock_mode', 'tower_lock_finish_minutes',
+            # BLE proximity + dementors mode defaults (mode-dementors-ble).
+            *DEMENTOR_BLE_FIELDS,
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -1417,6 +1436,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'tower_lock_mode', 'tower_lock_finish_minutes',
             # Game-mode override (mode-trail-discovery; null = inherit).
             'mode',
+            # BLE proximity + dementors overrides (null = inherit).
+            *DEMENTOR_BLE_FIELDS,
             'created_at',
         )
         read_only_fields = (

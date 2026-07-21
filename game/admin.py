@@ -14,12 +14,17 @@ from game.models import (
     NFC_MODE_SECURE_TOKEN,
     Challenge,
     Collection,
+    DementorFlip,
+    DementorState,
     LocationConsent,
     LocationPing,
     NfcTag,
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    ProximityEvent,
+    ProximityIdentity,
+    ProximityReport,
     ScoreMultiplier,
     TagScan,
     TeamTowerChallenge,
@@ -461,7 +466,45 @@ class ScoreMultiplierAdmin(admin.ModelAdmin):
 
 admin.site.register(ScoreMultiplier, ScoreMultiplierAdmin)
 admin.site.register(Collection, CollectionAdmin)
+
+
+class ProximityIdentityAdmin(admin.ModelAdmin):
+    list_display = ('token', 'player', 'session', 'active', 'issued_at', 'rotates_at', 'retired_at')
+    list_filter = ('session', 'active')
+    search_fields = ('token', 'player__user__username')
+
+
+class ProximityReportAdmin(admin.ModelAdmin):
+    list_display = ('id', 'player', 'session', 'received_at', 'observation_count')
+    list_filter = ('session',)
+    readonly_fields = ('observations',)
+
+    def observation_count(self, obj):
+        return len(obj.observations)
+
+
+class ProximityEventAdmin(admin.ModelAdmin):
+    list_display = ('id', 'session', 'player_a', 'player_b', 'distance_bucket', 'confidence', 'corroborated', 'derived_at')
+    list_filter = ('session', 'distance_bucket', 'corroborated')
+
+
+class DementorStateAdmin(admin.ModelAdmin):
+    list_display = ('player', 'session', 'role', 'energy', 'alive', 'last_delta', 'last_tick_at')
+    list_filter = ('session', 'role', 'alive')
+    search_fields = ('player__user__username',)
+
+
+class DementorFlipAdmin(admin.ModelAdmin):
+    list_display = ('state', 'from_role', 'to_role', 'cause', 'happened_at')
+    list_filter = ('cause',)
+
+
 admin.site.register(Zone, ZoneAdmin)
+admin.site.register(ProximityIdentity, ProximityIdentityAdmin)
+admin.site.register(ProximityReport, ProximityReportAdmin)
+admin.site.register(ProximityEvent, ProximityEventAdmin)
+admin.site.register(DementorState, DementorStateAdmin)
+admin.site.register(DementorFlip, DementorFlipAdmin)
 admin.site.register(Tower, TowerAdmin)
 admin.site.register(TowerPhoto, TowerPhotoAdmin)
 admin.site.register(Team, TeamAdmin)

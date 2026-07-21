@@ -425,6 +425,9 @@ class CurrentSessionSerializer(serializers.Serializer):
     push_notifications_enabled = serializers.SerializerMethodField()
     # Effective game mode (mode-trail-discovery): DOMINATION or TRAIL.
     mode = serializers.SerializerMethodField()
+    # Effective dementors-mode opt-in (mode-dementors-ble) so the player
+    # app knows whether to surface the Dementors screen.
+    dementors_enabled = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
@@ -445,6 +448,9 @@ class CurrentSessionSerializer(serializers.Serializer):
 
     def get_mode(self, session):
         return effective_mode(session)
+
+    def get_dementors_enabled(self, session):
+        return bool(session.effective('dementors_enabled'))
 
 
 class MySessionsView(APIView):

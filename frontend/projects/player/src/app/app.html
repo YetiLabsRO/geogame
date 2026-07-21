@@ -10,6 +10,7 @@
       <a class="nav-link small" routerLink="/settings" title="Notification settings">
         <i class="bi bi-bell"></i>
       </a>
+      <a class="nav-link small" routerLink="/dementors">Dementors</a>
       @if (captainTeamId(); as teamId) {
         <a class="nav-link small" [routerLink]="['/team', teamId, 'requests']">My team</a>
       }

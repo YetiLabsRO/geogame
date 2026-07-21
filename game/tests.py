@@ -52,7 +52,12 @@ from game.challenge_types import (
     TYPE_TEXT,
     get_handler,
 )
-from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links
+from game.dementors import assign_initial_roles, economy_tick, run_tick
+from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links  # mode-dementors-ble
+    FLIP_CAUSE_CONVERSION,
+    FLIP_CAUSE_DIED,
+    FLIP_CAUSE_DRAINED,
+    FLIP_CAUSE_REVERSE_GAME,
     KNOWLEDGE_ALL_KNOWN,
     KNOWLEDGE_NONE_KNOWN,
     KNOWLEDGE_ONE_KNOWN,
@@ -66,12 +71,17 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     STRUCTURE_GRAPH,
     Challenge,
     Collection,
+    DementorFlip,
+    DementorState,
     LocationConsent,
     LocationPing,
     NfcTag,
     PauseWindow,
     PresenceCheck,
     PresenceRequirement,
+    ProximityEvent,
+    ProximityIdentity,
+    ProximityReport,
     ScoreMultiplier,
     TagScan,
     TeamTowerChallenge,
@@ -90,10 +100,22 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     effective_tower_factor,
     effective_zone_factor,
 )
+from game.proximity import (
+    CONFIDENCE_CORROBORATED,
+    CONFIDENCE_ONE_WAY,
+    MAX_OBSERVATIONS_PER_REPORT,
+    clean_observations,
+    derive_proximity,
+    rssi_to_bucket,
+)
 from geogame.asgi import application as asgi_application
-from organize.models import (  # mode-trail-discovery
+from organize.models import (  # mode-trail-discovery  # mode-dementors-ble
+    DEMENTOR_EMPTY_DIE,
     MODE_DOMINATION,
     MODE_TRAIL,
+    PROXIMITY_BUCKET_FAR,
+    PROXIMITY_BUCKET_NEAR,
+    PROXIMITY_BUCKET_VERY_CLOSE,
     TOWER_LOCK_FREE_FOR_ALL,
     TOWER_LOCK_ON_INITIATE,
     Game,
@@ -9113,3 +9135,915 @@ class ScoreMultiplierApiTest(TestCase):
         boosts = resp.json()['active_multipliers']
         self.assertEqual(len(boosts), 1)
         self.assertEqual(boosts[0]['label'], 'Double points now')
+
+
+# ---------------------------------------------------------------------------
+# BLE proximity substrate + dementors mode (mode-dementors-ble)
+# ---------------------------------------------------------------------------
+
+
+def _make_player(team, username):
+    """Create a user with an active membership on `team`, pinned to its session."""
+    user = User.objects.create_user(
+        username=username, email=f'{username}@example.com', password='password123',
+    )
+    TeamMembership.objects.create(team=team, user=user.profile, is_active=True)
+    user.profile.current_session = team.session
+    user.profile.save(update_fields=['current_session'])
+    return user.profile
+
+
+def _client_for(profile):
+    token = Token.objects.create(user=profile.user)
+    client = APIClient()
+    client.credentials(HTTP_AUTHORIZATION=f'Token {token.key}')
+    return client
+
+
+def _proximity_setup(n_players=2, name='Dementors Game'):
+    """Game + RUNNING session + one team + `n_players` roster members."""
+    game = _make_game(name)
+    group = _make_group(game)
+    team = _make_team(game, group, name='park-team')
+    players = [_make_player(team, f'player{i}') for i in range(n_players)]
+    return game, team.session, team, players
+
+
+def _identity_for(session, profile, token=None):
+    identity = ProximityIdentity.issue(session, profile)
+    if token is not None:
+        ProximityIdentity.objects.filter(pk=identity.pk).update(token=token)
+        identity.refresh_from_db()
+    return identity
+
+
+def _report(session, identity, observations, received_at=None):
+    """Create a ProximityReport, optionally pinning received_at."""
+    report = ProximityReport.objects.create(
+        session=session,
+        reporter=identity,
+        player=identity.player,
+        observations=observations,
+    )
+    if received_at is not None:
+        ProximityReport.objects.filter(pk=report.pk).update(received_at=received_at)
+        report.refresh_from_db()
+    return report
+
+
+def _pair_event(session, a, b, bucket, derived_at=None):
+    """Unsaved ProximityEvent for feeding economy_tick directly."""
+    lo, hi = sorted([a.pk, b.pk])
+    return ProximityEvent(
+        session=session,
+        player_a_id=lo,
+        player_b_id=hi,
+        distance_bucket=bucket,
+        confidence=CONFIDENCE_CORROBORATED,
+        corroborated=True,
+        derived_at=derived_at or timezone.now(),
+    )
+
+
+def _state(session, profile, role, energy, last_tick_at=None, **kwargs):
+    return DementorState.objects.create(
+        session=session,
+        player=profile,
+        role=role,
+        energy=energy,
+        last_tick_at=last_tick_at,
+        **kwargs,
+    )
+
+
+class RssiBucketTest(TestCase):
+    """T7.1 — RSSI→bucket mapping and hysteresis (no metres, ever)."""
+
+    KW = dict(very_close_dbm=-55, near_dbm=-75)
+
+    def test_basic_mapping(self):
+        self.assertEqual(rssi_to_bucket(-40, **self.KW), PROXIMITY_BUCKET_VERY_CLOSE)
+        self.assertEqual(rssi_to_bucket(-55, **self.KW), PROXIMITY_BUCKET_VERY_CLOSE)
+        self.assertEqual(rssi_to_bucket(-60, **self.KW), PROXIMITY_BUCKET_NEAR)
+        self.assertEqual(rssi_to_bucket(-75, **self.KW), PROXIMITY_BUCKET_NEAR)
+        self.assertEqual(rssi_to_bucket(-90, **self.KW), PROXIMITY_BUCKET_FAR)
+
+    def test_hysteresis_keeps_previous_bucket_near_boundary(self):
+        # -58 alone is NEAR, but a pair previously VERY_CLOSE stays put
+        # until the signal drops beyond the shifted boundary.
+        self.assertEqual(rssi_to_bucket(-58, **self.KW), PROXIMITY_BUCKET_NEAR)
+        self.assertEqual(
+            rssi_to_bucket(-58, **self.KW, hysteresis_db=5,
+                           previous=PROXIMITY_BUCKET_VERY_CLOSE),
+            PROXIMITY_BUCKET_VERY_CLOSE,
+        )
+        # And a pair previously NEAR needs to beat the raised threshold
+        # to be promoted.
+        self.assertEqual(
+            rssi_to_bucket(-52, **self.KW, hysteresis_db=5,
+                           previous=PROXIMITY_BUCKET_NEAR),
+            PROXIMITY_BUCKET_NEAR,
+        )
+        self.assertEqual(
+            rssi_to_bucket(-48, **self.KW, hysteresis_db=5,
+                           previous=PROXIMITY_BUCKET_NEAR),
+            PROXIMITY_BUCKET_VERY_CLOSE,
+        )
+
+    def test_hysteresis_prevents_oscillation(self):
+        # A signal wobbling ±2 dB around the -55 boundary settles into
+        # one bucket instead of flapping.
+        bucket = rssi_to_bucket(-54, **self.KW)
+        for rssi in (-56, -54, -57, -53, -56):
+            bucket = rssi_to_bucket(
+                rssi, **self.KW, hysteresis_db=5, previous=bucket,
+            )
+            self.assertEqual(bucket, PROXIMITY_BUCKET_VERY_CLOSE)
+
+    def test_far_promotion_needs_margin(self):
+        self.assertEqual(
+            rssi_to_bucket(-73, **self.KW, hysteresis_db=5,
+                           previous=PROXIMITY_BUCKET_FAR),
+            PROXIMITY_BUCKET_FAR,
+        )
+        self.assertEqual(
+            rssi_to_bucket(-68, **self.KW, hysteresis_db=5,
+                           previous=PROXIMITY_BUCKET_FAR),
+            PROXIMITY_BUCKET_NEAR,
+        )
+
+
+class ProximityIdentityApiTest(TestCase):
+    """T7.1 — ephemeral advertising identity issuance and rotation."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(1)
+        self.profile = self.players[0]
+        self.client_a = _client_for(self.profile)
+
+    def test_issues_opaque_token(self):
+        resp = self.client_a.post('/api/proximity/identity/', {}, format='json')
+        self.assertEqual(resp.status_code, 200)
+        token = resp.json()['token']
+        self.assertEqual(len(token), 8)
+        self.assertNotIn(self.profile.user.username, token)
+        identity = ProximityIdentity.objects.get(token=token)
+        self.assertEqual(identity.player, self.profile)
+        self.assertTrue(identity.active)
+        self.assertIn('report_interval_seconds', resp.json())
+
+    def test_reissue_is_stable_until_rotation(self):
+        first = self.client_a.post('/api/proximity/identity/', {}, format='json').json()
+        second = self.client_a.post('/api/proximity/identity/', {}, format='json').json()
+        self.assertEqual(first['token'], second['token'])
+        self.assertFalse(second['rotated'])
+
+    def test_explicit_rotation_retires_old_token(self):
+        first = self.client_a.post('/api/proximity/identity/', {}, format='json').json()
+        second = self.client_a.post(
+            '/api/proximity/identity/', {'rotate': True}, format='json',
+        ).json()
+        self.assertNotEqual(first['token'], second['token'])
+        self.assertTrue(second['rotated'])
+        old = ProximityIdentity.objects.get(token=first['token'])
+        self.assertFalse(old.active)
+        self.assertIsNotNone(old.retired_at)
+        self.assertEqual(
+            ProximityIdentity.objects.filter(
+                session=self.session, player=self.profile, active=True,
+            ).count(),
+            1,
+        )
+
+    def test_elapsed_rotation_interval_rotates(self):
+        first = self.client_a.post('/api/proximity/identity/', {}, format='json').json()
+        ProximityIdentity.objects.filter(token=first['token']).update(
+            rotates_at=timezone.now() - timedelta(seconds=1),
+        )
+        second = self.client_a.post('/api/proximity/identity/', {}, format='json').json()
+        self.assertNotEqual(first['token'], second['token'])
+        self.assertTrue(second['rotated'])
+
+    def test_requires_a_current_session(self):
+        loner = User.objects.create_user(
+            username='loner', email='loner@example.com', password='password123',
+        )
+        client = _client_for(loner.profile)
+        resp = client.post('/api/proximity/identity/', {}, format='json')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_ble_gate_refuses_failed_self_check(self):
+        self.game.require_ble_capable = True
+        self.game.save(update_fields=['require_ble_capable'])
+        self.profile.attributes['ble_capable'] = False
+        self.profile.save(update_fields=['attributes'])
+        resp = self.client_a.post('/api/proximity/identity/', {}, format='json')
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn('BLE', resp.json()['detail'])
+
+
+class ProximityReportApiTest(TestCase):
+    """T7.1/T7.2 — report ingestion: unknown tokens, caps, rate limits."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(2)
+        self.alice, self.bob = self.players
+        self.client_a = _client_for(self.alice)
+        self.identity_a = _identity_for(self.session, self.alice, token='aaaa0001')
+        self.identity_b = _identity_for(self.session, self.bob, token='bbbb0001')
+
+    def _post(self, observations):
+        return self.client_a.post(
+            '/api/proximity/reports/', {'observations': observations}, format='json',
+        )
+
+    def test_ingests_a_valid_batch(self):
+        resp = self._post([{'token': 'bbbb0001', 'rssi': -60}])
+        self.assertEqual(resp.status_code, 201)
+        body = resp.json()
+        self.assertEqual(body['recorded'], 1)
+        self.assertEqual(body['discarded'], 0)
+        report = ProximityReport.objects.get(pk=body['id'])
+        self.assertEqual(report.player, self.alice)
+        self.assertEqual(report.observations, [{'token': 'bbbb0001', 'rssi': -60}])
+        # Ingestion triggered the tick: the pair got derived.
+        self.assertGreaterEqual(body['events_derived'], 1)
+
+    def test_unknown_tokens_are_discarded_not_fatal(self):
+        resp = self._post([
+            {'token': 'bbbb0001', 'rssi': -60},
+            {'token': 'ffffffff', 'rssi': -60},
+        ])
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['recorded'], 1)
+        self.assertEqual(resp.json()['discarded'], 1)
+
+    def test_malformed_and_self_observations_are_discarded(self):
+        resp = self._post([
+            'not-a-dict',
+            {'rssi': -60},
+            {'token': 'bbbb0001', 'rssi': 'loud'},
+            {'token': 'bbbb0001', 'rssi': -300},
+            {'token': 'aaaa0001', 'rssi': -60},  # self-sighting
+        ])
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.json()['recorded'], 0)
+        self.assertEqual(resp.json()['discarded'], 5)
+
+    def test_recently_rotated_token_still_resolves(self):
+        ProximityIdentity.issue(self.session, self.bob)  # rotates bbbb0001 out
+        resp = self._post([{'token': 'bbbb0001', 'rssi': -60}])
+        self.assertEqual(resp.json()['recorded'], 1)
+
+    def test_long_expired_token_is_discarded(self):
+        ProximityIdentity.issue(self.session, self.bob)
+        window = self.session.effective('ble_freshness_window_seconds')
+        ProximityIdentity.objects.filter(token='bbbb0001').update(
+            retired_at=timezone.now() - timedelta(seconds=window + 120),
+        )
+        resp = self._post([{'token': 'bbbb0001', 'rssi': -60}])
+        self.assertEqual(resp.json()['recorded'], 0)
+        self.assertEqual(resp.json()['discarded'], 1)
+
+    def test_reporting_without_identity_is_rejected(self):
+        client_b = _client_for(self.bob)
+        ProximityIdentity.objects.filter(player=self.bob).update(
+            active=False, retired_at=timezone.now(),
+        )
+        resp = client_b.post(
+            '/api/proximity/reports/',
+            {'observations': [{'token': 'aaaa0001', 'rssi': -60}]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 409)
+
+    def test_rate_limit_refuses_implausible_cadence(self):
+        for _ in range(3):
+            self.assertEqual(self._post([]).status_code, 201)
+        resp = self._post([])
+        self.assertEqual(resp.status_code, 429)
+
+    def test_batch_size_cap(self):
+        raw = [{'token': f'zz{i:06d}', 'rssi': -60} for i in range(200)]
+        kept, discarded = clean_observations(raw)
+        self.assertEqual(len(kept), MAX_OBSERVATIONS_PER_REPORT)
+        self.assertEqual(discarded, 200 - MAX_OBSERVATIONS_PER_REPORT)
+
+
+class ProximityDerivationTest(TestCase):
+    """T7.1/T7.2 — pair fusion, confidence, staleness, plausibility."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(3)
+        self.alice, self.bob, self.carol = self.players
+        self.ia = _identity_for(self.session, self.alice, token='aaaa0001')
+        self.ib = _identity_for(self.session, self.bob, token='bbbb0001')
+        self.ic = _identity_for(self.session, self.carol, token='cccc0001')
+        # Derivation reference instant, slightly ahead of the wall clock
+        # so reports auto-stamped during the test fall inside the window.
+        self.now = timezone.now() + timedelta(seconds=1)
+
+    def test_one_event_per_pair_with_corroboration_boost(self):
+        _report(self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -60}])
+        _report(self.session, self.ib, [{'token': 'aaaa0001', 'rssi': -58}])
+        events = derive_proximity(self.session, now=self.now)
+        self.assertEqual(len(events), 1)
+        event = events[0]
+        self.assertTrue(event.corroborated)
+        self.assertEqual(event.confidence, CONFIDENCE_CORROBORATED)
+        self.assertEqual(event.distance_bucket, PROXIMITY_BUCKET_NEAR)
+        self.assertEqual(
+            sorted([event.player_a_id, event.player_b_id]),
+            sorted([self.alice.pk, self.bob.pk]),
+        )
+
+    def test_one_directional_report_still_yields_an_event(self):
+        _report(self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -60}])
+        events = derive_proximity(self.session, now=self.now)
+        self.assertEqual(len(events), 1)
+        self.assertFalse(events[0].corroborated)
+        self.assertEqual(events[0].confidence, CONFIDENCE_ONE_WAY)
+
+    def test_stale_reports_derive_nothing(self):
+        window = self.session.effective('ble_freshness_window_seconds')
+        _report(
+            self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -60}],
+            received_at=self.now - timedelta(seconds=window + 5),
+        )
+        self.assertEqual(derive_proximity(self.session, now=self.now), [])
+
+    def test_only_latest_report_per_player_counts(self):
+        _report(
+            self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -60}],
+            received_at=self.now - timedelta(seconds=10),
+        )
+        _report(
+            self.session, self.ia, [],
+            received_at=self.now - timedelta(seconds=2),
+        )
+        self.assertEqual(derive_proximity(self.session, now=self.now), [])
+
+    def test_impossible_crowd_is_filtered_out(self):
+        crowd = [{'token': f'gg{i:06d}', 'rssi': -60} for i in range(81)]
+        crowd.append({'token': 'bbbb0001', 'rssi': -60})
+        _report(self.session, self.ia, crowd)
+        # Alice's implausible report is dropped wholesale…
+        self.assertEqual(derive_proximity(self.session, now=self.now), [])
+        # …but a plausible report from someone else still derives.
+        _report(self.session, self.ic, [{'token': 'bbbb0001', 'rssi': -70}])
+        events = derive_proximity(
+            self.session, now=self.now + timedelta(seconds=1),
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(
+            sorted([events[0].player_a_id, events[0].player_b_id]),
+            sorted([self.bob.pk, self.carol.pk]),
+        )
+
+    def test_hysteresis_uses_previous_pass_bucket(self):
+        _report(self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -54}])
+        first = derive_proximity(self.session, now=self.now)
+        self.assertEqual(first[0].distance_bucket, PROXIMITY_BUCKET_VERY_CLOSE)
+        # -58 raw is NEAR, but with the pair previously VERY_CLOSE and
+        # 5 dB hysteresis it stays VERY_CLOSE.
+        later = self.now + timedelta(seconds=5)
+        _report(
+            self.session, self.ia, [{'token': 'bbbb0001', 'rssi': -58}],
+            received_at=later,
+        )
+        second = derive_proximity(self.session, now=later)
+        self.assertEqual(second[0].distance_bucket, PROXIMITY_BUCKET_VERY_CLOSE)
+
+
+class DementorEconomyTest(TestCase):
+    """T7.3 — drain, groups, flips, reverse game, conversion, staleness."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(4)
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        self.w1, self.w2, self.w3, self.d1 = self.players
+        self.t0 = timezone.now()
+
+    def _tick(self, events, seconds=10):
+        return economy_tick(
+            self.session, events, now=self.t0 + timedelta(seconds=seconds),
+        )
+
+    def test_dementor_in_range_drains_wizard(self):
+        state = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 90.0)
+        self.assertAlmostEqual(state.last_delta, -10.0)
+
+    def test_out_of_range_bucket_does_not_drain(self):
+        state = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_FAR)])
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0)
+        self.assertAlmostEqual(state.last_delta, 0.0)
+
+    def test_stale_tick_applies_no_drain(self):
+        state = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([])  # no fresh events at all
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0)
+
+    def test_elapsed_time_is_clamped_to_freshness_window(self):
+        window = self.session.effective('ble_freshness_window_seconds')
+        state = _state(
+            self.session, self.w1, DementorState.WIZARD, 100,
+            self.t0 - timedelta(seconds=1000),
+        )
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick(
+            [_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)],
+            seconds=0,
+        )
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0 - window)
+
+    def test_safety_in_numbers_divides_drain(self):
+        s1 = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        s2 = _state(self.session, self.w2, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([
+            _pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR),
+            _pair_event(self.session, self.w2, self.d1, PROXIMITY_BUCKET_NEAR),
+            _pair_event(self.session, self.w1, self.w2, PROXIMITY_BUCKET_NEAR),
+        ])
+        s1.refresh_from_db()
+        s2.refresh_from_db()
+        # Two clustered wizards each take half the drain.
+        self.assertAlmostEqual(s1.energy, 95.0)
+        self.assertAlmostEqual(s2.energy, 95.0)
+
+    def test_area_drain_hits_everyone_at_full_rate(self):
+        self.session.dementor_safety_in_numbers = False
+        self.session.save(update_fields=['dementor_safety_in_numbers'])
+        s1 = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        s2 = _state(self.session, self.w2, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([
+            _pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR),
+            _pair_event(self.session, self.w2, self.d1, PROXIMITY_BUCKET_NEAR),
+            _pair_event(self.session, self.w1, self.w2, PROXIMITY_BUCKET_NEAR),
+        ])
+        s1.refresh_from_db()
+        s2.refresh_from_db()
+        self.assertAlmostEqual(s1.energy, 90.0)
+        self.assertAlmostEqual(s2.energy, 90.0)
+
+    def test_lone_wizard_drains_faster_than_group(self):
+        lone = _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        lone.refresh_from_db()
+        lone_drop = 100 - lone.energy
+        self.assertAlmostEqual(lone_drop, 10.0)  # vs 5.0 in the pair test
+
+    def test_full_drain_flips_wizard_to_dementor(self):
+        state = _state(self.session, self.w1, DementorState.WIZARD, 5, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        state.refresh_from_db()
+        self.assertEqual(state.role, DementorState.DEMENTOR)
+        self.assertTrue(state.alive)
+        self.assertAlmostEqual(state.energy, 0.0)
+        flip = DementorFlip.objects.get(state=state)
+        self.assertEqual(flip.cause, FLIP_CAUSE_DRAINED)
+        self.assertEqual(flip.from_role, DementorState.WIZARD)
+        self.assertEqual(flip.to_role, DementorState.DEMENTOR)
+
+    def test_die_on_empty_marks_out_of_play(self):
+        self.session.dementor_empty_outcome = DEMENTOR_EMPTY_DIE
+        self.session.save(update_fields=['dementor_empty_outcome'])
+        state = _state(self.session, self.w1, DementorState.WIZARD, 5, self.t0)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        state.refresh_from_db()
+        self.assertFalse(state.alive)
+        self.assertEqual(state.role, DementorState.WIZARD)
+        self.assertEqual(DementorFlip.objects.get(state=state).cause, FLIP_CAUSE_DIED)
+
+    def test_reverse_numbers_game_flips_held_dementor(self):
+        self.session.dementor_reverse_group_size = 3
+        self.session.dementor_reverse_hold_seconds = 30
+        self.session.save(update_fields=[
+            'dementor_reverse_group_size', 'dementor_reverse_hold_seconds',
+        ])
+        for w in (self.w1, self.w2, self.w3):
+            _state(self.session, w, DementorState.WIZARD, 100, self.t0)
+        dementor = _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        surround = [
+            _pair_event(self.session, w, self.d1, PROXIMITY_BUCKET_NEAR)
+            for w in (self.w1, self.w2, self.w3)
+        ]
+        self._tick(surround, seconds=10)  # hold starts
+        dementor.refresh_from_db()
+        self.assertIsNotNone(dementor.hold_started_at)
+        self.assertEqual(dementor.role, DementorState.DEMENTOR)
+        self._tick(surround, seconds=45)  # 35s of continuous hold ≥ 30s
+        dementor.refresh_from_db()
+        self.assertEqual(dementor.role, DementorState.WIZARD)
+        self.assertAlmostEqual(
+            dementor.energy, self.session.effective('dementor_starting_energy'),
+        )
+        flip = DementorFlip.objects.get(state=dementor)
+        self.assertEqual(flip.cause, FLIP_CAUSE_REVERSE_GAME)
+
+    def test_hold_resets_when_group_shrinks(self):
+        self.session.dementor_reverse_group_size = 3
+        self.session.dementor_reverse_hold_seconds = 30
+        self.session.save(update_fields=[
+            'dementor_reverse_group_size', 'dementor_reverse_hold_seconds',
+        ])
+        for w in (self.w1, self.w2, self.w3):
+            _state(self.session, w, DementorState.WIZARD, 100, self.t0)
+        dementor = _state(self.session, self.d1, DementorState.DEMENTOR, 0, self.t0)
+        surround = [
+            _pair_event(self.session, w, self.d1, PROXIMITY_BUCKET_NEAR)
+            for w in (self.w1, self.w2, self.w3)
+        ]
+        self._tick(surround, seconds=10)
+        self._tick(surround[:2], seconds=20)  # one wizard peels off
+        dementor.refresh_from_db()
+        self.assertIsNone(dementor.hold_started_at)
+        self._tick(surround, seconds=45)  # back to 3, but the clock restarted
+        dementor.refresh_from_db()
+        self.assertEqual(dementor.role, DementorState.DEMENTOR)
+
+    def test_conversion_threshold_flips_dementor_back(self):
+        self.session.dementor_reverse_group_size = 1
+        self.session.dementor_reverse_hold_seconds = 3600  # keep reverse out of it
+        self.session.dementor_restore_per_second = 1.0
+        self.session.dementor_conversion_threshold = 100.0
+        self.session.save(update_fields=[
+            'dementor_reverse_group_size', 'dementor_reverse_hold_seconds',
+            'dementor_restore_per_second', 'dementor_conversion_threshold',
+        ])
+        _state(self.session, self.w1, DementorState.WIZARD, 100, self.t0)
+        dementor = _state(self.session, self.d1, DementorState.DEMENTOR, 95, self.t0)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        dementor.refresh_from_db()
+        self.assertEqual(dementor.role, DementorState.WIZARD)
+        self.assertGreaterEqual(dementor.energy, 100.0)
+        flip = DementorFlip.objects.get(state=dementor)
+        self.assertEqual(flip.cause, FLIP_CAUSE_CONVERSION)
+
+    def test_wizard_regen_when_no_dementor_near(self):
+        self.session.dementor_wizard_regen_per_second = 0.5
+        self.session.save(update_fields=['dementor_wizard_regen_per_second'])
+        state = _state(self.session, self.w1, DementorState.WIZARD, 50, self.t0)
+        self._tick([])
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 55.0)
+        self.assertAlmostEqual(state.last_delta, 5.0)
+        # Regen never exceeds starting energy.
+        state.energy = 99.0
+        state.last_tick_at = self.t0
+        state.save()
+        economy_tick(self.session, [], now=self.t0 + timedelta(seconds=10))
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0)
+
+    def test_first_tick_only_stamps_bookkeeping(self):
+        state = _state(self.session, self.w1, DementorState.WIZARD, 100, None)
+        _state(self.session, self.d1, DementorState.DEMENTOR, 0, None)
+        self._tick([_pair_event(self.session, self.w1, self.d1, PROXIMITY_BUCKET_NEAR)])
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0)
+        self.assertIsNotNone(state.last_tick_at)
+
+    def test_run_tick_without_mode_leaves_states_alone(self):
+        self.game.dementors_enabled = False
+        self.game.save(update_fields=['dementors_enabled'])
+        state = _state(
+            self.session, self.w1, DementorState.WIZARD, 100,
+            self.t0 - timedelta(seconds=10),
+        )
+        run_tick(self.session, now=self.t0)
+        state.refresh_from_db()
+        self.assertAlmostEqual(state.energy, 100.0)
+        # Economy bookkeeping untouched — the tick never ran for it.
+        self.assertEqual(state.last_tick_at, self.t0 - timedelta(seconds=10))
+
+
+class DementorLifecycleTest(TestCase):
+    """T3.3 — initial role assignment and the session-start hook."""
+
+    def test_assign_initial_roles_splits_roster(self):
+        game, session, team, players = _proximity_setup(5, name='Roles Game')
+        game.dementors_enabled = True
+        game.dementor_initial_dementors = 2
+        game.save(update_fields=['dementors_enabled', 'dementor_initial_dementors'])
+        assign_initial_roles(session)
+        states = DementorState.objects.filter(session=session)
+        self.assertEqual(states.count(), 5)
+        dementors = states.filter(role=DementorState.DEMENTOR)
+        wizards = states.filter(role=DementorState.WIZARD)
+        self.assertEqual(dementors.count(), 2)
+        self.assertEqual(wizards.count(), 3)
+        for state in dementors:
+            self.assertEqual(state.energy, 0.0)
+        for state in wizards:
+            self.assertEqual(state.energy, 100.0)
+
+    def test_assign_initial_roles_is_idempotent(self):
+        game, session, team, players = _proximity_setup(3, name='Idem Game')
+        game.dementors_enabled = True
+        game.save(update_fields=['dementors_enabled'])
+        assign_initial_roles(session)
+        first = set(DementorState.objects.filter(session=session).values_list('pk', flat=True))
+        assign_initial_roles(session)
+        second = set(DementorState.objects.filter(session=session).values_list('pk', flat=True))
+        self.assertEqual(first, second)
+
+    def test_session_start_seeds_dementor_states(self):
+        game, session, team, players = _proximity_setup(2, name='Start Game')
+        game.dementors_enabled = True
+        game.save(update_fields=['dementors_enabled'])
+        session.state = Session.OPEN_FOR_PARTICIPANTS
+        session.save(update_fields=['state'])
+        session.transition('start')
+        self.assertEqual(session.state, Session.RUNNING)
+        self.assertEqual(
+            DementorState.objects.filter(session=session).count(), 2,
+        )
+
+    def test_session_start_without_mode_seeds_nothing(self):
+        game, session, team, players = _proximity_setup(2, name='Plain Game')
+        session.state = Session.OPEN_FOR_PARTICIPANTS
+        session.save(update_fields=['state'])
+        session.transition('start')
+        self.assertEqual(DementorState.objects.filter(session=session).count(), 0)
+
+
+class DementorApiTest(TestCase):
+    """T5.1/T5.2 — player /me/ endpoint and staff totals feed."""
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(3)
+        self.game.dementors_enabled = True
+        self.game.save(update_fields=['dementors_enabled'])
+        self.wizard, self.other, self.dementor = self.players
+        _state(self.session, self.wizard, DementorState.WIZARD, 80,
+               timezone.now(), last_delta=-2.5)
+        _state(self.session, self.other, DementorState.WIZARD, 100, timezone.now())
+        _state(self.session, self.dementor, DementorState.DEMENTOR, 10,
+               timezone.now(), last_delta=1.0)
+        self.client_w = _client_for(self.wizard)
+
+    def test_me_reports_role_energy_and_trend(self):
+        resp = self.client_w.get('/api/dementors/me/')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertEqual(body['role'], 'WIZARD')
+        self.assertEqual(body['energy'], 80.0)
+        self.assertEqual(body['starting_energy'], 100.0)
+        self.assertEqual(body['trend'], 'DRAINING')
+        self.assertTrue(body['alive'])
+        self.assertTrue(body['reports_stale'])  # no report submitted yet
+
+    def test_me_reports_fresh_after_reporting(self):
+        _identity_for(self.session, self.wizard, token='aaaa0002')
+        self.client_w.post(
+            '/api/proximity/reports/', {'observations': []}, format='json',
+        )
+        resp = self.client_w.get('/api/dementors/me/')
+        self.assertFalse(resp.json()['reports_stale'])
+
+    def test_me_404_when_mode_disabled(self):
+        self.game.dementors_enabled = False
+        self.game.save(update_fields=['dementors_enabled'])
+        self.assertEqual(self.client_w.get('/api/dementors/me/').status_code, 404)
+
+    def test_me_404_without_state(self):
+        DementorState.objects.filter(player=self.wizard).delete()
+        self.assertEqual(self.client_w.get('/api/dementors/me/').status_code, 404)
+
+    def test_device_cannot_assert_its_own_energy(self):
+        # There is no write path: POSTing to /me/ is rejected outright,
+        # and report payload fields like "energy" are ignored.
+        resp = self.client_w.post(
+            '/api/dementors/me/', {'energy': 9999}, format='json',
+        )
+        self.assertEqual(resp.status_code, 405)
+        _identity_for(self.session, self.wizard, token='aaaa0003')
+        self.client_w.post(
+            '/api/proximity/reports/',
+            {'observations': [], 'energy': 9999, 'role': 'DEMENTOR'},
+            format='json',
+        )
+        state = DementorState.objects.get(player=self.wizard)
+        self.assertEqual(state.energy, 80.0)
+        self.assertEqual(state.role, DementorState.WIZARD)
+
+    def test_staff_totals_counts_roles(self):
+        staff_client, _ = _staff_client(session=self.session, username='dstaff')
+        resp = staff_client.get(
+            f'/api/staff/dementors/session/{self.session.id}/totals/',
+        )
+        self.assertEqual(resp.status_code, 200)
+        body = resp.json()
+        self.assertTrue(body['enabled'])
+        self.assertEqual(body['totals'], {
+            'wizards': 2, 'dementors': 1, 'out_of_play': 0,
+        })
+        self.assertEqual(len(body['players']), 3)
+        by_name = {p['username']: p for p in body['players']}
+        self.assertEqual(by_name['player2']['role'], 'DEMENTOR')
+        self.assertEqual(by_name['player0']['team'], 'park-team')
+
+    def test_staff_totals_tracks_out_of_play(self):
+        DementorState.objects.filter(player=self.other).update(alive=False)
+        staff_client, _ = _staff_client(session=self.session, username='dstaff2')
+        body = staff_client.get(
+            f'/api/staff/dementors/session/{self.session.id}/totals/',
+        ).json()
+        self.assertEqual(body['totals'], {
+            'wizards': 1, 'dementors': 1, 'out_of_play': 1,
+        })
+
+    def test_staff_totals_requires_staff(self):
+        resp = self.client_w.get(
+            f'/api/staff/dementors/session/{self.session.id}/totals/',
+        )
+        self.assertEqual(resp.status_code, 403)
+
+
+class DementorConfigOverrideTest(TestCase):
+    """T7.4 — Session overrides beat Game defaults for every new knob."""
+
+    OVERRIDES = {
+        'require_ble_capable': True,
+        'ble_report_interval_seconds': 7,
+        'ble_scan_duty_cycle_percent': 40,
+        'ble_freshness_window_seconds': 90,
+        'ble_identity_rotation_minutes': 3,
+        'ble_rssi_very_close_dbm': -50,
+        'ble_rssi_near_dbm': -70,
+        'ble_rssi_hysteresis_db': 8,
+        'dementors_enabled': True,
+        'dementor_initial_dementors': 4,
+        'dementor_starting_energy': 250.0,
+        'dementor_drain_per_second': 2.5,
+        'dementor_drain_range_bucket': PROXIMITY_BUCKET_VERY_CLOSE,
+        'dementor_empty_outcome': DEMENTOR_EMPTY_DIE,
+        'dementor_safety_in_numbers': False,
+        'dementor_reverse_group_size': 5,
+        'dementor_reverse_hold_seconds': 120,
+        'dementor_conversion_threshold': 300.0,
+        'dementor_restore_per_second': 3.5,
+        'dementor_wizard_regen_per_second': 0.25,
+        'dementor_tick_seconds': 2,
+    }
+
+    def setUp(self):
+        self.game, self.session, self.team, self.players = _proximity_setup(1)
+
+    def test_defaults_inherit_from_game(self):
+        for field in self.OVERRIDES:
+            with self.subTest(field=field):
+                self.assertIsNone(getattr(self.session, field))
+                self.assertEqual(
+                    self.session.effective(field), getattr(self.game, field),
+                )
+
+    def test_session_override_beats_game_default(self):
+        for field, value in self.OVERRIDES.items():
+            setattr(self.session, field, value)
+        self.session.save()
+        session = Session.objects.get(pk=self.session.pk)
+        for field, value in self.OVERRIDES.items():
+            with self.subTest(field=field):
+                self.assertNotEqual(value, getattr(self.game, field))
+                self.assertEqual(session.effective(field), value)
+
+    def test_capability_endpoint_admits_and_refuses(self):
+        client = _client_for(self.players[0])
+        # Not required: a non-BLE phone is admitted (but flagged).
+        resp = client.post(
+            '/api/proximity/capability/', {'ble_capable': False}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.json()['admitted'])
+        # Required: the same phone is refused with a clear message.
+        self.session.require_ble_capable = True
+        self.session.save(update_fields=['require_ble_capable'])
+        resp = client.post(
+            '/api/proximity/capability/', {'ble_capable': False}, format='json',
+        )
+        self.assertFalse(resp.json()['admitted'])
+        self.assertIn('BLE', resp.json()['detail'])
+        # A capable phone passes the gate.
+        resp = client.post(
+            '/api/proximity/capability/', {'ble_capable': True}, format='json',
+        )
+        self.assertTrue(resp.json()['admitted'])
+
+    def test_capability_validates_payload(self):
+        client = _client_for(self.players[0])
+        resp = client.post(
+            '/api/proximity/capability/', {'ble_capable': 'yes'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class DementorSwarmTest(TestCase):
+    """T7.5 — ~100-identity simulated swarm: tick correctness + bounds."""
+
+    N = 100
+    NEIGHBORS = 5  # each phone hears the next 5 identities in a ring
+
+    def test_hundred_player_tick(self):
+        import time as time_module
+
+        game, session, team, players = _proximity_setup(0, name='Swarm Game')
+        game.dementors_enabled = True
+        game.dementor_initial_dementors = 10
+        game.save(update_fields=['dementors_enabled', 'dementor_initial_dementors'])
+
+        profiles = []
+        for i in range(self.N):
+            user = User(username=f'swarm{i:03d}', email=f'swarm{i:03d}@example.com')
+            user.set_unusable_password()
+            user.save()
+            TeamMembership.objects.create(
+                team=team, user=user.profile, is_active=True,
+            )
+            profiles.append(user.profile)
+
+        identities = [
+            ProximityIdentity.objects.create(
+                session=session, player=profile, token=f'sw{i:06x}',
+            )
+            for i, profile in enumerate(profiles)
+        ]
+        assign_initial_roles(session)
+        self.assertEqual(
+            DementorState.objects.filter(session=session).count(), self.N,
+        )
+        self.assertEqual(
+            DementorState.objects.filter(
+                session=session, role=DementorState.DEMENTOR,
+            ).count(),
+            10,
+        )
+        # Backdate the tick bookkeeping so the swarm tick applies 10s.
+        t0 = timezone.now()
+        DementorState.objects.filter(session=session).update(
+            last_tick_at=t0 - timedelta(seconds=10),
+        )
+
+        for i, identity in enumerate(identities):
+            observations = [
+                {
+                    'token': identities[(i + k) % self.N].token,
+                    'rssi': -60 - k,
+                }
+                for k in range(1, self.NEIGHBORS + 1)
+            ]
+            _report(session, identity, observations)
+
+        started = time_module.monotonic()
+        events = run_tick(session)
+        elapsed = time_module.monotonic() - started
+
+        # Ring topology: every (i, i+k) pair for k ≤ 5 exists exactly once.
+        self.assertEqual(len(events), self.N * self.NEIGHBORS)
+        for event in events:
+            self.assertLess(event.player_a_id, event.player_b_id)
+        # All fused pairs were seen from both sides? No — only k ≤ 5 both
+        # ways when i sees i+k and i+k sees i+2k…; assert confidences are
+        # within the defined set rather than a fixed split.
+        self.assertTrue(all(
+            event.confidence in (CONFIDENCE_ONE_WAY, CONFIDENCE_CORROBORATED)
+            for event in events
+        ))
+        # Economy ran: wizards adjacent to a dementor lost energy.
+        states = {
+            s.player_id: s
+            for s in DementorState.objects.filter(session=session)
+        }
+        adjacency = {pid: set() for pid in states}
+        for event in events:
+            adjacency[event.player_a_id].add(event.player_b_id)
+            adjacency[event.player_b_id].add(event.player_a_id)
+        dementor_ids = {
+            pid for pid, s in states.items() if s.role == DementorState.DEMENTOR
+        }
+        drained = [
+            s for pid, s in states.items()
+            if s.role == DementorState.WIZARD and adjacency[pid] & dementor_ids
+        ]
+        flipped = DementorFlip.objects.filter(state__session=session).count()
+        self.assertTrue(drained or flipped)
+        for state in drained:
+            self.assertLess(state.energy, 100.0)
+        # Loose CI-safe performance bound for one full tick at 100 phones.
+        self.assertLess(elapsed, 10.0)

@@ -2335,3 +2335,249 @@ def active_multipliers_for_session(session, at=None):
         .select_related('tower', 'zone')
     )
     return [m for m in candidates if m.is_in_effect(at=at, session=session)]
+
+
+# ---------------------------------------------------------------------------
+# BLE proximity substrate (ble-proximity capability)
+# ---------------------------------------------------------------------------
+
+# Flip/convert causes recorded on DementorFlip (mode-dementors).
+FLIP_CAUSE_DRAINED = 'DRAINED'
+FLIP_CAUSE_DIED = 'DIED'
+FLIP_CAUSE_REVERSE_GAME = 'REVERSE_GAME'
+FLIP_CAUSE_CONVERSION = 'CONVERSION'
+FLIP_CAUSE_CHOICES = [
+    (FLIP_CAUSE_DRAINED, 'Wizard drained to empty — flipped to dementor'),
+    (FLIP_CAUSE_DIED, 'Wizard drained to empty — out of play'),
+    (FLIP_CAUSE_REVERSE_GAME, 'Held by a wizard group — flipped to wizard'),
+    (FLIP_CAUSE_CONVERSION, 'Energy crossed the conversion threshold'),
+]
+
+
+def _generate_proximity_token():
+    """Short opaque token a phone can fit in a BLE advertising payload.
+
+    8 hex chars (4 random bytes). Carries no user identity — the
+    token→player mapping lives only server-side (ProximityIdentity).
+    """
+    import secrets
+    return secrets.token_hex(4)
+
+
+class ProximityIdentity(models.Model):
+    """Per-player, per-session ephemeral BLE advertising identity.
+
+    The phone advertises `token` over BLE; peers report the tokens they
+    hear. Tokens are opaque and MAY rotate (`rotates_at`); a retired
+    token stays resolvable for the freshness window (via `retired_at`)
+    so in-flight reports still fuse, then goes dark — replaying an old
+    token cannot be farmed indefinitely.
+    """
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='proximity_identities',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, related_name='proximity_identities',
+    )
+    token = models.CharField(max_length=16, unique=True, default=_generate_proximity_token)
+    active = models.BooleanField(default=True)
+    issued_at = models.DateTimeField(auto_now_add=True)
+    rotates_at = models.DateTimeField(null=True, blank=True)
+    retired_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'player'],
+                condition=models.Q(active=True),
+                name='unique_active_proximity_identity',
+            ),
+        ]
+
+    def __str__(self):
+        state = 'active' if self.active else 'retired'
+        return f'ProximityIdentity({self.player}, {self.token}, {state})'
+
+    @classmethod
+    def issue(cls, session, player, now=None):
+        """Issue (or rotate to) a fresh identity for (session, player).
+
+        Retires any currently-active identity, stamping `retired_at` so
+        its token resolves for one more freshness window.
+        """
+        now = now or _now()
+        cls.objects.filter(session=session, player=player, active=True).update(
+            active=False, retired_at=now,
+        )
+        rotation_minutes = session.effective('ble_identity_rotation_minutes')
+        token = _generate_proximity_token()
+        while cls.objects.filter(token=token).exists():
+            token = _generate_proximity_token()
+        return cls.objects.create(
+            session=session,
+            player=player,
+            token=token,
+            rotates_at=now + timedelta(minutes=rotation_minutes) if rotation_minutes else None,
+        )
+
+    @classmethod
+    def current_for(cls, session, player):
+        return cls.objects.filter(session=session, player=player, active=True).first()
+
+
+class ProximityReport(models.Model):
+    """One phone's raw batch of observed tokens + RSSI. Untrusted input.
+
+    `observations` is a list of `{'token': str, 'rssi': int}` entries as
+    accepted at ingestion; the server-side derivation pass (see
+    game/proximity.py) is the only consumer. Indexed by session +
+    `received_at` for freshness-window queries.
+    """
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='proximity_reports',
+    )
+    reporter = models.ForeignKey(
+        ProximityIdentity, on_delete=models.CASCADE, related_name='reports',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, related_name='proximity_reports',
+    )
+    observations = models.JSONField(default=list, blank=True)
+    # Device-clock timestamp as claimed by the phone; untrusted, kept for
+    # diagnostics only. `received_at` (server clock) drives freshness.
+    reported_at = models.DateTimeField(null=True, blank=True)
+    received_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-received_at']
+        indexes = [
+            models.Index(fields=['session', 'received_at']),
+        ]
+
+    def __str__(self):
+        return f'ProximityReport({self.player}, {len(self.observations)} obs)'
+
+
+class ProximityEvent(models.Model):
+    """Server-derived nearness of one unordered player pair for one pass.
+
+    `player_a_id < player_b_id` by convention so each pass yields at most
+    one event per pair. `confidence` rises when both phones corroborate
+    each other (see game/proximity.py); `distance_bucket` is coarse and
+    ordinal — never metres.
+    """
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='proximity_events',
+    )
+    player_a = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, related_name='+',
+    )
+    player_b = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, related_name='+',
+    )
+    distance_bucket = models.CharField(max_length=16)
+    confidence = models.FloatField(default=0.5)
+    corroborated = models.BooleanField(default=False)
+    derived_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ['-derived_at']
+        indexes = [
+            models.Index(fields=['session', 'derived_at']),
+        ]
+
+    def __str__(self):
+        return (
+            f'ProximityEvent({self.player_a} ~ {self.player_b}: '
+            f'{self.distance_bucket}, conf {self.confidence:.2f})'
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dementors mode (mode-dementors capability)
+# ---------------------------------------------------------------------------
+
+
+class DementorState(models.Model):
+    """Per-player role + energy for a dementors-mode session.
+
+    One energy axis drives the whole state machine (see design.md): a
+    wizard drained to 0 flips to dementor (or dies, per config); a
+    dementor whose energy crosses the conversion threshold flips back.
+    All values are server-computed — never asserted by a device.
+    """
+
+    WIZARD = 'WIZARD'
+    DEMENTOR = 'DEMENTOR'
+    ROLE_CHOICES = [
+        (WIZARD, 'Wizard'),
+        (DEMENTOR, 'Dementor'),
+    ]
+
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='dementor_states',
+    )
+    player = models.ForeignKey(
+        'organize.UserProfile', on_delete=models.CASCADE, related_name='dementor_states',
+    )
+    role = models.CharField(max_length=16, choices=ROLE_CHOICES, default=WIZARD)
+    energy = models.FloatField(default=0.0)
+    alive = models.BooleanField(default=True)
+    # Economy-tick bookkeeping: when this state was last ticked and the
+    # energy delta that tick applied (drives the live drain/gain UI).
+    last_tick_at = models.DateTimeField(null=True, blank=True)
+    last_delta = models.FloatField(default=0.0)
+    # Reverse numbers game: since when ≥N wizards have continuously held
+    # this dementor in range (None = no hold in progress).
+    hold_started_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=['session', 'player'], name='unique_dementor_state',
+            ),
+        ]
+
+    def __str__(self):
+        return f'DementorState({self.player}: {self.role}, {self.energy:.1f})'
+
+    def record_flip(self, to_role, cause, when=None):
+        """Apply + record a role/liveness change with its cause and time."""
+        when = when or _now()
+        flip = DementorFlip.objects.create(
+            state=self,
+            from_role=self.role,
+            to_role=to_role,
+            cause=cause,
+            happened_at=when,
+        )
+        self.role = to_role
+        if cause == FLIP_CAUSE_DIED:
+            self.alive = False
+        return flip
+
+
+class DementorFlip(models.Model):
+    """History of role flips / eliminations, with cause and time."""
+
+    state = models.ForeignKey(
+        DementorState, on_delete=models.CASCADE, related_name='flips',
+    )
+    from_role = models.CharField(max_length=16, choices=DementorState.ROLE_CHOICES)
+    to_role = models.CharField(max_length=16, choices=DementorState.ROLE_CHOICES)
+    cause = models.CharField(max_length=16, choices=FLIP_CAUSE_CHOICES)
+    happened_at = models.DateTimeField()
+
+    class Meta:
+        ordering = ['-happened_at']
+
+    def __str__(self):
+        return (
+            f'DementorFlip({self.state.player}: {self.from_role} → '
+            f'{self.to_role}, {self.cause})'
+        )

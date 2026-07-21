@@ -66,6 +66,28 @@ TOWER_LOCK_MODE_CHOICES = [
     (TOWER_LOCK_FREE_FOR_ALL, 'Free for all — last confirmed finish owns the tower'),
     (TOWER_LOCK_ON_INITIATE, 'Lock on initiate — the initiating team gets an exclusive finish window'),
 ]
+
+# Coarse BLE proximity buckets (ble-proximity capability). Ordinal,
+# closest first; the server never exposes metres. Defined here (like the
+# FAIL_RESET_* choices) so Game/Session config fields can reference them
+# without a circular organize→game import.
+PROXIMITY_BUCKET_VERY_CLOSE = 'VERY_CLOSE'
+PROXIMITY_BUCKET_NEAR = 'NEAR'
+PROXIMITY_BUCKET_FAR = 'FAR'
+PROXIMITY_BUCKET_CHOICES = [
+    (PROXIMITY_BUCKET_VERY_CLOSE, 'Very close'),
+    (PROXIMITY_BUCKET_NEAR, 'Near'),
+    (PROXIMITY_BUCKET_FAR, 'Far'),
+]
+
+# What happens to a wizard drained to empty (mode-dementors).
+DEMENTOR_EMPTY_FLIP = 'FLIP'
+DEMENTOR_EMPTY_DIE = 'DIE'
+DEMENTOR_EMPTY_CHOICES = [
+    (DEMENTOR_EMPTY_FLIP, 'Flip to dementor on empty'),
+    (DEMENTOR_EMPTY_DIE, 'Out of play on empty'),
+]
+
 # Team-join confirmation policies (player-team-formation).
 JOIN_CONFIRM_AUTO_APPROVE = 'AUTO_APPROVE'
 JOIN_CONFIRM_CAPTAIN = 'CAPTAIN'
@@ -161,6 +183,29 @@ OVERRIDABLE_CONFIG_FIELDS = (
     # Tower-locking knobs (tower-locking capability).
     'tower_lock_mode',
     'tower_lock_finish_minutes',
+    # BLE proximity substrate knobs (ble-proximity capability).
+    'require_ble_capable',
+    'ble_report_interval_seconds',
+    'ble_scan_duty_cycle_percent',
+    'ble_freshness_window_seconds',
+    'ble_identity_rotation_minutes',
+    'ble_rssi_very_close_dbm',
+    'ble_rssi_near_dbm',
+    'ble_rssi_hysteresis_db',
+    # Dementors mode knobs (mode-dementors capability).
+    'dementors_enabled',
+    'dementor_initial_dementors',
+    'dementor_starting_energy',
+    'dementor_drain_per_second',
+    'dementor_drain_range_bucket',
+    'dementor_empty_outcome',
+    'dementor_safety_in_numbers',
+    'dementor_reverse_group_size',
+    'dementor_reverse_hold_seconds',
+    'dementor_conversion_threshold',
+    'dementor_restore_per_second',
+    'dementor_wizard_regen_per_second',
+    'dementor_tick_seconds',
 )
 
 
@@ -314,6 +359,43 @@ class Game(models.Model):
     nfc_secure_mode = models.BooleanField(default=False)
     nfc_require_app = models.BooleanField(default=False)
     nfc_replay_hardening = models.BooleanField(default=False)
+
+    # --- BLE proximity substrate defaults (ble-proximity). Cadence and
+    # RSSI thresholds are coarse by design (buckets, never metres);
+    # overridable per Session (see Session.effective). ---
+    require_ble_capable = models.BooleanField(default=False)
+    ble_report_interval_seconds = models.PositiveSmallIntegerField(default=10)
+    ble_scan_duty_cycle_percent = models.PositiveSmallIntegerField(default=100)
+    ble_freshness_window_seconds = models.PositiveSmallIntegerField(default=30)
+    ble_identity_rotation_minutes = models.PositiveSmallIntegerField(default=15)
+    ble_rssi_very_close_dbm = models.SmallIntegerField(default=-55)
+    ble_rssi_near_dbm = models.SmallIntegerField(default=-75)
+    ble_rssi_hysteresis_db = models.PositiveSmallIntegerField(default=5)
+
+    # --- Dementors mode defaults (mode-dementors). `dementors_enabled`
+    # is the opt-in gate: everything below is inert until a Game (or a
+    # Session override) turns it on. Overridable per Session. ---
+    dementors_enabled = models.BooleanField(default=False)
+    dementor_initial_dementors = models.PositiveSmallIntegerField(default=1)
+    dementor_starting_energy = models.FloatField(default=100.0)
+    dementor_drain_per_second = models.FloatField(default=1.0)
+    dementor_drain_range_bucket = models.CharField(
+        max_length=16,
+        choices=PROXIMITY_BUCKET_CHOICES,
+        default=PROXIMITY_BUCKET_NEAR,
+    )
+    dementor_empty_outcome = models.CharField(
+        max_length=8,
+        choices=DEMENTOR_EMPTY_CHOICES,
+        default=DEMENTOR_EMPTY_FLIP,
+    )
+    dementor_safety_in_numbers = models.BooleanField(default=True)
+    dementor_reverse_group_size = models.PositiveSmallIntegerField(default=3)
+    dementor_reverse_hold_seconds = models.PositiveSmallIntegerField(default=30)
+    dementor_conversion_threshold = models.FloatField(default=100.0)
+    dementor_restore_per_second = models.FloatField(default=1.0)
+    dementor_wizard_regen_per_second = models.FloatField(default=0.0)
+    dementor_tick_seconds = models.PositiveSmallIntegerField(default=5)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -746,6 +828,37 @@ class Session(models.Model):
     realtime_enabled = models.BooleanField(null=True, blank=True)
     push_notifications_enabled = models.BooleanField(null=True, blank=True)
 
+    # --- BLE proximity substrate overrides (ble-proximity). NULL means
+    # "inherit the Game default". ---
+    require_ble_capable = models.BooleanField(null=True, blank=True)
+    ble_report_interval_seconds = models.PositiveSmallIntegerField(null=True, blank=True)
+    ble_scan_duty_cycle_percent = models.PositiveSmallIntegerField(null=True, blank=True)
+    ble_freshness_window_seconds = models.PositiveSmallIntegerField(null=True, blank=True)
+    ble_identity_rotation_minutes = models.PositiveSmallIntegerField(null=True, blank=True)
+    ble_rssi_very_close_dbm = models.SmallIntegerField(null=True, blank=True)
+    ble_rssi_near_dbm = models.SmallIntegerField(null=True, blank=True)
+    ble_rssi_hysteresis_db = models.PositiveSmallIntegerField(null=True, blank=True)
+
+    # --- Dementors mode overrides (mode-dementors). NULL means
+    # "inherit the Game default". ---
+    dementors_enabled = models.BooleanField(null=True, blank=True)
+    dementor_initial_dementors = models.PositiveSmallIntegerField(null=True, blank=True)
+    dementor_starting_energy = models.FloatField(null=True, blank=True)
+    dementor_drain_per_second = models.FloatField(null=True, blank=True)
+    dementor_drain_range_bucket = models.CharField(
+        max_length=16, choices=PROXIMITY_BUCKET_CHOICES, null=True, blank=True,
+    )
+    dementor_empty_outcome = models.CharField(
+        max_length=8, choices=DEMENTOR_EMPTY_CHOICES, null=True, blank=True,
+    )
+    dementor_safety_in_numbers = models.BooleanField(null=True, blank=True)
+    dementor_reverse_group_size = models.PositiveSmallIntegerField(null=True, blank=True)
+    dementor_reverse_hold_seconds = models.PositiveSmallIntegerField(null=True, blank=True)
+    dementor_conversion_threshold = models.FloatField(null=True, blank=True)
+    dementor_restore_per_second = models.FloatField(null=True, blank=True)
+    dementor_wizard_regen_per_second = models.FloatField(null=True, blank=True)
+    dementor_tick_seconds = models.PositiveSmallIntegerField(null=True, blank=True)
+
     class Meta:
         unique_together = (('game', 'slug'),)
 
@@ -859,6 +972,12 @@ class Session(models.Model):
             raise IllegalTransition(
                 f'Session cannot start: {detail}', blockers=blockers,
             )
+        # mode-dementors: seed per-player roles + starting energy when the
+        # mode is enabled for this run. Idempotent — existing states are
+        # kept, so re-running a start after a rollback is safe.
+        if self.effective('dementors_enabled'):
+            from game.dementors import assign_initial_roles
+            assign_initial_roles(self)
 
     def _apply_pause(self, override=False):
         from game.models import PauseWindow

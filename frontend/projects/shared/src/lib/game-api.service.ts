@@ -130,6 +130,8 @@ export interface CurrentSession {
   /** Effective realtime/push toggles (realtime-and-notifications). */
   realtime_enabled: boolean;
   push_notifications_enabled: boolean;
+  /** Effective dementors-mode opt-in (mode-dementors-ble). */
+  dementors_enabled: boolean;
 }
 
 export interface ZoneFeature {
