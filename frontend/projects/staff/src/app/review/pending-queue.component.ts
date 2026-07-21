@@ -5,12 +5,13 @@ import { FormsModule } from '@angular/forms';
 import { StaffApiService, StaffSubmission } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
+import { ActiveLocksComponent } from './active-locks.component';
 
 @Component({
   selector: 'app-pending-queue',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, FormsModule],
+  imports: [DatePipe, FormsModule, ActiveLocksComponent],
   template: `
     <div class="d-flex justify-content-between align-items-center mb-3">
       <h1 class="h3 mb-0">Review queue</h1>
@@ -147,6 +148,9 @@ import { extractErrorMessage } from '../auth/form-error';
         }
       </div>
     }
+
+    <hr class="my-4" />
+    <app-active-locks />
   `,
 })
 export class PendingQueueComponent {

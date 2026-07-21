@@ -86,6 +86,53 @@ interface Position {
             </div>
           </div>
 
+          @if (s.tower_lock_mode === 'LOCK_ON_INITIATE') {
+            @if (activeLock(); as lock) {
+              @if (lock.held_by_us) {
+                <div class="alert alert-success d-flex justify-content-between align-items-center gap-2">
+                  <div>
+                    <div class="fw-semibold">
+                      <i class="bi bi-lock-fill"></i> Tower locked to your team
+                    </div>
+                    <div class="small">
+                      Finish within
+                      <strong>{{ formatCountdown(lockRemaining()) }}</strong>.
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    class="btn btn-sm btn-outline-secondary"
+                    [disabled]="releasing()"
+                    (click)="releaseLock()"
+                  >
+                    @if (releasing()) {
+                      <span class="spinner-border spinner-border-sm me-1"></span>
+                    }
+                    Give up lock
+                  </button>
+                </div>
+              } @else {
+                <div class="alert alert-warning">
+                  <div class="fw-semibold">
+                    <i class="bi bi-lock-fill"></i>
+                    Locked by
+                    <span class="badge" [style.background-color]="lock.team_color">
+                      {{ lock.team_name }}
+                    </span>
+                  </div>
+                  <div class="small">
+                    Free again in
+                    <strong>{{ formatCountdown(lockRemaining()) }}</strong>
+                    unless they finish first.
+                  </div>
+                </div>
+              }
+            }
+            @if (lockError(); as msg) {
+              <div class="alert alert-danger py-2">{{ msg }}</div>
+            }
+          }
+
           @if (cooloffRemaining() > 0) {
             <div class="alert alert-warning">
               <div class="fw-semibold">Cooloff in effect</div>
@@ -141,41 +188,60 @@ interface Position {
               </div>
             </div>
 
-            <div class="mb-3">
-              <label class="form-label" for="photo">Photo (optional)</label>
-              <input
-                id="photo"
-                type="file"
-                class="form-control"
-                accept="image/*"
-                capture="environment"
-                (change)="onPhotoSelected($event)"
-              />
-              @if (photoName(); as n) {
-                <div class="small text-body-secondary mt-1">Selected: {{ n }}</div>
+            @if (mustInitiate()) {
+              <button
+                type="button"
+                class="btn btn-primary w-100"
+                [disabled]="initiating() || activeLock() !== null"
+                (click)="initiate()"
+              >
+                @if (initiating()) {
+                  <span class="spinner-border spinner-border-sm me-2"></span>
+                }
+                <i class="bi bi-lock"></i> Start challenge (lock this tower)
+              </button>
+              @if (activeLock() !== null) {
+                <div class="small text-body-secondary text-center mt-1">
+                  Wait for the current lock to expire or be released.
+                </div>
               }
-            </div>
-
-            @if (submitError(); as msg) {
-              <div class="alert alert-danger py-2">{{ msg }}</div>
-            }
-            @if (submitSuccess()) {
-              <div class="alert alert-success py-2">
-                Submission received. Staff will review it shortly.
+            } @else {
+              <div class="mb-3">
+                <label class="form-label" for="photo">Photo (optional)</label>
+                <input
+                  id="photo"
+                  type="file"
+                  class="form-control"
+                  accept="image/*"
+                  capture="environment"
+                  (change)="onPhotoSelected($event)"
+                />
+                @if (photoName(); as n) {
+                  <div class="small text-body-secondary mt-1">Selected: {{ n }}</div>
+                }
               </div>
-            }
 
-            <button
-              type="button"
-              class="btn btn-primary w-100"
-              [disabled]="!canSubmit()"
-              (click)="submit()"
-            >
-              @if (submitting()) {
-                <span class="spinner-border spinner-border-sm me-2"></span>
+              @if (submitError(); as msg) {
+                <div class="alert alert-danger py-2">{{ msg }}</div>
               }
-              Submit challenge
-            </button>
+              @if (submitSuccess()) {
+                <div class="alert alert-success py-2">
+                  Submission received. Staff will review it shortly.
+                </div>
+              }
+
+              <button
+                type="button"
+                class="btn btn-primary w-100"
+                [disabled]="!canSubmit()"
+                (click)="submit()"
+              >
+                @if (submitting()) {
+                  <span class="spinner-border spinner-border-sm me-2"></span>
+                }
+                Submit challenge
+              </button>
+            }
           } @else {
             <div class="alert alert-secondary">No challenges available for this tower.</div>
           }
@@ -205,6 +271,9 @@ export class TowerDetailComponent implements OnInit {
   protected readonly submitting = signal(false);
   protected readonly submitError = signal<string | null>(null);
   protected readonly submitSuccess = signal(false);
+  protected readonly initiating = signal(false);
+  protected readonly releasing = signal(false);
+  protected readonly lockError = signal<string | null>(null);
 
   protected readonly distanceMeters = computed(() => {
     const pos = this.position();
@@ -227,6 +296,36 @@ export class TowerDetailComponent implements OnInit {
     return Math.max(0, Math.ceil(ms / 1000));
   });
 
+  /**
+   * Seconds until the reported lock's finish deadline (0 when free or
+   * lapsed) — client-side mirror of the backend's lazy expiry.
+   */
+  protected readonly lockRemaining = computed(() => {
+    const lock = this.state()?.lock;
+    if (!lock) return 0;
+    const ms = new Date(lock.expires_at).getTime() - this.now();
+    return Math.max(0, Math.ceil(ms / 1000));
+  });
+
+  /** The still-active lock, or null once it lapses client-side. */
+  protected readonly activeLock = computed(() => {
+    const lock = this.state()?.lock ?? null;
+    return lock && this.lockRemaining() > 0 ? lock : null;
+  });
+
+  /**
+   * Under LOCK_ON_INITIATE the finish affordance only appears while our
+   * team holds the active lock; otherwise the player must initiate first.
+   */
+  protected readonly mustInitiate = computed(() => {
+    const s = this.state();
+    return (
+      !!s &&
+      s.tower_lock_mode === 'LOCK_ON_INITIATE' &&
+      !(this.activeLock()?.held_by_us ?? false)
+    );
+  });
+
   protected readonly canSubmit = computed(() => {
     const s = this.state();
     return (
@@ -235,6 +334,7 @@ export class TowerDetailComponent implements OnInit {
       !s.pending_submission &&
       this.cooloffRemaining() === 0 &&
       this.withinRange() &&
+      !this.mustInitiate() &&
       !this.submitting()
     );
   });
@@ -287,6 +387,45 @@ export class TowerDetailComponent implements OnInit {
       },
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 },
     );
+  }
+
+  /** INITIATE lifecycle phase: commit to the challenge and lock the tower. */
+  protected initiate(): void {
+    const s = this.state();
+    if (!s || this.initiating()) return;
+    this.initiating.set(true);
+    this.lockError.set(null);
+    this.api.initiateTower(s.id).subscribe({
+      next: () => {
+        this.initiating.set(false);
+        this.fetchState(s.id);
+      },
+      error: (err) => {
+        this.initiating.set(false);
+        this.lockError.set(extractErrorMessage(err));
+        // A 409 means another team beat us to it — refresh to show their lock.
+        this.fetchState(s.id);
+      },
+    });
+  }
+
+  /** Voluntarily give up our active lock (CANCELLED) before the deadline. */
+  protected releaseLock(): void {
+    const s = this.state();
+    if (!s || this.releasing()) return;
+    this.releasing.set(true);
+    this.lockError.set(null);
+    this.api.releaseTowerLock(s.id).subscribe({
+      next: () => {
+        this.releasing.set(false);
+        this.fetchState(s.id);
+      },
+      error: (err) => {
+        this.releasing.set(false);
+        this.lockError.set(extractErrorMessage(err));
+        this.fetchState(s.id);
+      },
+    });
   }
 
   protected onPhotoSelected(event: Event): void {
