@@ -4,13 +4,21 @@ from datetime import datetime, timedelta, timezone
 from colorfield.fields import ColorField
 from django.conf import settings
 from django.contrib.gis.db import models
+from django.core.exceptions import ValidationError
 from django.db import transaction
 from django.db.models import Count, F, Max, Value
 from django.db.models.functions import Greatest
+from django.db.models.signals import m2m_changed, pre_delete
 
 from organize.models import (
+    CONQUEST_RULE_ALL,
+    CONQUEST_RULE_ANY,
+    CONQUEST_RULE_CHOICES,
+    CONQUEST_RULE_MAJORITY,
     FAIL_RESET_ANY_ATTEMPT_ELSEWHERE,
     FAIL_RESET_ANY_SUCCESS_ELSEWHERE,
+    TIME_UNIT_MINUTE,
+    TIME_UNIT_SECONDS,
     Team,
     TeamGroup,
 )
@@ -18,6 +26,39 @@ from organize.models import (
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Effective-value helpers (zone-conquest-and-scoring-config)
+# ---------------------------------------------------------------------------
+
+
+def effective_conquest_rule(zone, session=None, game=None):
+    """Most-specific conquest rule: Zone override > Session override > Game default.
+
+    `session` may be None when the recompute has no Session context for a
+    TeamGroup (e.g. no team currently holds a tower); pass the group's
+    `game` so the Game default still applies.
+    """
+    if zone.conquest_rule:
+        return zone.conquest_rule
+    if session is not None:
+        return session.effective('zone_conquest_rule')
+    if game is not None:
+        return game.zone_conquest_rule
+    return CONQUEST_RULE_MAJORITY
+
+
+def effective_proximity(tower, game):
+    """Capture radius in meters: Tower override when set, else the Game default."""
+    if tower.proximity_meters is not None:
+        return tower.proximity_meters
+    return game.proximity_meters
+
+
+def effective_time_unit(session):
+    """Scoring time unit: Session override when set, else the Game default."""
+    return session.effective('score_time_unit')
 
 
 # Challenge role-requirement modes (team-roles-as-mechanics).
@@ -50,8 +91,29 @@ class Zone(models.Model):
     scoring_type = models.PositiveSmallIntegerField(choices=ZONE_SCORING_CHOICES)
     shape = models.PolygonField(null=True, blank=True)
 
+    # Per-zone conquest-rule override (zone-conquest-and-scoring-config).
+    # NULL inherits the Session override / Game default.
+    conquest_rule = models.CharField(
+        max_length=16, choices=CONQUEST_RULE_CHOICES, null=True, blank=True,
+    )
+
     def __str__(self):
         return self.name
+
+    def clean(self):
+        """At-least-one-tower invariant (tower-zone-topology).
+
+        Enforced at the application layer: an existing Zone may not be
+        saved while it has zero member towers. Brand-new zones (no pk)
+        are exempt — membership can only be linked after the row exists
+        (the autocreate-circle flow links the founding tower right away).
+        """
+        super().clean()
+        if self.pk and not self.towers.exists():
+            raise ValidationError(
+                'A zone must retain at least one member tower. '
+                'Link a tower before saving this zone.',
+            )
 
     def zone_control(self, group: TeamGroup):
         teams = self.teamzoneownership_set.filter(team__group=group, timestamp_end__isnull=True).values_list('team', flat=True)
@@ -71,23 +133,26 @@ class Zone(models.Model):
 
         TeamZoneOwnership.objects.create(zone=self, team=team, timestamp_start=handover_time)
 
-    def _get_score_exp(self, seconds):
-        mins = seconds / 60.
-        return math.pow(mins, 2) / 140 + 10
+    def _get_score_exp(self, units):
+        return math.pow(units, 2) / 140 + 10
 
-    def _get_score_exp_bonus(self, seconds):
-        mins = seconds / 60.
-        return min(math.pow(mins, 2) / 25 + 50, 200)
+    def _get_score_exp_bonus(self, units):
+        return min(math.pow(units, 2) / 25 + 50, 200)
 
-    def _get_score_log(self, seconds):
-        mins = seconds / 60.
-        return 30 * math.log(mins) + pow(mins, 2) / 10000
+    def _get_score_log(self, units):
+        return 30 * math.log(units) + pow(units, 2) / 10000
 
-    def _get_score_prop(self, seconds):
-        mins = seconds / 60.
-        return mins
+    def _get_score_prop(self, units):
+        return units
 
-    def get_score(self, seconds):
+    def get_score(self, seconds, time_unit=TIME_UNIT_MINUTE):
+        """Floating points for an ownership window of `seconds` seconds.
+
+        The window duration is first converted into `units` of the
+        effective scoring time unit (zone-conquest-and-scoring-config);
+        the four formula shapes are unchanged, so the MINUTE default
+        yields `units == mins` and reproduces historical scores exactly.
+        """
         score_functions = {
             Zone.SCORE_EXP: self._get_score_exp,
             Zone.SCORE_LOG: self._get_score_log,
@@ -95,7 +160,8 @@ class Zone(models.Model):
             Zone.SCORE_BONUS: self._get_score_exp_bonus,
         }
 
-        return score_functions[self.scoring_type](seconds)
+        units = seconds / float(TIME_UNIT_SECONDS[time_unit])
+        return score_functions[self.scoring_type](units)
 
 
 class Tower(models.Model):
@@ -109,9 +175,16 @@ class Tower(models.Model):
     name = models.CharField(max_length=255)
 
     location = models.PointField()
-    zone = models.ForeignKey(Zone, on_delete=models.CASCADE, null=True, blank=True)
+    # Many-to-many zone membership (tower-zone-topology): a tower may
+    # belong to several, possibly overlapping, zones. Membership is
+    # logical, not spatial — it is never inferred from geometry.
+    zones = models.ManyToManyField(Zone, related_name='towers', blank=True)
     category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
     is_active = models.BooleanField()
+
+    # Per-tower capture-radius override (zone-conquest-and-scoring-config).
+    # NULL falls back to the game-wide Game.proximity_meters default.
+    proximity_meters = models.PositiveIntegerField(null=True, blank=True)
 
     initial_bonus = models.PositiveIntegerField(default=0, help_text="Număr inițial de puncte obținute la câștigarea turnului")
     decrease_initial_bonus = models.BooleanField(default=False, help_text="Dacă la fiecare recucerire ulterioară de către aceeași echipă să se înjumătățească numărul inițial de puncte obținute (minimul va fi 1)")
@@ -133,46 +206,9 @@ class Tower(models.Model):
         ownerships = TeamTowerOwnership.objects.filter(tower=self, timestamp_end__isnull=True)
         ownerships.update(timestamp_end=handover_time)
 
-        zone_tower_count = Tower.objects.filter(zone=self.zone, is_active=True).count()
-        if zone_tower_count == 0:
-            ownerships = TeamZoneOwnership.objects.filter(zone=self.zone, timestamp_end__isnull=True)
-            for ownership in ownerships:
-                ownership.timestamp_end = handover_time
-                ownership.save()
-                ownership.team.update_score(ownership.get_score())
-
-        elif zone_tower_count > 0:
-            #   recalculeaza ownership pentru situatia cu noul turn
-            #   get current zone owners
-            #   for each team type (separate controls) of every Game that
-            #   reaches this zone through its collections
-            for group in TeamGroup.objects.filter(game__collections__zones=self.zone).distinct():
-                current_zone_control_teams = self.zone.zone_control(group=group)
-                #   recalculate maximum number of towers owned in zone
-                team_stats = TeamTowerOwnership.objects.filter(
-                    tower__zone=self.zone,
-                    tower__is_active=True,
-                    timestamp_end__isnull=True,
-                    team__group=group).values('team').annotate(tower_count=Count('tower'))
-
-                if team_stats.count():
-                    max_towers = max((stat['tower_count'] for stat in team_stats))
-                    new_team_ids = list(stat['team'] for stat in team_stats if stat['tower_count'] == max_towers)
-                else:
-                    new_team_ids = []
-
-                #   remove old owners that are not in control anymore
-                to_remove = list(set(current_zone_control_teams) - set(new_team_ids))
-                to_close = TeamZoneOwnership.objects.filter(zone=self.zone, timestamp_end__isnull=True, team__in=to_remove)
-                for zone_ownership in to_close:
-                    zone_ownership.timestamp_end = handover_time
-                    zone_ownership.save()
-                    zone_ownership.team.update_score(zone_ownership.get_score())
-
-                #   add new zone owners
-                to_add = list(set(new_team_ids) - set(current_zone_control_teams))
-                for team_id in to_add:
-                    TeamZoneOwnership.objects.create(zone=self.zone, team_id=team_id, timestamp_start=handover_time)
+        # Recompute control of EVERY zone this tower belongs to — each
+        # zone independently (tower-zone-topology).
+        self._recompute_zones_control(handover_time)
 
     def assign_to_team(self, team, challenge=None, no_bonus=False):
         if not no_bonus:
@@ -195,38 +231,147 @@ class Tower(models.Model):
 
         TeamTowerOwnership.objects.create(tower=self, team=team, timestamp_start=handover_time)
 
-        #   when towers are reassigned, recalculate zone assignments
-        zone_tower_count = Tower.objects.filter(zone=self.zone, is_active=True).count()
-        if zone_tower_count == 1:
-            #   for towers that control their zone on their own, this is straightforward
-            self.zone.assign_to_team(team=team, handover_time=handover_time)
-        elif zone_tower_count > 1:
-            #   for towers that share control of their zone with other towers, we need to
-            #   figure out more
+        # When towers are reassigned, recalculate zone control across
+        # every zone the tower belongs to (tower-zone-topology).
+        self._recompute_zones_control(handover_time, capturing_team=team)
 
-            #   get current zone owners
-            current_zone_control_teams = self.zone.zone_control(group=team.group)
-            #   recalculate maximum number of towers owned in zone
-            team_stats = TeamTowerOwnership.objects\
-                .filter(tower__zone=self.zone, tower__is_active=True, timestamp_end__isnull=True,
-                        team__group=team.group)\
-                .values('team').annotate(tower_count=Count('tower'))
+    # --- Zone-control recompute (implements the `Zone conquest rule`
+    # requirement from zone-conquest-and-scoring-config over the
+    # many-to-many topology from tower-zone-topology). -------------------
 
-            max_towers = max((stat['tower_count'] for stat in team_stats))
-            new_team_ids = list(stat['team'] for stat in team_stats if stat['tower_count'] == max_towers)
+    def _recompute_zones_control(self, handover_time, capturing_team=None):
+        """Recompute conquest-rule control of every zone this tower belongs to.
 
-            #   remove old owners that are not in control anymore
-            to_remove = list(set(current_zone_control_teams) - set(new_team_ids))
-            to_close = TeamZoneOwnership.objects.filter(zone=self.zone, timestamp_end__isnull=True, team__in=to_remove)
-            for zone_ownership in to_close:
-                zone_ownership.timestamp_end = handover_time
-                zone_ownership.save()
-                zone_ownership.team.update_score(zone_ownership.get_score())
+        Each zone is evaluated independently, per TeamGroup, over the
+        zone's currently-active member towers (reverse many-to-many).
+        A change of controller closes the prior owner's TeamZoneOwnership
+        (finalizing its floating score into the locked team score) and
+        opens a new one for the new controller, if any.
+        """
+        for zone in self.zones.all():
+            active_tower_ids = list(
+                zone.towers.filter(is_active=True).values_list('pk', flat=True),
+            )
+            if not active_tower_ids:
+                # No active member tower left: close every open ownership
+                # for the zone (legacy deactivation behavior).
+                open_ownerships = TeamZoneOwnership.objects.filter(
+                    zone=zone, timestamp_end__isnull=True,
+                ).select_related('team__session__game', 'zone')
+                for zone_ownership in open_ownerships:
+                    zone_ownership.timestamp_end = handover_time
+                    zone_ownership.save()
+                    zone_ownership.team.update_score(zone_ownership.get_score())
+                continue
 
-            #   add new zone owners
-            to_add = list(set(new_team_ids) - set(current_zone_control_teams))
-            for team_id in to_add:
-                TeamZoneOwnership.objects.create(zone=self.zone, team_id=team_id, timestamp_start=handover_time)
+            # One control computation per TeamGroup of every Game that
+            # reaches this zone through its collections.
+            for group in TeamGroup.objects.filter(game__collections__zones=zone).distinct():
+                self._recompute_zone_group_control(
+                    zone, group, active_tower_ids, handover_time, capturing_team,
+                )
+
+    def _resolve_rule_session(self, group, active_tower_ids, capturing_team):
+        """Best Session context for resolving a zone's effective rule.
+
+        The capturing team's Session when the group is its own; otherwise
+        the Session of any team in the group currently holding a member
+        tower; otherwise None (the caller falls back to the group's Game
+        default).
+        """
+        if capturing_team is not None and capturing_team.group_id == group.id:
+            return capturing_team.session
+        holder = (
+            TeamTowerOwnership.objects
+            .filter(
+                tower_id__in=active_tower_ids,
+                tower__is_active=True,
+                timestamp_end__isnull=True,
+                team__group=group,
+            )
+            .select_related('team__session')
+            .first()
+        )
+        return holder.team.session if holder else None
+
+    def _recompute_zone_group_control(self, zone, group, active_tower_ids,
+                                      handover_time, capturing_team):
+        session = self._resolve_rule_session(group, active_tower_ids, capturing_team)
+        rule = effective_conquest_rule(zone, session=session, game=group.game)
+
+        current_zone_control_teams = set(zone.zone_control(group=group))
+
+        open_ownerships = TeamTowerOwnership.objects.filter(
+            tower_id__in=active_tower_ids,
+            tower__is_active=True,
+            timestamp_end__isnull=True,
+            team__group=group,
+        )
+
+        if rule == CONQUEST_RULE_ALL:
+            # Only a team holding EVERY active member tower controls the zone.
+            team_stats = open_ownerships.values('team').annotate(
+                tower_count=Count('tower', distinct=True),
+            )
+            new_team_ids = [
+                stat['team'] for stat in team_stats
+                if stat['tower_count'] == len(active_tower_ids)
+            ]
+        elif rule == CONQUEST_RULE_ANY:
+            # Any holder is eligible; most towers wins, ties broken by
+            # the most recent capture (deterministic single winner).
+            team_stats = list(
+                open_ownerships.values('team').annotate(
+                    tower_count=Count('tower', distinct=True),
+                ),
+            )
+            if team_stats:
+                max_towers = max(stat['tower_count'] for stat in team_stats)
+                leaders = [
+                    stat['team'] for stat in team_stats
+                    if stat['tower_count'] == max_towers
+                ]
+                if len(leaders) > 1:
+                    latest = (
+                        open_ownerships
+                        .filter(team_id__in=leaders)
+                        .order_by('-timestamp_start')
+                        .first()
+                    )
+                    leaders = [latest.team_id]
+                new_team_ids = leaders
+            else:
+                new_team_ids = []
+        else:
+            # MAJORITY — the pre-change computation retained verbatim:
+            # the team(s) holding the most active member towers control
+            # the zone (a tie keeps every tied team as a controller).
+            team_stats = open_ownerships.values('team').annotate(tower_count=Count('tower'))
+            if team_stats.count():
+                max_towers = max(stat['tower_count'] for stat in team_stats)
+                new_team_ids = [
+                    stat['team'] for stat in team_stats
+                    if stat['tower_count'] == max_towers
+                ]
+            else:
+                new_team_ids = []
+
+        # Remove old owners that are not in control anymore.
+        to_remove = list(current_zone_control_teams - set(new_team_ids))
+        to_close = TeamZoneOwnership.objects.filter(
+            zone=zone, timestamp_end__isnull=True, team__in=to_remove,
+        ).select_related('team__session__game', 'zone')
+        for zone_ownership in to_close:
+            zone_ownership.timestamp_end = handover_time
+            zone_ownership.save()
+            zone_ownership.team.update_score(zone_ownership.get_score())
+
+        # Add new zone owners.
+        to_add = list(set(new_team_ids) - current_zone_control_teams)
+        for team_id in to_add:
+            TeamZoneOwnership.objects.create(
+                zone=zone, team_id=team_id, timestamp_start=handover_time,
+            )
 
     def _difficulty_rollback(self, team):
         """Phase 10: how many difficulty buckets to drop after failures.
@@ -306,29 +451,115 @@ class Tower(models.Model):
         elapsed = (now - ttc.timestamp_verified).total_seconds()
         return elapsed < cooloff_seconds
 
+    def ensure_autocreated_zone(self):
+        """Autocreate-circle-zone hook (tower-zone-topology).
+
+        When `autocreate_zone` is set and the tower belongs to NO zone,
+        create a circular Zone around the tower and ADD it to the
+        tower's `zones` set — the tower is the new zone's founding
+        member, so the at-least-one-tower invariant holds from creation.
+        Returns the new Zone, or None when nothing was created.
+        """
+        if not self.autocreate_zone or self.pk is None or self.zones.exists():
+            return None
+
+        p = self.location.clone()
+        p.transform(3857)
+        circle = p.buffer(100)
+        circle.transform(4326)
+
+        zone = Zone.objects.create(
+            name=f"{self.name} - zone",
+            color="#000000",
+            shape=circle,
+            scoring_type=Zone.SCORE_LIN,
+        )
+        self.zones.add(zone)
+        # Keep the autocreated zone reachable wherever the tower is:
+        # add it to every collection the tower already belongs to.
+        for collection in self.collections.all():
+            collection.zones.add(zone)
+        return zone
+
     def save(self, *args, **kwargs):
-        autocreated_zone = None
-        if self.zone is None and self.autocreate_zone:
-            p = self.location
-            p.transform(3857)
-            circle = p.buffer(100)
-            circle.transform(4326)
-
-            self.zone = autocreated_zone = Zone.objects.create(
-                name=f"{self.name} - zone",
-                color="#000000",
-                shape=circle,
-                scoring_type=Zone.SCORE_LIN
-            )
-
         super(Tower, self).save(*args, **kwargs)
-        if autocreated_zone is not None:
-            # Keep the autocreated zone reachable wherever the tower is:
-            # add it to every collection the tower already belongs to.
-            for collection in self.collections.all():
-                collection.zones.add(autocreated_zone)
+        # M2M membership needs a pk, so the autocreate hook runs after
+        # the row exists (the admin re-runs it after its M2M save too).
+        self.ensure_autocreated_zone()
         if self.__is_active != self.is_active and self.is_active is False:
             self.unassign()
+
+
+# ---------------------------------------------------------------------------
+# At-least-one-tower invariant guards (tower-zone-topology)
+#
+# Application-layer enforcement: any membership removal or tower deletion
+# that would leave a Zone with zero member towers is rejected with a
+# ValidationError. (Minimum cardinality on a many-to-many cannot be a
+# simple DB constraint.)
+# ---------------------------------------------------------------------------
+
+
+def _last_member_zone_names(tower, zones):
+    """Names of `zones` whose only member tower is `tower`."""
+    blocked = []
+    for zone in zones:
+        member_ids = set(zone.towers.values_list('pk', flat=True))
+        if member_ids == {tower.pk}:
+            blocked.append(zone.name)
+    return blocked
+
+
+def _guard_zone_membership_removal(sender, instance, action, reverse, pk_set, **kwargs):
+    if action not in ('pre_remove', 'pre_clear'):
+        return
+    if not reverse:
+        # instance is a Tower losing zone memberships.
+        if action == 'pre_clear':
+            zones = list(instance.zones.all())
+        else:
+            zones = list(Zone.objects.filter(pk__in=pk_set))
+        blocked = _last_member_zone_names(instance, zones)
+        if blocked:
+            raise ValidationError(
+                f'Cannot remove tower "{instance.name}" from '
+                f'{", ".join(blocked)}: a zone must retain at least one '
+                'member tower.',
+            )
+    else:
+        # instance is a Zone losing member towers.
+        member_ids = set(instance.towers.values_list('pk', flat=True))
+        if not member_ids:
+            return
+        remaining = member_ids if action == 'pre_clear' else member_ids - set(pk_set)
+        if action == 'pre_clear' or not remaining:
+            raise ValidationError(
+                f'Cannot remove the last member tower(s) of zone '
+                f'"{instance.name}": a zone must retain at least one '
+                'member tower.',
+            )
+
+
+def _guard_tower_delete(sender, instance, **kwargs):
+    blocked = _last_member_zone_names(instance, instance.zones.all())
+    if blocked:
+        raise ValidationError(
+            f'Cannot delete tower "{instance.name}": it is the last member '
+            f'tower of {", ".join(blocked)}. Link another tower or delete '
+            'the zone first.',
+        )
+
+
+m2m_changed.connect(
+    _guard_zone_membership_removal,
+    sender=Tower.zones.through,
+    dispatch_uid='tower_zone_topology_membership_guard',
+)
+pre_delete.connect(
+    _guard_tower_delete,
+    sender=Tower,
+    dispatch_uid='tower_zone_topology_tower_delete_guard',
+)
 
 
 class Collection(models.Model):
@@ -540,7 +771,12 @@ class TeamZoneOwnership(models.Model):
     def get_score(self, when=None):
         ref_time = self.timestamp_end or datetime.now(timezone.utc)
         score_time = (ref_time - self.timestamp_start).seconds
-        return self.zone.get_score(seconds=score_time)
+        # Accrue in the Session's effective scoring time unit; the
+        # MINUTE default reproduces historical scores exactly.
+        return self.zone.get_score(
+            seconds=score_time,
+            time_unit=effective_time_unit(self.team.session),
+        )
 
     def __str__(self):
         data = (self.team, self.get_score(), self.zone)
@@ -636,7 +872,9 @@ class PauseWindow(models.Model):
             zone_owns = list(
                 TeamZoneOwnership.objects
                 .filter(team_id__in=team_ids, timestamp_end__isnull=True)
-                .select_related('team', 'zone')
+                # team__session__game: get_score resolves the effective
+                # scoring time unit through the owning team's Session.
+                .select_related('team__session__game', 'zone')
             )
             zone_pairs = [(zo.team_id, zo.zone_id) for zo in zone_owns]
 

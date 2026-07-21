@@ -749,9 +749,10 @@ class SessionHistoryTest(TestCase):
             shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
         )
         tower = Tower.objects.create(
-            name='T', zone=zone, location=Point(23.5, 46.5),
+            name='T', location=Point(23.5, 46.5),
             is_active=True, category=Tower.CATEGORY_NORMAL,
         )
+        tower.zones.add(zone)
         TeamTowerOwnership.objects.create(team=self.team, tower=tower)
         url = reverse(
             'api-session-timeline', args=[self.session.id],

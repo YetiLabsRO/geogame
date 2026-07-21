@@ -1,10 +1,11 @@
 import secrets
 import uuid
 
+from django.contrib.gis.db.models.functions import Distance as DistanceFunc
 from django.contrib.gis.geos import Point
-from django.contrib.gis.measure import Distance
 from django.db import OperationalError, connection, transaction
-from django.db.models import Count, Q
+from django.db.models import Count, F, FloatField, Q, Value
+from django.db.models.functions import Cast, Coalesce, Least
 from django.http import JsonResponse
 from rest_framework import permissions, status, viewsets
 from rest_framework.response import Response
@@ -14,6 +15,7 @@ from game.scoping import (
     GameGeometryScopedViewSetMixin,
     GameScopedViewSetMixin,
     SessionScopedViewSetMixin,
+    _current_session,
 )
 from game.serializers import (
     ChallengeSerializer,
@@ -38,8 +40,10 @@ class ZoneViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
 
     def get_queryset(self):
         qs = super().get_queryset()
+        # Member towers are the many-to-many `towers` reverse
+        # (tower-zone-topology) — not the removed single FK.
         return qs.annotate(
-            num_towers=Count('tower', Q(tower__is_active=True)),
+            num_towers=Count('towers', filter=Q(towers__is_active=True)),
         ).filter(num_towers__gte=1)
 
     def get_serializer_context(self):
@@ -64,10 +68,28 @@ class TowerViewSet(GameGeometryScopedViewSetMixin, viewsets.ModelViewSet):
         if self.request.query_params.get("lat") and self.request.query_params.get("lng"):
             lat = float(self.request.query_params.get("lat"))
             lng = float(self.request.query_params.get("lng"))
-            point = Point(lng, lat)
-            radius = min(float(self.request.query_params.get("accuracy", 100.)), 50.)
+            point = Point(lng, lat, srid=4326)
+            accuracy = float(self.request.query_params.get("accuracy", 100.))
 
-            return queryset.filter(location__distance_lt=(point, Distance(m=radius)))
+            # Effective per-tower radius (zone-conquest-and-scoring-config):
+            # the tower's own proximity_meters when set, else the Game's
+            # game-wide default — each capped by the reported GPS accuracy,
+            # preserving the historical `min(accuracy, game default)` shape.
+            session = _current_session(self.request)
+            default_radius = float(
+                session.game.proximity_meters if session is not None else 50,
+            )
+            return queryset.annotate(
+                _distance=DistanceFunc('location', point),
+                _radius=Least(
+                    Coalesce(
+                        Cast('proximity_meters', FloatField()),
+                        Value(default_radius),
+                    ),
+                    Value(accuracy),
+                    output_field=FloatField(),
+                ),
+            ).filter(_distance__lt=F('_radius'))
         return queryset
 
 

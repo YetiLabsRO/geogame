@@ -91,10 +91,13 @@ export interface TowerFeature {
   id: number;
   name: string;
   location: { type: 'Point'; coordinates: [number, number] };
-  zone: string | null;
+  /** Many-to-many zone membership (ids) — tower-zone-topology. */
+  zones: number[];
   category: number;
   is_active: boolean;
   has_initial_bonus: boolean;
+  /** Per-tower capture radius; null inherits the Game default. */
+  proximity_meters: number | null;
   ownership: TowerOwnership | Record<string, never>;
 }
 

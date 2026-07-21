@@ -1,5 +1,8 @@
+from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
+from django.core.exceptions import ValidationError
+from django.db import transaction
 
 # Register your models here.
 from django.utils.safestring import mark_safe
@@ -19,7 +22,19 @@ from organize.models import Team, TeamGroup
 
 
 class ZoneAdmin(LeafletGeoAdmin):
-    list_display = ['__str__', 'scoring_type', 'color', 'get_zone_control']
+    list_display = [
+        '__str__', 'scoring_type', 'color', 'conquest_rule',
+        'get_member_towers', 'get_zone_control',
+    ]
+
+    def get_member_towers(self, instance: Zone):
+        """Member towers via the many-to-many (tower-zone-topology)."""
+        names = list(instance.towers.values_list('name', flat=True))
+        if not names:
+            return 'NO TOWERS (invalid)'
+        return f'{len(names)}: {", ".join(names)}'
+
+    get_member_towers.short_description = 'Member towers'
 
     def get_zone_control(self, instance: Zone):
         output = "<ul>"
@@ -46,14 +61,79 @@ def unassign_all(modeladmin, request, queryset):
 unassign_all.short_description = "Închide toate deținerile de Zone (selectează toate turnurile pentru a închide jocul)"
 
 
+class TowerAdminForm(forms.ModelForm):
+    """Form-level at-least-one-tower guard (tower-zone-topology).
+
+    Rejecting the removal in `clean_zones` surfaces a friendly field
+    error instead of letting the model-layer m2m guard blow up inside
+    the admin's atomic save.
+    """
+
+    class Meta:
+        model = Tower
+        fields = '__all__'
+
+    def clean_zones(self):
+        zones = self.cleaned_data.get('zones') or []
+        if self.instance.pk:
+            kept = {z.pk for z in zones}
+            removed = self.instance.zones.exclude(pk__in=kept)
+            blocked = [
+                z.name for z in removed
+                if set(z.towers.values_list('pk', flat=True)) == {self.instance.pk}
+            ]
+            if blocked:
+                raise forms.ValidationError(
+                    'A zone must retain at least one member tower. '
+                    f'This tower is the last member of: {", ".join(blocked)}.',
+                )
+        return zones
+
+
 class TowerAdmin(LeafletGeoAdmin):
+    form = TowerAdminForm
     list_display = [
-        '__str__', 'is_active', 'zone', 'category', 'get_tower_control', 'get_rfid_url', 'id',
+        '__str__', 'is_active', 'get_zones', 'category', 'get_tower_control', 'get_rfid_url', 'id',
         'initial_bonus', 'decrease_initial_bonus'
     ]
-    list_filter = ['zone', 'is_active', 'category']
+    # `zones` is the many-to-many membership (tower-zone-topology): the
+    # list filters by member zone and the edit form uses a multi-select.
+    list_filter = ['zones', 'is_active', 'category']
+    filter_horizontal = ['zones']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]
+
+    def get_zones(self, instance):
+        return ', '.join(instance.zones.values_list('name', flat=True)) or '-'
+
+    get_zones.short_description = 'Zones'
+
+    def save_related(self, request, form, formsets, change):
+        """Re-run the autocreate-circle-zone hook after the form's M2M save.
+
+        The admin persists many-to-many selections *after* model.save(),
+        and `form.save_m2m()` resets the membership to the form's
+        selection — so the autocreate hook must be (re)applied here for
+        a tower saved with `autocreate_zone` and no zones selected.
+        """
+        super().save_related(request, form, formsets, change)
+        form.instance.ensure_autocreated_zone()
+
+    def delete_model(self, request, obj):
+        # The savepoint keeps the admin's wrapping transaction usable
+        # when the last-member guard rejects the delete.
+        try:
+            with transaction.atomic():
+                super().delete_model(request, obj)
+        except ValidationError as exc:
+            messages.error(request, '; '.join(exc.messages))
+
+    def delete_queryset(self, request, queryset):
+        try:
+            with transaction.atomic():
+                super().delete_queryset(request, queryset)
+        except ValidationError as exc:
+            messages.error(request, '; '.join(exc.messages))
 
     def get_tower_control(self, instance):
         output = "<ul>"

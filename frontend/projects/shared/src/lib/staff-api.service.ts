@@ -30,12 +30,21 @@ export interface UsageRef {
   name: string;
 }
 
+/** Zone conquest rules (zone-conquest-and-scoring-config). */
+export type ConquestRule = 'ALL' | 'MAJORITY' | 'ANY';
+
+/** Scoring time units — the unit zone scores accrue per. */
+export type ScoreTimeUnit = 'SECOND' | 'MINUTE' | 'HOUR';
+
 export interface AdminTower {
   id: number;
   name: string;
-  zone: number | null;
+  /** Many-to-many zone membership (tower-zone-topology). */
+  zones: number[];
   category: number;
   is_active: boolean;
+  /** Per-tower capture radius; null inherits the Game default. */
+  proximity_meters: number | null;
   initial_bonus: number;
   rfid_code: string | null;
   collections: UsageRef[];
@@ -47,6 +56,10 @@ export interface AdminZone {
   name: string;
   color: string;
   scoring_type: number;
+  /** Per-zone conquest override; null inherits Session/Game. */
+  conquest_rule: ConquestRule | null;
+  /** Member towers via the many-to-many (read-only). */
+  towers: UsageRef[];
   collections: UsageRef[];
   games: UsageRef[];
 }
@@ -181,6 +194,10 @@ export interface AdminGame extends Phase10Config, TeamRulesConfig {
   proximity_meters: number;
   cooloff_minutes: number;
   initial_bonus_default: number;
+  /** Game-wide conquest-rule default (zone-conquest-and-scoring-config). */
+  zone_conquest_rule: ConquestRule;
+  /** Game-wide scoring time-unit default. */
+  score_time_unit: ScoreTimeUnit;
   allow_player_team_creation: boolean;
   team_join_confirmation: TeamJoinConfirmation;
   collections: number[];
@@ -226,6 +243,10 @@ export interface AdminSession extends Phase10Overrides, TeamRulesOverrides {
   id: number;
   /** Per-session override; null inherits the Game default. */
   allow_player_team_creation: boolean | null;
+  /** Conquest-rule override; null inherits the Game default. */
+  zone_conquest_rule: ConquestRule | null;
+  /** Scoring time-unit override; null inherits the Game default. */
+  score_time_unit: ScoreTimeUnit | null;
   game: number;
   game_slug: string;
   game_name: string;
@@ -494,6 +515,10 @@ export class StaffApiService {
 
   listGames(): Observable<AdminGame[]> {
     return this.http.get<AdminGame[]>('/api/staff/games/');
+  }
+
+  getGame(id: number): Observable<AdminGame> {
+    return this.http.get<AdminGame>(`/api/staff/games/${id}/`);
   }
 
   cloneGame(

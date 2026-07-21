@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
-import { AdminZone, StaffApiService } from 'shared';
+import { AdminZone, ConquestRule, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -44,6 +44,8 @@ interface Row {
               <th>Name</th>
               <th>Color</th>
               <th>Scoring type</th>
+              <th>Conquest rule</th>
+              <th>Member towers</th>
               <th>Used by</th>
               <th></th>
             </tr>
@@ -78,6 +80,31 @@ interface Row {
                     <option [ngValue]="3">Linear (proportional)</option>
                     <option [ngValue]="4">Bonus (capped 200)</option>
                   </select>
+                </td>
+                <td style="min-width: 11rem">
+                  <!-- Per-zone override; blank inherits the Session
+                       override or the Game default. -->
+                  <select
+                    class="form-select form-select-sm"
+                    [ngModel]="row.draft.conquest_rule"
+                    (ngModelChange)="update(row, 'conquest_rule', $event)"
+                  >
+                    <option [ngValue]="null">Inherit</option>
+                    @for (o of conquestRuleOptions; track o.value) {
+                      <option [ngValue]="o.value">{{ o.label }}</option>
+                    }
+                  </select>
+                </td>
+                <td>
+                  <!-- Member towers via the many-to-many
+                       (tower-zone-topology); membership is edited from
+                       the Towers page. -->
+                  @for (t of row.zone.towers; track t.id) {
+                    <span class="badge text-bg-light border me-1">{{ t.name }}</span>
+                  }
+                  @if (row.zone.towers.length === 0) {
+                    <span class="badge text-bg-danger">no towers (invalid)</span>
+                  }
                 </td>
                 <td>
                   <!-- Usage guard: which collections + games share this
@@ -122,6 +149,12 @@ export class ZonesComponent {
   protected readonly rows = signal<Row[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
+
+  protected readonly conquestRuleOptions: { value: ConquestRule; label: string }[] = [
+    { value: 'MAJORITY', label: 'Majority of towers' },
+    { value: 'ALL', label: 'All towers' },
+    { value: 'ANY', label: 'Any tower' },
+  ];
 
   constructor() {
     this.refresh();
