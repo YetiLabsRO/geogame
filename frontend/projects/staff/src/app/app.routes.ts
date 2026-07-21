@@ -120,6 +120,12 @@ export const routes: Routes = [
       import('./game-state/game-state.component').then((m) => m.GameStateComponent),
   },
   {
+    path: 'badges',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/badges.component').then((m) => m.BadgesComponent),
+  },
+  {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },

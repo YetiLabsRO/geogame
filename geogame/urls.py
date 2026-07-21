@@ -43,6 +43,13 @@ from game.api import (
     TowerLockReleaseView,
     TowerStateView,
 )
+from game.badge_api import (
+    GatewayIngestView,
+    StaffBadgeAssignView,
+    StaffBadgeCollectView,
+    StaffBadgeListView,
+    StaffGatewayListView,
+)
 from game.location_api import (
     LocationConsentView,
     LocationLiveView,
@@ -264,6 +271,32 @@ urlpatterns = [
         'api/staff/dementors/session/<int:pk>/totals/',
         StaffDementorTotalsView.as_view(),
         name='api-staff-dementor-totals',
+    ),
+    # Wearable badge hardware (wearable-badge-hardware).
+    path(
+        'api/gateway/ingest/',
+        GatewayIngestView.as_view(),
+        name='api-gateway-ingest',
+    ),
+    path(
+        'api/staff/badges/',
+        StaffBadgeListView.as_view(),
+        name='api-staff-badges',
+    ),
+    path(
+        'api/staff/badges/<int:pk>/assign/',
+        StaffBadgeAssignView.as_view(),
+        name='api-staff-badge-assign',
+    ),
+    path(
+        'api/staff/badges/<int:pk>/collect/',
+        StaffBadgeCollectView.as_view(),
+        name='api-staff-badge-collect',
+    ),
+    path(
+        'api/staff/gateways/',
+        StaffGatewayListView.as_view(),
+        name='api-staff-gateways',
     ),
     path('api/staff/', include(admin_router.urls)),
     path(

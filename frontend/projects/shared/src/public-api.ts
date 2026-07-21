@@ -15,3 +15,4 @@ export * from './lib/qr-code.component';
 export * from './lib/team-formation.service';
 export * from './lib/realtime.service';
 export * from './lib/dementors.service';
+export * from './lib/badges.service';

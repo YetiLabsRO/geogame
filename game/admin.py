@@ -12,10 +12,14 @@ from leaflet.admin import LeafletGeoAdmin
 from game.challenge_types import SCAN_TYPES, TYPE_NFC_QR
 from game.models import (
     NFC_MODE_SECURE_TOKEN,
+    BadgeAssignment,
+    BadgeDevice,
+    BadgeTelemetry,
     Challenge,
     Collection,
     DementorFlip,
     DementorState,
+    GatewayNode,
     LocationConsent,
     LocationPing,
     NfcTag,
@@ -499,6 +503,33 @@ class DementorFlipAdmin(admin.ModelAdmin):
     list_filter = ('cause',)
 
 
+class BadgeDeviceAdmin(admin.ModelAdmin):
+    list_display = (
+        'badge_id', 'status', 'battery_pct', 'firmware_version',
+        'hardware_mac', 'last_seen_at',
+    )
+    list_filter = ('status',)
+    search_fields = ('badge_id', 'hardware_mac')
+
+
+class GatewayNodeAdmin(admin.ModelAdmin):
+    list_display = ('name', 'transport', 'active', 'last_seen_at')
+    list_filter = ('transport', 'active')
+    search_fields = ('name',)
+
+
+class BadgeAssignmentAdmin(admin.ModelAdmin):
+    list_display = ('badge', 'session', 'player', 'team', 'assigned_at', 'released_at')
+    list_filter = ('session',)
+    search_fields = ('badge__badge_id', 'player__user__username', 'team__name')
+
+
+class BadgeTelemetryAdmin(admin.ModelAdmin):
+    list_display = ('badge', 'session', 'battery_pct', 'activity', 'gesture', 'recorded_at')
+    list_filter = ('activity', 'gesture')
+    readonly_fields = ('imu',)
+
+
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(ProximityIdentity, ProximityIdentityAdmin)
 admin.site.register(ProximityReport, ProximityReportAdmin)
@@ -516,3 +547,7 @@ admin.site.register(TeamTowerFailCounter, TeamTowerFailCounterAdmin)
 admin.site.register(NfcTag, NfcTagAdmin)
 admin.site.register(TagScan, TagScanAdmin)
 admin.site.register(TowerLock, TowerLockAdmin)
+admin.site.register(BadgeDevice, BadgeDeviceAdmin)
+admin.site.register(GatewayNode, GatewayNodeAdmin)
+admin.site.register(BadgeAssignment, BadgeAssignmentAdmin)
+admin.site.register(BadgeTelemetry, BadgeTelemetryAdmin)

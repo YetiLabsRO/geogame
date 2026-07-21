@@ -20,7 +20,14 @@ from datetime import timedelta
 from django.db.models import Q
 from django.utils import timezone
 
-from game.models import ProximityEvent, ProximityIdentity, ProximityReport
+from game.models import (
+    PROXIMITY_SOURCE_BADGE,
+    PROXIMITY_SOURCE_MIXED,
+    PROXIMITY_SOURCE_PHONE,
+    ProximityEvent,
+    ProximityIdentity,
+    ProximityReport,
+)
 from organize.models import (
     PROXIMITY_BUCKET_FAR,
     PROXIMITY_BUCKET_NEAR,
@@ -178,7 +185,8 @@ def derive_proximity(session, now=None):
 
     token_map = resolvable_identities(session, now=now)
 
-    # pair (lo, hi) → {'rssi': best, 'directions': {reporter ids}}
+    # pair (lo, hi) → {'rssi': best, 'directions': {reporter ids},
+    #                  'sources': {report transports}}
     evidence = {}
     for player_id, report in latest_by_player.items():
         observations = report.observations
@@ -194,11 +202,14 @@ def derive_proximity(session, now=None):
             if seen_id == player_id:
                 continue  # self-sighting
             pair = (min(player_id, seen_id), max(player_id, seen_id))
-            slot = evidence.setdefault(pair, {'rssi': None, 'directions': set()})
+            slot = evidence.setdefault(
+                pair, {'rssi': None, 'directions': set(), 'sources': set()},
+            )
             rssi = int(entry['rssi'])
             if slot['rssi'] is None or rssi > slot['rssi']:
                 slot['rssi'] = rssi
             slot['directions'].add(player_id)
+            slot['sources'].add(report.source)
 
     if not evidence:
         return []
@@ -227,6 +238,14 @@ def derive_proximity(session, now=None):
             hysteresis_db=hysteresis,
             previous=previous_bucket.get((lo, hi)),
         )
+        # Tag the transport(s) that evidenced the pair (wearable-badge):
+        # informational only — the economy is transport-agnostic.
+        if slot['sources'] == {PROXIMITY_SOURCE_BADGE}:
+            source = PROXIMITY_SOURCE_BADGE
+        elif slot['sources'] <= {PROXIMITY_SOURCE_PHONE}:
+            source = PROXIMITY_SOURCE_PHONE
+        else:
+            source = PROXIMITY_SOURCE_MIXED
         events.append(ProximityEvent(
             session=session,
             player_a_id=lo,
@@ -234,6 +253,7 @@ def derive_proximity(session, now=None):
             distance_bucket=bucket,
             confidence=CONFIDENCE_CORROBORATED if corroborated else CONFIDENCE_ONE_WAY,
             corroborated=corroborated,
+            source=source,
             derived_at=now,
         ))
     return ProximityEvent.objects.bulk_create(events)
