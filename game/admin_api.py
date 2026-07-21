@@ -644,7 +644,7 @@ class AdminGameSerializer(serializers.ModelSerializer):
     class Meta:
         model = Game
         fields = (
-            'id', 'slug', 'name',
+            'id', 'slug', 'name', 'mode',
             'base_point', 'base_lat', 'base_lng',
             'base_zoom_level', 'is_active',
             'proximity_meters', 'cooloff_minutes', 'initial_bonus_default',
@@ -821,6 +821,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'min_members_per_team', 'max_members_per_team',
             # Team-formation override (null = inherit Game default).
             'allow_player_team_creation',
+            # Game-mode override (mode-trail-discovery; null = inherit).
+            'mode',
             'created_at',
         )
         read_only_fields = (

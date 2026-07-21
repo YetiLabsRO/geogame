@@ -17,6 +17,7 @@ from game.models import (
     Tower,
     Zone,
 )
+from game.trail import read_only_gate_step
 from organize.models import Team
 
 
@@ -334,6 +335,16 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
         if counter and counter.is_locked():
             raise TowerLockedError()
 
+        # mode-trail-discovery: a challenge-less submission at the
+        # party's current gate-less trail step is the read-only
+        # "acknowledge the clue" gate — arrival within range unlocks it,
+        # so it auto-confirms instead of entering staff review.
+        trail_ack_step = None
+        if handler is None and challenge is None:
+            trail_ack_step = read_only_gate_step(
+                session, attrs['_team'], user.profile, tower,
+            )
+
         # challenge-type-system: resolve the outcome LAST, so every gate
         # above applies to auto types too. A held submission (paused
         # session, rejects disabled) stays PENDING — capture waits for
@@ -344,6 +355,8 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             attrs['_resolved_outcome'] = handler.validate(
                 challenge, tower, attrs['_team'], submitted_code=submitted_code,
             )
+        elif trail_ack_step is not None:
+            attrs['_resolved_outcome'] = TeamTowerChallenge.CONFIRMED
         else:
             attrs['_resolved_outcome'] = TeamTowerChallenge.PENDING
 

@@ -37,6 +37,18 @@ from game.api import (
     StaffSubmissionReview,
     TowerStateView,
 )
+from game.trail_api import (
+    AdminTrailEdgeViewSet,
+    AdminTrailStepViewSet,
+    AdminTrailViewSet,
+    SessionTrailLeaderboardView,
+    SessionTrailRevealStartView,
+    SessionTrailRoutesGenerateView,
+    SessionTrailRoutesView,
+    TrailLeaderboardView,
+    TrailNextView,
+    TrailStateView,
+)
 from game.views import (
     ChallengeViewSet,
     TeamTowerChallengeViewSet,
@@ -76,6 +88,13 @@ admin_router.register(
 admin_router.register(
     r'sessions', AdminSessionViewSet, basename='admin-session',
 )
+admin_router.register(r'trails', AdminTrailViewSet, basename='admin-trail')
+admin_router.register(
+    r'trail-steps', AdminTrailStepViewSet, basename='admin-trail-step',
+)
+admin_router.register(
+    r'trail-edges', AdminTrailEdgeViewSet, basename='admin-trail-edge',
+)
 
 urlpatterns = [
     path('admin/', admin.site.urls),
@@ -91,6 +110,34 @@ urlpatterns = [
         'api/staff/submissions/<int:pk>/review/',
         StaffSubmissionReview.as_view(),
         name='api-staff-submission-review',
+    ),
+    # mode-trail-discovery: player trail state + staff per-session routes.
+    path('api/trail/state/', TrailStateView.as_view(), name='api-trail-state'),
+    path('api/trail/next/', TrailNextView.as_view(), name='api-trail-next'),
+    path(
+        'api/trail/leaderboard/',
+        TrailLeaderboardView.as_view(),
+        name='api-trail-leaderboard',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/trail-routes/',
+        SessionTrailRoutesView.as_view(),
+        name='api-staff-session-trail-routes',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/trail-routes/auto-generate/',
+        SessionTrailRoutesGenerateView.as_view(),
+        name='api-staff-session-trail-routes-generate',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/trail-reveal-start/',
+        SessionTrailRevealStartView.as_view(),
+        name='api-staff-session-trail-reveal-start',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/trail-leaderboard/',
+        SessionTrailLeaderboardView.as_view(),
+        name='api-staff-session-trail-leaderboard',
     ),
     path('api/staff/', include(admin_router.urls)),
     path(

@@ -32,6 +32,7 @@ from organize.models import (
     TeamMembership,
     active_membership_conflict,
     effective_allow_player_team_creation,
+    effective_mode,
     effective_team_join_confirmation,
     user_can_invite_to_team,
 )
@@ -414,9 +415,14 @@ class CurrentSessionSerializer(serializers.Serializer):
     # Effective (Session override, else Game default) player-team-creation
     # toggle for this session.
     allow_player_team_creation = serializers.SerializerMethodField()
+    # Effective game mode (mode-trail-discovery): DOMINATION or TRAIL.
+    mode = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
+
+    def get_mode(self, session):
+        return effective_mode(session)
 
 
 class MySessionsView(APIView):

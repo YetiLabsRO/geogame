@@ -39,9 +39,19 @@ JOIN_CONFIRM_CHOICES = [
     (JOIN_CONFIRM_STAFF, 'Staff approve joins'),
 ]
 
+# Game modes (mode-trail-discovery). DOMINATION is the shipped
+# capture-and-hold loop; TRAIL is clue-driven point-to-point progression.
+MODE_DOMINATION = 'DOMINATION'
+MODE_TRAIL = 'TRAIL'
+MODE_CHOICES = [
+    (MODE_DOMINATION, 'Domination — capture towers, hold zones'),
+    (MODE_TRAIL, 'Trail / discovery — clue-driven point-to-point run'),
+]
+
 # Config fields that live on Game as defaults and are overridable per
 # Session. `Session.effective(field)` resolves override-or-default.
 OVERRIDABLE_CONFIG_FIELDS = (
+    'mode',
     'pause_freezes_floating_score',
     'pause_restores_ownerships_on_resume',
     'pause_rejects_submissions',
@@ -56,6 +66,11 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'max_members_per_team',
     'allow_player_team_creation',
 )
+
+
+def effective_mode(session):
+    """Effective game mode for a Session: Session override, else Game default."""
+    return session.effective('mode')
 
 
 def effective_allow_player_team_creation(session):
@@ -82,6 +97,13 @@ class Game(models.Model):
     base_zoom_level = models.PositiveSmallIntegerField(default=15)
 
     is_active = models.BooleanField(default=False)
+
+    # Game mode (mode-trail-discovery). DOMINATION preserves all current
+    # behavior; TRAIL runs the clue-driven trail loop instead of
+    # zone/floating-point scoring. Overridable per Session.
+    mode = models.CharField(
+        max_length=16, choices=MODE_CHOICES, default=MODE_DOMINATION,
+    )
 
     # Per-game rule defaults. Existing callers hardcode 50m / 5min;
     # T3.6 will wire these through the request path.
@@ -474,6 +496,10 @@ class Session(models.Model):
         max_length=32, choices=FAIL_RESET_CHOICES, null=True, blank=True,
     )
     allow_player_team_creation = models.BooleanField(null=True, blank=True)
+    # Game-mode override (mode-trail-discovery); null = inherit.
+    mode = models.CharField(
+        max_length=16, choices=MODE_CHOICES, null=True, blank=True,
+    )
 
     # --- Team-composition overrides. NULL means "inherit the Game
     # default"; a 0 maximum means "explicitly no cap". ---

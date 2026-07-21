@@ -14,7 +14,12 @@ from game.models import (
     TeamTowerChallenge,
     TeamTowerFailCounter,
     TeamTowerOwnership,
+    TeamTrailProgress,
+    TeamTrailRoute,
     Tower,
+    Trail,
+    TrailEdge,
+    TrailStep,
     Zone,
 )
 from organize.models import Team, TeamGroup
@@ -191,6 +196,43 @@ class CollectionAdmin(admin.ModelAdmin):
         return obj.zones.count()
 
 
+# --- mode-trail-discovery ---------------------------------------------------
+
+
+class TrailStepInline(admin.TabularInline):
+    model = TrailStep
+    extra = 0
+    fields = ('order', 'tower', 'is_start', 'is_finish', 'gate_challenge', 'clue_text', 'start_hint')
+
+
+class TrailEdgeInline(admin.TabularInline):
+    model = TrailEdge
+    extra = 0
+    fields = ('from_step', 'to_step', 'clue')
+
+
+class TrailAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'game', 'structure', 'starting_knowledge', 'participation', 'step_count')
+    list_filter = ('structure', 'starting_knowledge', 'participation')
+    inlines = [TrailStepInline, TrailEdgeInline]
+
+    def step_count(self, obj):
+        return obj.steps.count()
+
+
+class TeamTrailRouteAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'session', 'start_step', 'finished_at')
+    list_filter = ('session',)
+
+
+class TeamTrailProgressAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'session', 'state', 'revealed_at', 'arrived_at', 'unlocked_at')
+    list_filter = ('session', 'state')
+
+
+admin.site.register(Trail, TrailAdmin)
+admin.site.register(TeamTrailRoute, TeamTrailRouteAdmin)
+admin.site.register(TeamTrailProgress, TeamTrailProgressAdmin)
 admin.site.register(Collection, CollectionAdmin)
 admin.site.register(Zone, ZoneAdmin)
 admin.site.register(Tower, TowerAdmin)
