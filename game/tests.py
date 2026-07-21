@@ -40,6 +40,15 @@ from rest_framework.test import APIClient
 
 from game import events
 from game.admin import unassign_all
+from game.challenge_types import (
+    REVIEW_AUTO,
+    REVIEW_MANUAL,
+    TYPE_NFC_QR,
+    TYPE_PHOTO,
+    TYPE_RFID,
+    TYPE_TEXT,
+    get_handler,
+)
 from game.models import (
     ROLE_REQUIREMENT_ALL,
     ROLE_REQUIREMENT_ANY,
@@ -6297,3 +6306,602 @@ class AsgiHttpSmokeTest(TransactionTestCase):
             return client.get('/api/current-session/').json()
 
         self.assertEqual(asgi_body, await database_sync_to_async(_wsgi_body)())
+
+
+# ---------------------------------------------------------------------------
+# challenge-type-system — pluggable challenge types (TEXT/PHOTO/NFC_QR/RFID)
+# ---------------------------------------------------------------------------
+
+
+class ChallengeTypeRegistryTest(TestCase):
+    """2.x / 8.6 — handler registry + effective review-mode resolution."""
+
+    def test_four_types_registered_with_expected_contracts(self):
+        expectations = {
+            TYPE_TEXT: (REVIEW_MANUAL, []),
+            TYPE_PHOTO: (REVIEW_MANUAL, ['photo']),
+            TYPE_NFC_QR: (REVIEW_AUTO, ['submitted_code']),
+            TYPE_RFID: (REVIEW_AUTO, ['submitted_code']),
+        }
+        for type_value, (mode, payload) in expectations.items():
+            handler = get_handler(type_value)
+            self.assertIsNotNone(handler, type_value)
+            self.assertEqual(handler.review_mode, mode, type_value)
+            self.assertEqual(list(handler.required_payload), payload, type_value)
+
+    def test_unknown_type_has_no_handler(self):
+        self.assertIsNone(get_handler('CARRIER_PIGEON'))
+        self.assertIsNone(get_handler(None))
+
+    def test_effective_review_mode_prefers_challenge_override(self):
+        challenge = Challenge(type=TYPE_NFC_QR, review_mode=REVIEW_MANUAL)
+        self.assertEqual(challenge.effective_review_mode(), REVIEW_MANUAL)
+
+    def test_effective_review_mode_defaults_to_handler(self):
+        self.assertEqual(
+            Challenge(type=TYPE_NFC_QR).effective_review_mode(), REVIEW_AUTO,
+        )
+        self.assertEqual(
+            Challenge(type=TYPE_TEXT).effective_review_mode(), REVIEW_MANUAL,
+        )
+
+    def test_unknown_type_resolves_to_no_mode_and_no_payload(self):
+        self.assertIsNone(Challenge(type='WAT').effective_review_mode())
+        self.assertEqual(Challenge(type='WAT').required_payload(), [])
+
+    def test_default_challenge_type_is_text(self):
+        challenge = Challenge.objects.create(text='plain', difficulty=1)
+        self.assertEqual(challenge.type, TYPE_TEXT)
+        self.assertEqual(challenge.type_config, {})
+        self.assertIsNone(challenge.review_mode)
+
+
+class TextRosterRegressionTest(TestCase):
+    """8.1 — an all-TEXT game keeps the pre-change roster + review flow."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.c1 = Challenge.objects.create(text='c1', tower=self.tower, difficulty=1)
+        self.c2 = Challenge.objects.create(text='c2', tower=self.tower, difficulty=1)
+        self.c3 = Challenge.objects.create(text='c3', tower=self.tower, difficulty=2)
+        self.c4 = Challenge.objects.create(text='c4', tower=self.tower, difficulty=5)
+        self.c5 = Challenge.objects.create(text='c5', difficulty=1)
+        self.c6 = Challenge.objects.create(text='c6', difficulty=2)
+        self.c7 = Challenge.objects.create(text='c7', difficulty=5)
+
+    def _confirm(self, challenge):
+        TeamTowerChallenge.objects.create(
+            team=self.team, tower=self.tower, challenge=challenge,
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+
+    def test_all_rows_default_to_text(self):
+        self.assertEqual(
+            set(Challenge.objects.values_list('type', flat=True)), {TYPE_TEXT},
+        )
+
+    def test_next_challenge_sequence_identical_to_pre_change(self):
+        expected = [self.c1, self.c2, self.c3, self.c4, self.c5, self.c6, self.c7]
+        for challenge in expected:
+            self.assertEqual(self.tower.get_next_challenge(self.team), challenge)
+            self._confirm(challenge)
+        # All exhausted — hardest generic replays forever, as before.
+        self.assertEqual(self.tower.get_next_challenge(self.team), self.c7)
+
+    def test_text_submission_stays_pending_and_staff_confirm_captures(self):
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': self.c1.pk,
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        self.assertIsNone(ttc.timestamp_verified)
+        # No capture until staff confirm — the pre-change manual flow.
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+
+        staff_client, staff = _staff_client(session=self.team.session)
+        resp = staff_client.post(
+            reverse('api-staff-submission-review', args=[ttc.id]),
+            {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        ttc.refresh_from_db()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(ttc.checked_by, staff)
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            tower=self.tower, team=self.team, timestamp_end__isnull=True,
+        ).exists())
+
+
+class NfcQrChallengeTest(TestCase):
+    """8.2 / 4.x — NFC_QR venue-code auto validation."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            text='Buy the house drink, scan the code the bartender hands you',
+            tower=self.tower, game=self.game, difficulty=1,
+            type=TYPE_NFC_QR, validation_code='DRINK-42',
+            type_config={'venue_label': 'Bar X'},
+        )
+        self.client_api, self.user = _authed_client(self.team)
+
+    def _scan(self, client, code, lat=46.5, lng=23.5):
+        return client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': self.challenge.pk,
+                'submitted_code': code, 'lat': lat, 'lng': lng,
+            },
+            format='json',
+        )
+
+    def test_matching_code_in_range_auto_confirms_and_captures(self):
+        resp = self._scan(self.client_api, 'DRINK-42')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], TeamTowerChallenge.CONFIRMED)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+        self.assertEqual(ttc.submitted_code, 'DRINK-42')
+        # System-attributed: verified timestamp set, no reviewing staff.
+        self.assertIsNotNone(ttc.timestamp_verified)
+        self.assertIsNone(ttc.checked_by)
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            tower=self.tower, team=self.team, timestamp_end__isnull=True,
+        ).exists())
+
+    def test_wrong_code_auto_rejects_and_feeds_cooldown(self):
+        resp = self._scan(self.client_api, 'WRONG')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], TeamTowerChallenge.REJECTED)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.REJECTED)
+        self.assertIsNotNone(ttc.timestamp_verified)
+        self.assertIsNone(ttc.checked_by)
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+        # The rejection enters the per-tower cooldown and fail counter.
+        self.assertTrue(self.tower.team_in_cooloff(self.team))
+        counter = TeamTowerFailCounter.objects.get(team=self.team, tower=self.tower)
+        self.assertEqual(counter.consecutive_fails, 1)
+
+    def test_out_of_range_rejected_nothing_persisted(self):
+        lat = 46.5 + 200 / 111_111.0  # ~200m north
+        resp = self._scan(self.client_api, 'DRINK-42', lat=lat)
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_missing_code_is_a_payload_error(self):
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': self.challenge.pk,
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_shared_code_validates_every_team_by_default(self):
+        other = _make_team(self.game, self.group, name='t2', color='#663300')
+        other_client, _ = _authed_client(other, username='scout2')
+        self.assertEqual(
+            self._scan(self.client_api, 'DRINK-42').json()['outcome'],
+            TeamTowerChallenge.CONFIRMED,
+        )
+        self.assertEqual(
+            self._scan(other_client, 'DRINK-42').json()['outcome'],
+            TeamTowerChallenge.CONFIRMED,
+        )
+
+    def test_single_use_code_consumed_on_first_confirm(self):
+        self.challenge.type_config = {'single_use': True}
+        self.challenge.save(update_fields=['type_config'])
+        other = _make_team(self.game, self.group, name='t2', color='#663300')
+        other_client, _ = _authed_client(other, username='scout2')
+
+        first = self._scan(self.client_api, 'DRINK-42')
+        self.assertEqual(first.json()['outcome'], TeamTowerChallenge.CONFIRMED)
+        second = self._scan(other_client, 'DRINK-42')
+        self.assertEqual(second.status_code, 201, second.content)
+        self.assertEqual(second.json()['outcome'], TeamTowerChallenge.REJECTED)
+        self.assertFalse(TeamTowerOwnership.objects.filter(
+            team=other, timestamp_end__isnull=True,
+        ).exists())
+
+    def test_matching_scan_held_pending_while_paused(self):
+        session = self.team.session
+        session.pause_rejects_submissions = False
+        session.save()
+        PauseWindow.pause_session(session)
+        resp = self._scan(self.client_api, 'DRINK-42')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)  # held
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+
+
+class PhotoChallengeTest(TestCase):
+    """8.3 — PHOTO submissions require a photo and stay staff-reviewed."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            text='Photo of the whole team at the fountain',
+            tower=self.tower, game=self.game, difficulty=1, type=TYPE_PHOTO,
+        )
+        self.client_api, _ = _authed_client(self.team)
+
+    def test_submission_without_photo_rejected(self):
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': self.challenge.pk,
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+    def test_with_photo_pending_reaches_review_and_confirm_captures(self):
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': self.challenge.pk,
+                'photo': _tiny_png_b64(), 'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+
+        staff_client, staff = _staff_client(session=self.team.session)
+        listing = staff_client.get(reverse('api-staff-submissions'))
+        self.assertEqual(listing.status_code, 200)
+        rows = listing.json()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]['challenge_type'], TYPE_PHOTO)
+        self.assertFalse(rows[0]['auto_resolved'])
+
+        resp = staff_client.post(
+            reverse('api-staff-submission-review', args=[ttc.id]),
+            {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            tower=self.tower, team=self.team, timestamp_end__isnull=True,
+        ).exists())
+
+
+class RfidParityTest(TestCase):
+    """8.4 / 5.x — the RFID route and RFID-typed submissions stay in lockstep."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.rfid_tower = _make_tower(
+            self.game, zone=self.zone, category=Tower.CATEGORY_RFID,
+            rfid_code='ABC123',
+        )
+        self.t1 = _make_team(self.game, self.group, name='t1')
+        self.t2 = _make_team(self.game, self.group, name='t2', color='#663300')
+
+    def test_route_and_manual_rfid_submission_reach_same_outcome(self):
+        c1, _ = _authed_client(self.t1, username='s1')
+        c2, _ = _authed_client(self.t2, username='s2')
+        # (a) the public code route: rfid_code only.
+        by_route = c1.post(
+            '/api/team_tower_challenges/',
+            {'rfid_code': 'ABC123', 'lat': 46.5, 'lng': 23.5},
+            format='json',
+        )
+        # (b) a hand-built RFID scan: tower + submitted_code.
+        by_scan = c2.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.rfid_tower.pk, 'submitted_code': 'ABC123',
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        for resp, team in ((by_route, self.t1), (by_scan, self.t2)):
+            self.assertEqual(resp.status_code, 201, resp.content)
+            ttc = TeamTowerChallenge.objects.get(team=team)
+            self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+            self.assertEqual(ttc.submitted_code, 'ABC123')
+            self.assertIsNone(ttc.checked_by)
+            self.assertIsNotNone(ttc.timestamp_verified)
+            self.assertTrue(TeamTowerOwnership.objects.filter(
+                tower=self.rfid_tower, team=team,
+            ).exists())
+
+    def test_rfid_typed_challenge_row_derives_code_from_tower(self):
+        challenge = Challenge.objects.create(
+            text='Scan the tag', tower=self.rfid_tower, game=self.game,
+            difficulty=1, type=TYPE_RFID,
+        )
+        client, _ = _authed_client(self.t1, username='s1')
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.rfid_tower.pk, 'challenge': challenge.pk,
+                'submitted_code': 'ABC123', 'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], TeamTowerChallenge.CONFIRMED)
+
+    def test_manual_rfid_wrong_code_auto_rejected(self):
+        client, _ = _authed_client(self.t1, username='s1')
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.rfid_tower.pk, 'submitted_code': 'NOPE',
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(resp.json()['outcome'], TeamTowerChallenge.REJECTED)
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+
+    def test_manual_rfid_proximity_still_enforced(self):
+        client, _ = _authed_client(self.t1, username='s1')
+        lat = 46.5 + 200 / 111_111.0
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.rfid_tower.pk, 'submitted_code': 'ABC123',
+                'lat': lat, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+
+
+class ReviewModeOverrideTest(TestCase):
+    """8.5 / 2.6 — per-challenge review-mode override beats the handler."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.client_api, _ = _authed_client(self.team)
+
+    def test_nfc_forced_manual_stays_pending_on_matching_scan(self):
+        challenge = Challenge.objects.create(
+            text='Suspicious venue', tower=self.tower, game=self.game,
+            difficulty=1, type=TYPE_NFC_QR, validation_code='SECRET',
+            review_mode=REVIEW_MANUAL,
+        )
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': challenge.pk,
+                'submitted_code': 'SECRET', 'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        ttc = TeamTowerChallenge.objects.get()
+        self.assertEqual(ttc.outcome, TeamTowerChallenge.PENDING)
+        self.assertEqual(ttc.submitted_code, 'SECRET')
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+
+        # Staff can still confirm it through the ordinary review surface.
+        staff_client, _ = _staff_client(session=self.team.session)
+        resp = staff_client.post(
+            reverse('api-staff-submission-review', args=[ttc.id]),
+            {'outcome': 'confirm'}, format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.assertTrue(TeamTowerOwnership.objects.filter(
+            tower=self.tower, team=self.team, timestamp_end__isnull=True,
+        ).exists())
+
+    def test_auto_override_on_text_never_confirms_by_itself(self):
+        challenge = Challenge.objects.create(
+            text='Trust me', tower=self.tower, game=self.game,
+            difficulty=1, type=TYPE_TEXT, review_mode=REVIEW_AUTO,
+        )
+        resp = self.client_api.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': challenge.pk,
+                'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        # The TEXT handler has no auto validation — it resolves PENDING.
+        self.assertEqual(
+            TeamTowerChallenge.objects.get().outcome, TeamTowerChallenge.PENDING,
+        )
+
+
+class UnknownTypeSafetyTest(TestCase):
+    """8.6 — unregistered types are rejected safely; legacy rows stamped TEXT."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+
+    def test_unknown_type_submission_rejected_safely(self):
+        challenge = Challenge.objects.create(
+            text='??', tower=self.tower, game=self.game, difficulty=1,
+            type='ODD',
+        )
+        client, _ = _authed_client(self.team)
+        resp = client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk, 'challenge': challenge.pk,
+                'submitted_code': 'ANY', 'lat': 46.5, 'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(TeamTowerChallenge.objects.exists())
+        self.assertFalse(TeamTowerOwnership.objects.exists())
+
+    def test_stamp_migration_repairs_blank_rows_and_keeps_typed_ones(self):
+        from importlib import import_module
+
+        from django.apps import apps as global_apps
+
+        legacy = Challenge.objects.create(text='legacy', difficulty=1)
+        Challenge.objects.filter(pk=legacy.pk).update(type='')
+        nfc = Challenge.objects.create(
+            text='venue', difficulty=1, type=TYPE_NFC_QR, validation_code='X',
+        )
+        migration = import_module(
+            'game.migrations.0027_stamp_existing_challenges_text',
+        )
+        migration.stamp_text(global_apps, None)
+        legacy.refresh_from_db()
+        nfc.refresh_from_db()
+        self.assertEqual(legacy.type, TYPE_TEXT)
+        self.assertEqual(nfc.type, TYPE_NFC_QR)
+        # Idempotent: a second run changes nothing.
+        migration.stamp_text(global_apps, None)
+        self.assertEqual(
+            Challenge.objects.filter(type=TYPE_TEXT).count(), 1,
+        )
+
+
+class StaffChallengeTypeApiTest(TestCase):
+    """1.4 / 4.x / 6.x — staff authoring of typed challenges."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.session = _default_session(self.game)
+        self.client_api, _ = _staff_client(self.session)
+
+    def test_create_nfc_qr_challenge_with_config(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'Buy the drink',
+            'difficulty': 1,
+            'type': TYPE_NFC_QR,
+            'validation_code': 'DRINK-42',
+            'type_config': {'venue_label': 'Bar X', 'single_use': True},
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+        body = resp.json()
+        self.assertEqual(body['type'], TYPE_NFC_QR)
+        # Staff DO see the handout code (they hand it to the venue).
+        self.assertEqual(body['validation_code'], 'DRINK-42')
+        self.assertEqual(
+            body['type_config'], {'venue_label': 'Bar X', 'single_use': True},
+        )
+        self.assertIsNone(body['review_mode'])
+
+    def test_nfc_qr_without_code_rejected(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'no code',
+            'difficulty': 1,
+            'type': TYPE_NFC_QR,
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_nfc_qr_without_code_allowed_when_forced_manual(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'manual fallback',
+            'difficulty': 1,
+            'type': TYPE_NFC_QR,
+            'review_mode': REVIEW_MANUAL,
+        }, format='json')
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+    def test_single_use_must_be_boolean(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'bad single_use',
+            'difficulty': 1,
+            'type': TYPE_NFC_QR,
+            'validation_code': 'X',
+            'type_config': {'single_use': 'yes'},
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+    def test_type_config_must_be_an_object(self):
+        resp = self.client_api.post('/api/staff/challenges/', {
+            'game': self.game.id,
+            'text': 'bad config',
+            'difficulty': 1,
+            'type': TYPE_NFC_QR,
+            'validation_code': 'X',
+            'type_config': ['not', 'a', 'dict'],
+        }, format='json')
+        self.assertEqual(resp.status_code, 400)
+
+
+class PlayerChallengePayloadTest(TestCase):
+    """6.1 / 6.3 — players see type + payload contract, never the code."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.nfc = Challenge.objects.create(
+            text='Scan at the bar', tower=self.tower, game=self.game,
+            difficulty=1, type=TYPE_NFC_QR, validation_code='SECRET',
+        )
+        self.generic_photo = Challenge.objects.create(
+            text='Team photo', game=self.game, difficulty=2, type=TYPE_PHOTO,
+        )
+        self.client_api, _ = _authed_client(self.team)
+
+    def test_tower_state_reports_type_and_payload_without_code(self):
+        resp = self.client_api.get(f'/api/towers/{self.tower.pk}/state/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        payload = resp.json()['next_challenge']
+        self.assertEqual(payload['id'], self.nfc.pk)
+        self.assertEqual(payload['type'], TYPE_NFC_QR)
+        self.assertEqual(payload['effective_review_mode'], REVIEW_AUTO)
+        self.assertEqual(payload['required_payload'], ['submitted_code'])
+        self.assertNotIn('validation_code', payload)
+
+    def test_challenges_endpoint_lists_every_type_without_code(self):
+        resp = self.client_api.get('/api/challenges/')
+        self.assertEqual(resp.status_code, 200, resp.content)
+        rows = resp.json()
+        self.assertEqual(len(rows), 2)
+        types = {row['type'] for row in rows}
+        self.assertEqual(types, {TYPE_NFC_QR, TYPE_PHOTO})
+        for row in rows:
+            self.assertNotIn('validation_code', row)
+            self.assertIn('effective_review_mode', row)
+            self.assertIn('required_payload', row)

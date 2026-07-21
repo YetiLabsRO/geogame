@@ -1,8 +1,15 @@
 from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
+from django.utils import timezone
 from rest_framework import serializers
 from rest_framework.exceptions import APIException
 
+from game.challenge_types import (
+    REVIEW_AUTO,
+    REVIEW_MANUAL,
+    TYPE_RFID,
+    get_handler,
+)
 from game.models import (
     Challenge,
     PresenceCheck,
@@ -118,14 +125,33 @@ class TeamSerializer(serializers.ModelSerializer):
 
 
 class ChallengeSerializer(serializers.HyperlinkedModelSerializer):
+    """Player-facing challenge payload.
+
+    Emits the challenge `type`, its effective review mode and the
+    submission payload the client must supply — but NEVER the raw
+    `validation_code` (players must obtain it at the venue).
+    """
+
     required_role_slugs = serializers.SerializerMethodField()
+    effective_review_mode = serializers.SerializerMethodField()
+    required_payload = serializers.SerializerMethodField()
 
     class Meta:
         model = Challenge
-        fields = ["text", "tower", "difficulty", "role_requirement_mode", "required_role_slugs"]
+        fields = [
+            "text", "tower", "difficulty", "type",
+            "effective_review_mode", "required_payload",
+            "role_requirement_mode", "required_role_slugs",
+        ]
 
     def get_required_role_slugs(self, challenge):
         return [role.slug for role in challenge.required_roles.all()]
+
+    def get_effective_review_mode(self, challenge):
+        return challenge.effective_review_mode()
+
+    def get_required_payload(self, challenge):
+        return challenge.required_payload()
 
 
 class Base64ImageField(serializers.ImageField):
@@ -167,20 +193,26 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
     Requires an authenticated user with an active TeamMembership. Team is
     derived from that membership — NEVER sent by the client. RFID captures
     send `rfid_code` and skip `tower`; the serializer resolves the matching
-    active RFID tower and marks the submission CONFIRMED.
+    active RFID tower and dispatches through the RFID handler.
 
     Check order: membership → location consent (live-location) →
-    tower/RFID resolution → GPS proximity → presence requirement
-    (presence-rules) → challenge role requirement (team-roles) →
-    paused session → failure lockout. The consent gate sits right
-    after membership because it is a session-level "may this player
-    play at all" precondition, independent of the tower. Presence runs
-    directly after the submitter's own proximity check (it extends it
-    to teammates), so "you are too far" wins over "your team is not
-    together", which in turn wins over "you lack a role"; the
-    pause/lockout state checks stay last. A presence photo fallback
-    never rejects — it stores the submission PENDING and forces staff
-    review (never auto-confirm, even for RFID captures).
+    tower/RFID resolution + challenge-type handler resolution +
+    required-payload check → GPS proximity (per-tower effective radius) →
+    presence requirement (presence-rules) → challenge role requirement
+    (team-roles) → paused session → failure lockout → type outcome
+    resolution. The consent gate sits right after membership because it
+    is a session-level "may this player play at all" precondition,
+    independent of the tower. The handler/payload check runs right after
+    tower resolution because an unknown type or a malformed payload is a
+    request-shape error (like an unknown RFID code), not a game-state
+    one. Presence runs directly after the submitter's own proximity
+    check (it extends it to teammates), so "you are too far" wins over
+    "your team is not together", which in turn wins over "you lack a
+    role"; the pause/lockout checks stay before outcome resolution. The
+    outcome resolution runs LAST so an auto-validated scan can never
+    bypass the proximity/presence/role/pause/lockout gates: a paused
+    hold stays PENDING, and a presence photo fallback never auto-resolves
+    (it holds for staff review, even for RFID/scan captures).
     """
 
     class Meta:
@@ -191,6 +223,7 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             "challenge",
             "tower",
             "rfid_code",
+            "submitted_code",
             "lng",
             "lat",
             "response_text",
@@ -204,6 +237,7 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
     photo = Base64ImageField(max_length=None, use_url=True, required=False, allow_empty_file=True, allow_null=True)
     tower = serializers.PrimaryKeyRelatedField(queryset=Tower.objects.all(), required=False, allow_null=True)
     rfid_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    submitted_code = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     lat = serializers.FloatField(required=True, write_only=True)
     lng = serializers.FloatField(required=True, write_only=True)
 
@@ -226,8 +260,13 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
 
         rfid_code = attrs.get('rfid_code') or None
         tower = attrs.get('tower')
+        challenge = attrs.get('challenge')
+        submitted_code = attrs.get('submitted_code') or None
 
         if rfid_code:
+            # Public RFID capture path (/tower/rfid/<code>/): resolve the
+            # tower by its code, then dispatch through the RFID handler
+            # exactly like a hand-built RFID scan submission.
             try:
                 tower = Tower.objects.get(
                     rfid_code=rfid_code,
@@ -237,11 +276,41 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
             except Tower.DoesNotExist:
                 raise serializers.ValidationError("Cod RFID necunoscut sau turn inactiv.")
             attrs['tower'] = tower
-            attrs['_auto_confirm'] = True
+            submitted_code = attrs['submitted_code'] = rfid_code
+            handler = get_handler(TYPE_RFID)
+            effective_mode = handler.review_mode
         else:
             if not tower:
                 raise serializers.ValidationError("Trebuie un turn sau un cod RFID.")
-            attrs['_auto_confirm'] = False
+            if challenge is not None:
+                # Type dispatch: an unregistered type is rejected safely
+                # (never captures), and the type's required payload must
+                # be present before anything else is evaluated.
+                handler = get_handler(challenge.type)
+                if handler is None:
+                    raise serializers.ValidationError(
+                        f"Tip de provocare necunoscut: {challenge.type}.",
+                    )
+                error = handler.payload_error(
+                    submitted_code=submitted_code, photo=attrs.get('photo'),
+                )
+                if error:
+                    raise serializers.ValidationError(error)
+                effective_mode = challenge.effective_review_mode()
+            elif tower.category == Tower.CATEGORY_RFID and submitted_code:
+                # Tower.category == RFID stays the trigger for the RFID
+                # handler: a challenge-less scan against an RFID tower
+                # takes the same auto path as the public code route.
+                handler = get_handler(TYPE_RFID)
+                effective_mode = handler.review_mode
+            else:
+                # Challenge-less free-form submission — the pre-change
+                # manual path, unchanged.
+                handler = None
+                effective_mode = REVIEW_MANUAL
+
+        attrs['_handler'] = handler
+        attrs['_effective_mode'] = effective_mode
 
         if not attrs.get('lat') or not attrs.get('lng'):
             raise serializers.ValidationError("Dacă nu ești la turn, nu poți face provocarea!")
@@ -321,33 +390,61 @@ class TeamTowerChallengeSerializer(serializers.ModelSerializer):
         if counter and counter.is_locked():
             raise TowerLockedError()
 
+        # challenge-type-system: resolve the outcome LAST, so every gate
+        # above applies to auto types too. A held submission (paused
+        # session, rejects disabled) stays PENDING — capture waits for
+        # resume, exactly as the pre-change RFID hold behaved.
+        # presence-rules: a photo-fallback submission (hold_for_review)
+        # must be reviewed by a human — it never auto-resolves, RFID/scan
+        # included, so it takes precedence over the handler outcome.
+        presence = attrs.get('_presence')
+        if attrs.get('_paused_hold'):
+            attrs['_resolved_outcome'] = TeamTowerChallenge.PENDING
+        elif presence is not None and presence[1].hold_for_review:
+            attrs['_resolved_outcome'] = TeamTowerChallenge.PENDING
+        elif handler is not None and effective_mode == REVIEW_AUTO:
+            attrs['_resolved_outcome'] = handler.validate(
+                challenge, tower, attrs['_team'], submitted_code=submitted_code,
+            )
+        else:
+            attrs['_resolved_outcome'] = TeamTowerChallenge.PENDING
+
         return attrs
 
     def create(self, validated_data):
         validated_data.pop('lat')
         validated_data.pop('lng')
         validated_data.pop('rfid_code', None)
+        validated_data.pop('_handler', None)
+        validated_data.pop('_effective_mode', None)
+        validated_data.pop('_paused_hold', False)
         team = validated_data.pop('_team')
-        auto_confirm = validated_data.pop('_auto_confirm')
-        paused_hold = validated_data.pop('_paused_hold', False)
+        # The outcome (CONFIRMED/REJECTED/PENDING) was fully resolved in
+        # validate() — it already accounts for the paused hold and the
+        # presence photo-fallback hold, so create() only persists it.
+        outcome = validated_data.pop('_resolved_outcome')
         presence = validated_data.pop('_presence', None)
         user = self.context['request'].user
 
-        # A held submission (paused session, rejects disabled) is stored
-        # PENDING and never auto-confirms — capture waits for resume.
-        if paused_hold:
-            auto_confirm = False
-        # presence-rules: a photo-fallback submission must be reviewed
-        # by a human — it is never auto-confirmed, RFID included.
-        if presence is not None and presence[1].hold_for_review:
-            auto_confirm = False
+        extra = {}
+        if outcome != TeamTowerChallenge.PENDING:
+            # System-resolved (AUTO) outcome: stamp the verification time
+            # now; checked_by stays NULL — the outcome is attributed to
+            # the system, not a reviewing staff user.
+            extra['timestamp_verified'] = timezone.now()
 
-        ttc = TeamTowerChallenge.objects.create(
+        ttc = TeamTowerChallenge(
             team=team,
             submitted_by=user,
-            outcome=TeamTowerChallenge.CONFIRMED if auto_confirm else TeamTowerChallenge.PENDING,
+            outcome=outcome,
             **validated_data,
+            **extra,
         )
+        if outcome == TeamTowerChallenge.REJECTED:
+            # Auto-reject feeds the failure consequences on insert (see
+            # TeamTowerChallenge._on_submission_created).
+            ttc._system_resolved = True
+        ttc.save()
         if presence is not None:
             resolved, result = presence
             PresenceCheck.objects.create(

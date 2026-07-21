@@ -21,6 +21,10 @@ export interface PresenceStatus {
   window_seconds: number;
 }
 
+/** challenge-type-system: the pluggable challenge type discriminator. */
+export type ChallengeType = 'TEXT' | 'PHOTO' | 'NFC_QR' | 'RFID';
+export type ReviewMode = 'AUTO' | 'MANUAL';
+
 export interface TowerState {
   id: number;
   name: string;
@@ -33,6 +37,11 @@ export interface TowerState {
     text: string;
     difficulty: number;
     tower: number | null;
+    /** challenge-type-system: drives the per-type submission UI. */
+    type: ChallengeType | string;
+    effective_review_mode: ReviewMode | null;
+    /** Payload keys a submission must supply ('photo', 'submitted_code'). */
+    required_payload: string[];
     role_requirement: RoleRequirementInfo | null;
   } | null;
   /** null = no presence requirement (presence-rules capability). */
@@ -46,6 +55,8 @@ export interface ChallengeSubmitPayload {
   tower: number;
   challenge: number;
   photo?: string;
+  /** Scanned/pasted venue or tag code for scan-type challenges. */
+  submitted_code?: string;
   lat: number;
   lng: number;
 }

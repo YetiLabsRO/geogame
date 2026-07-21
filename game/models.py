@@ -10,6 +10,12 @@ from django.db.models import Count, F, Max, Value
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, pre_delete
 
+from game.challenge_types import (
+    CHALLENGE_TYPE_CHOICES,
+    REVIEW_MODE_CHOICES,
+    TYPE_TEXT,
+    get_handler,
+)
 from organize.models import (
     CONQUEST_RULE_ALL,
     CONQUEST_RULE_ANY,
@@ -779,6 +785,29 @@ class Challenge(models.Model):
     tower = models.ForeignKey(Tower, null=True, blank=True, on_delete=models.CASCADE)
     difficulty = models.PositiveSmallIntegerField(default=1)
 
+    # --- challenge-type-system: pluggable type discriminator. The
+    # default (TEXT / no code / empty config / no override) preserves
+    # pre-change behavior exactly; validation and review flow are
+    # resolved through game.challenge_types.get_handler(type). ---
+    type = models.CharField(
+        max_length=8,
+        choices=CHALLENGE_TYPE_CHOICES,
+        default=TYPE_TEXT,
+    )
+    # Scan types (NFC_QR): the code embedded in the QR/NFC the venue
+    # hands out. NEVER exposed to players through the challenge API.
+    validation_code = models.CharField(max_length=64, null=True, blank=True)
+    # Per-type extras, e.g. {'venue_label': 'Bar X', 'single_use': true}.
+    type_config = models.JSONField(default=dict, blank=True)
+    # Optional override of the handler's default review flow (e.g. force
+    # a suspicious NFC_QR challenge to MANUAL staff review).
+    review_mode = models.CharField(
+        max_length=8,
+        choices=REVIEW_MODE_CHOICES,
+        null=True,
+        blank=True,
+    )
+
     # --- team-roles-as-mechanics: opt-in role gating. Defaults (NONE /
     # empty / False) preserve pre-change behavior exactly. ---
     role_requirement_mode = models.CharField(
@@ -810,6 +839,23 @@ class Challenge(models.Model):
         if self.tower:
             return "(Turn {}) {}".format(self.tower, self.text)
         return self.text
+
+    def effective_review_mode(self):
+        """The review flow this challenge resolves to.
+
+        `challenge.review_mode` when set, else the registered handler's
+        default; None for an unknown/unregistered type (which the
+        submission pipeline rejects safely).
+        """
+        if self.review_mode:
+            return self.review_mode
+        handler = get_handler(self.type)
+        return handler.review_mode if handler else None
+
+    def required_payload(self):
+        """Payload keys a submission for this challenge must supply."""
+        handler = get_handler(self.type)
+        return list(handler.required_payload) if handler else []
 
     def team_satisfies_roles(self, team):
         """Evaluate this challenge's role requirement for `team`.
@@ -872,6 +918,10 @@ class TeamTowerChallenge(models.Model):
     )
     response_text = models.TextField(null=True, blank=True)
     photo = models.ImageField(upload_to="photos", null=True, blank=True)
+    # challenge-type-system: the scanned code carried by scan-type
+    # submissions (NFC_QR / RFID); null for TEXT / PHOTO. Kept on auto
+    # outcomes as the audit trail of what was scanned.
+    submitted_code = models.CharField(max_length=64, null=True, blank=True)
 
     class Meta:
         ordering = ["-timestamp_submitted"]
@@ -906,10 +956,18 @@ class TeamTowerChallenge(models.Model):
         mode = self.team.session.effective('fail_counter_reset')
         if mode == FAIL_RESET_ANY_ATTEMPT_ELSEWHERE:
             self._reset_other_tower_counters()
-        # RFID auto-confirm inserts an already-CONFIRMED row, so the
-        # PENDING->CONFIRMED transition never fires for it.
+        # Auto-confirm (RFID / NFC_QR) inserts an already-CONFIRMED row,
+        # so the PENDING->CONFIRMED transition never fires for it.
         if self.outcome == TeamTowerChallenge.CONFIRMED:
             self._reset_fail_counters_on_confirm()
+        # challenge-type-system: an auto-REJECTED scan (wrong/consumed
+        # code) is inserted as an already-REJECTED row; apply the same
+        # failure consequences a staff rejection triggers so it feeds
+        # the cooldown and fail counters. Flagged by the submission
+        # serializer only — direct ORM inserts (fixtures, admin) keep
+        # their pre-change behavior.
+        if self.outcome == TeamTowerChallenge.REJECTED and getattr(self, '_system_resolved', False):
+            self._apply_failure_consequences()
 
     def _reset_other_tower_counters(self):
         TeamTowerFailCounter.objects.filter(team=self.team).exclude(tower=self.tower).update(

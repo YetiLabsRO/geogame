@@ -5,9 +5,11 @@ from django.core.exceptions import ValidationError
 from django.db import transaction
 
 # Register your models here.
+from django.utils.html import format_html
 from django.utils.safestring import mark_safe
 from leaflet.admin import LeafletGeoAdmin
 
+from game.challenge_types import SCAN_TYPES, TYPE_NFC_QR
 from game.models import (
     Challenge,
     Collection,
@@ -178,8 +180,50 @@ class TeamAdmin(admin.ModelAdmin):
 
 
 class ChallengeAdmin(admin.ModelAdmin):
-    list_display = ['__str__', 'tower', 'difficulty', 'incercari_total', 'incercari_reusite']
-    list_filter = ['tower', ]
+    list_display = [
+        '__str__', 'type', 'tower', 'difficulty', 'get_handout_code',
+        'incercari_total', 'incercari_reusite',
+    ]
+    list_filter = ['type', 'tower']
+
+    # The scan-type configuration fieldset is only shown for the types
+    # that use it (NFC_QR / RFID) — see get_fieldsets.
+    base_fieldsets = (
+        (None, {
+            'fields': ('game', 'text', 'tower', 'difficulty', 'type', 'review_mode'),
+        }),
+        ('Role requirements', {
+            'fields': (
+                'role_requirement_mode', 'required_roles', 'require_holders_present',
+            ),
+        }),
+    )
+    scan_fieldset = (
+        'Scan validation (NFC/QR)', {
+            'description': (
+                'validation_code is the code embedded in the QR/NFC handed '
+                'out at the venue — print it from the list column. '
+                "type_config holds per-type extras, e.g. "
+                '{"venue_label": "Bar X", "single_use": true}.'
+            ),
+            'fields': ('validation_code', 'type_config'),
+        },
+    )
+
+    def get_fieldsets(self, request, obj=None):
+        # On add the type is not yet known, so offer the full form; when
+        # editing, only scan types surface the scan configuration.
+        if obj is None or obj.type in SCAN_TYPES:
+            return self.base_fieldsets + (self.scan_fieldset,)
+        return self.base_fieldsets
+
+    def get_handout_code(self, obj):
+        """Printable/handout venue code for NFC_QR challenges (task 4.3)."""
+        if obj.type == TYPE_NFC_QR and obj.validation_code:
+            return format_html('<code>{}</code>', obj.validation_code)
+        return '-'
+
+    get_handout_code.short_description = 'Handout code'
 
     def incercari_total(self, obj):
         return TeamTowerChallenge.objects.filter(challenge=obj).count()
@@ -190,8 +234,8 @@ class ChallengeAdmin(admin.ModelAdmin):
 
 class TeamTowerChallangeAdmin(admin.ModelAdmin):
     list_filter = ['checked_by', 'outcome', 'team']
-    list_display = ['id', 'team', 'tower', 'challenge_text', 'checked_by', 'timestamp_submitted', 'timestamp_verified', 'time_diff', 'outcome']
-    readonly_fields = ['response_text', 'photo', 'timestamp_verified', 'team', 'challenge', 'tower']
+    list_display = ['id', 'team', 'tower', 'challenge_text', 'submitted_code', 'checked_by', 'timestamp_submitted', 'timestamp_verified', 'time_diff', 'outcome']
+    readonly_fields = ['response_text', 'photo', 'timestamp_verified', 'team', 'challenge', 'tower', 'submitted_code']
 
     def challenge_text(self, obj):
         if obj.challenge:

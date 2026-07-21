@@ -37,13 +37,20 @@ interface Row {
         </p>
         <form [formGroup]="createForm" (ngSubmit)="create()" novalidate>
           <div class="row g-2">
-            <div class="col-md-5">
+            <div class="col-md-4">
               <textarea
                 class="form-control"
                 rows="2"
                 placeholder="Challenge text"
                 formControlName="text"
               ></textarea>
+            </div>
+            <div class="col-md-2">
+              <select class="form-select" formControlName="type">
+                @for (t of typeOptions; track t.value) {
+                  <option [ngValue]="t.value">{{ t.label }}</option>
+                }
+              </select>
             </div>
             <div class="col-md-3">
               <select class="form-select" formControlName="tower">
@@ -53,11 +60,11 @@ interface Row {
                 }
               </select>
             </div>
-            <div class="col-md-2">
+            <div class="col-md-1">
               <input
                 type="number"
                 class="form-control"
-                placeholder="Difficulty"
+                placeholder="Diff."
                 min="1"
                 formControlName="difficulty"
               />
@@ -75,6 +82,23 @@ interface Row {
               </button>
             </div>
           </div>
+          @if (createForm.value.type === 'NFC_QR') {
+            <div class="row g-2 mt-1">
+              <div class="col-md-4">
+                <input
+                  type="text"
+                  class="form-control"
+                  placeholder="Validation code (handed out at the venue)"
+                  formControlName="validation_code"
+                />
+              </div>
+              <div class="col-md-8 form-text">
+                The code embedded in the QR/NFC the venue hands out. Required
+                unless the challenge is switched to manual review after
+                creation.
+              </div>
+            </div>
+          }
           @if (createError(); as msg) {
             <div class="alert alert-danger py-2 mt-2 mb-0">{{ msg }}</div>
           }
@@ -213,6 +237,7 @@ interface Row {
           <thead>
             <tr>
               <th>Text</th>
+              <th style="min-width: 14rem">Type</th>
               <th style="min-width: 12rem">Tower</th>
               <th style="max-width: 6rem">Difficulty</th>
               <th style="min-width: 14rem">Role requirement</th>
@@ -230,6 +255,61 @@ interface Row {
                     [ngModel]="row.draft.text"
                     (ngModelChange)="update(row, 'text', $event)"
                   ></textarea>
+                </td>
+                <td>
+                  <select
+                    class="form-select form-select-sm mb-1"
+                    [ngModel]="row.draft.type"
+                    (ngModelChange)="update(row, 'type', $event)"
+                  >
+                    @for (t of typeOptions; track t.value) {
+                      <option [ngValue]="t.value">{{ t.label }}</option>
+                    }
+                  </select>
+                  @if (row.draft.type === 'NFC_QR') {
+                    <input
+                      type="text"
+                      class="form-control form-control-sm mb-1"
+                      placeholder="Validation code"
+                      [ngModel]="row.draft.validation_code"
+                      (ngModelChange)="update(row, 'validation_code', $event)"
+                    />
+                    <input
+                      type="text"
+                      class="form-control form-control-sm mb-1"
+                      placeholder="Venue label (e.g. Bar X)"
+                      [ngModel]="venueLabel(row)"
+                      (ngModelChange)="updateConfig(row, 'venue_label', $event)"
+                    />
+                    <div class="form-check">
+                      <input
+                        type="checkbox"
+                        class="form-check-input"
+                        [id]="'single-use-' + row.challenge.id"
+                        [checked]="singleUse(row)"
+                        (change)="updateConfig(row, 'single_use', !singleUse(row))"
+                      />
+                      <label
+                        class="form-check-label small"
+                        [for]="'single-use-' + row.challenge.id"
+                      >
+                        Single-use code (consumed on first confirm)
+                      </label>
+                    </div>
+                  } @else if (row.draft.type === 'RFID') {
+                    <div class="small text-body-secondary mb-1">
+                      Code comes from the tower's RFID tag.
+                    </div>
+                  }
+                  <select
+                    class="form-select form-select-sm"
+                    [ngModel]="row.draft.review_mode"
+                    (ngModelChange)="update(row, 'review_mode', $event)"
+                  >
+                    <option [ngValue]="null">Review: type default</option>
+                    <option [ngValue]="'AUTO'">Review: force auto</option>
+                    <option [ngValue]="'MANUAL'">Review: force manual</option>
+                  </select>
                 </td>
                 <td>
                   <select
@@ -371,8 +451,18 @@ export class ChallengesComponent {
   protected readonly requirementBusy = signal(false);
   protected readonly requirementError = signal<string | null>(null);
 
+  /** challenge-type-system: authoring options for Challenge.type. */
+  protected readonly typeOptions = [
+    { value: 'TEXT', label: 'Text question (staff-reviewed)' },
+    { value: 'PHOTO', label: 'Photo evidence (staff-reviewed)' },
+    { value: 'NFC_QR', label: 'NFC/QR venue code (auto)' },
+    { value: 'RFID', label: 'RFID tag scan (auto)' },
+  ] as const;
+
   protected readonly createForm = this.fb.group({
     text: ['', [Validators.required]],
+    type: ['TEXT'],
+    validation_code: [''],
     tower: [null as number | null],
     difficulty: [1, [Validators.required, Validators.min(1)]],
   });
@@ -455,6 +545,27 @@ export class ChallengesComponent {
     });
   }
 
+  // --- challenge-type-system: type_config helpers -------------------------
+
+  protected venueLabel(row: Row): string {
+    const label = row.draft.type_config?.['venue_label'];
+    return typeof label === 'string' ? label : '';
+  }
+
+  protected singleUse(row: Row): boolean {
+    return row.draft.type_config?.['single_use'] === true;
+  }
+
+  protected updateConfig(row: Row, key: string, value: unknown): void {
+    const config = { ...(row.draft.type_config ?? {}) };
+    if (value === '' || value === false || value == null) {
+      delete config[key];
+    } else {
+      config[key] = value;
+    }
+    this.update(row, 'type_config', config);
+  }
+
   protected toggleRequiredRole(row: Row, roleId: number): void {
     const current = row.draft.required_roles;
     const next = current.includes(roleId)
@@ -496,6 +607,12 @@ export class ChallengesComponent {
         text: raw.text,
         tower: raw.tower,
         difficulty: raw.difficulty,
+        // challenge-type-system: type + per-type config. Venue label /
+        // single-use are edited on the row after creation.
+        type: raw.type,
+        validation_code: raw.validation_code.trim() || null,
+        type_config: {},
+        review_mode: null,
         // game is derived server-side once T3.5 scoping lands; in the
         // meantime the backfill migration covers existing rows.
         game: null,
@@ -510,7 +627,13 @@ export class ChallengesComponent {
       .subscribe({
         next: () => {
           this.creating.set(false);
-          this.createForm.reset({ text: '', tower: null, difficulty: 1 });
+          this.createForm.reset({
+            text: '',
+            type: 'TEXT',
+            validation_code: '',
+            tower: null,
+            difficulty: 1,
+          });
           this.refresh();
         },
         error: (err) => {

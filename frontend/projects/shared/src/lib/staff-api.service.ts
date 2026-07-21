@@ -2,6 +2,8 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
+import { ChallengeType, ReviewMode } from './game-api.service';
+
 export type SubmissionOutcome = 0 | 1 | 2; // PENDING, CONFIRMED, REJECTED
 export type SubmissionFilter = 'pending' | 'confirmed' | 'rejected' | 'all';
 
@@ -15,9 +17,15 @@ export interface StaffSubmission {
   challenge: number | null;
   challenge_text: string | null;
   challenge_difficulty: number | null;
+  /** challenge-type-system: type of the submitted challenge (RFID for challenge-less scans). */
+  challenge_type: ChallengeType | string | null;
   submitted_by: number | null;
   submitted_by_username: string | null;
   photo_url: string | null;
+  /** Scanned code carried by scan-type submissions (audit trail). */
+  submitted_code: string | null;
+  /** True when the outcome was resolved by the system (AUTO types), not staff. */
+  auto_resolved: boolean;
   timestamp_submitted: string;
   timestamp_verified: string | null;
   outcome: SubmissionOutcome;
@@ -176,6 +184,14 @@ export interface AdminChallenge {
   text: string;
   tower: number | null;
   difficulty: number;
+  /** challenge-type-system: type + per-type configuration. */
+  type: ChallengeType | string;
+  /** Handout code for NFC_QR (staff-only; never sent to players). */
+  validation_code: string | null;
+  /** Per-type extras, e.g. { venue_label: 'Bar X', single_use: true }. */
+  type_config: Record<string, unknown>;
+  /** Optional override of the type's default review flow. */
+  review_mode: ReviewMode | null;
   role_requirement_mode: RoleRequirementMode;
   required_roles: number[];
   require_holders_present: boolean;
