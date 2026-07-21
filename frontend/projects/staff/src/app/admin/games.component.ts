@@ -13,6 +13,7 @@ import {
 
 import { extractErrorMessage } from '../auth/form-error';
 import { GameRolesPanelComponent } from './game-roles-panel.component';
+import { ScoreMultipliersPanelComponent } from './score-multipliers-panel.component';
 
 type PauseKnob =
   | 'pause_freezes_floating_score'
@@ -38,7 +39,13 @@ interface Row {
   selector: 'app-admin-games',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, FormsModule, RouterLink, GameRolesPanelComponent],
+  imports: [
+    ReactiveFormsModule,
+    FormsModule,
+    RouterLink,
+    GameRolesPanelComponent,
+    ScoreMultipliersPanelComponent,
+  ],
   template: `
     <h1 class="h3 mb-3">Games</h1>
     <p class="text-body-secondary small">
@@ -210,6 +217,13 @@ interface Row {
                     <button
                       type="button"
                       class="btn btn-sm btn-outline-secondary"
+                      (click)="toggleMultipliers(row.game.id)"
+                    >
+                      Multipliers
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-sm btn-outline-secondary"
                       (click)="clone(row)"
                     >
                       Clone game
@@ -245,6 +259,13 @@ interface Row {
                 <tr class="table-light">
                   <td colspan="7">
                     <app-game-roles-panel [gameId]="row.game.id" />
+                  </td>
+                </tr>
+              }
+              @if (multipliersExpanded().has(row.game.id)) {
+                <tr class="table-light">
+                  <td colspan="7">
+                    <app-score-multipliers-panel [gameId]="row.game.id" />
                   </td>
                 </tr>
               }
@@ -435,6 +456,7 @@ export class GamesComponent {
 
   protected readonly expanded = signal<Set<number>>(new Set<number>());
   protected readonly rolesExpanded = signal<Set<number>>(new Set<number>());
+  protected readonly multipliersExpanded = signal<Set<number>>(new Set<number>());
 
   protected readonly pauseKnobs: { field: PauseKnob; label: string }[] = [
     { field: 'pause_freezes_floating_score', label: 'Freeze floating score while paused' },
@@ -518,6 +540,14 @@ export class GamesComponent {
 
   protected toggleRoles(id: number): void {
     this.rolesExpanded.update((set) => {
+      const next = new Set(set);
+      next.has(id) ? next.delete(id) : next.add(id);
+      return next;
+    });
+  }
+
+  protected toggleMultipliers(id: number): void {
+    this.multipliersExpanded.update((set) => {
       const next = new Set(set);
       next.has(id) ? next.delete(id) : next.add(id);
       return next;

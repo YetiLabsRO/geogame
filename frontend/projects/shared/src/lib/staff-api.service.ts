@@ -2,6 +2,8 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
+import { ScoreMultiplierScope, ScoreMultiplierType } from './game-api.service';
+
 export type SubmissionOutcome = 0 | 1 | 2; // PENDING, CONFIRMED, REJECTED
 export type SubmissionFilter = 'pending' | 'confirmed' | 'rejected' | 'all';
 
@@ -315,6 +317,45 @@ export interface StartReadiness {
   teams: StartReadinessTeam[];
 }
 
+/** A ScoreMultiplier row (score-multipliers capability). Durations are
+ *  Django strings ("HH:MM:SS" or "D HH:MM:SS"); datetimes are ISO. */
+export interface AdminScoreMultiplier {
+  id: number;
+  game: number | null;
+  session: number | null;
+  scope: ScoreMultiplierScope;
+  tower: number | null;
+  tower_name: string | null;
+  zone: number | null;
+  zone_name: string | null;
+  multiplier_type: ScoreMultiplierType;
+  factor: number;
+  is_active: boolean;
+  window_start_offset: string | null;
+  window_end_offset: string | null;
+  starts_at: string | null;
+  ends_at: string | null;
+  label: string;
+  created_by: number | null;
+  created_by_username: string | null;
+  created_at: string;
+}
+
+/** Ownership (game/session) comes from the URL, never the body. */
+export interface AdminScoreMultiplierPayload {
+  scope: ScoreMultiplierScope;
+  multiplier_type: ScoreMultiplierType;
+  factor: number;
+  tower?: number | null;
+  zone?: number | null;
+  is_active?: boolean;
+  window_start_offset?: string | null;
+  window_end_offset?: string | null;
+  starts_at?: string | null;
+  ends_at?: string | null;
+  label?: string;
+}
+
 @Injectable({ providedIn: 'root' })
 export class StaffApiService {
   private readonly http = inject(HttpClient);
@@ -595,6 +636,72 @@ export class StaffApiService {
   sessionStartBlockers(id: number): Observable<StartReadiness> {
     return this.http.get<StartReadiness>(
       `/api/staff/sessions/${id}/start_blockers/`,
+    );
+  }
+
+  // ---- Score multipliers (score-multipliers) --------------------------------
+
+  listGameMultipliers(gameId: number): Observable<AdminScoreMultiplier[]> {
+    return this.http.get<AdminScoreMultiplier[]>(
+      `/api/staff/games/${gameId}/score-multipliers/`,
+    );
+  }
+
+  createGameMultiplier(
+    gameId: number,
+    payload: AdminScoreMultiplierPayload,
+  ): Observable<AdminScoreMultiplier> {
+    return this.http.post<AdminScoreMultiplier>(
+      `/api/staff/games/${gameId}/score-multipliers/`,
+      payload,
+    );
+  }
+
+  updateGameMultiplier(
+    gameId: number,
+    id: number,
+    patch: Partial<AdminScoreMultiplierPayload>,
+  ): Observable<AdminScoreMultiplier> {
+    return this.http.patch<AdminScoreMultiplier>(
+      `/api/staff/games/${gameId}/score-multipliers/${id}/`,
+      patch,
+    );
+  }
+
+  deleteGameMultiplier(gameId: number, id: number): Observable<void> {
+    return this.http.delete<void>(
+      `/api/staff/games/${gameId}/score-multipliers/${id}/`,
+    );
+  }
+
+  /** Union of Session-owned and Game-owned rows — the whole picture. */
+  listSessionMultipliers(sessionId: number): Observable<AdminScoreMultiplier[]> {
+    return this.http.get<AdminScoreMultiplier[]>(
+      `/api/staff/sessions/${sessionId}/score-multipliers/`,
+    );
+  }
+
+  /** Live drop: always creates a Session-owned row (MANUAL / RANDOM_BONUS). */
+  createSessionMultiplier(
+    sessionId: number,
+    payload: AdminScoreMultiplierPayload,
+  ): Observable<AdminScoreMultiplier> {
+    return this.http.post<AdminScoreMultiplier>(
+      `/api/staff/sessions/${sessionId}/score-multipliers/`,
+      payload,
+    );
+  }
+
+  /** Live MANUAL switch: flips is_active from this instant forward. */
+  setMultiplierActive(
+    sessionId: number,
+    id: number,
+    active: boolean,
+  ): Observable<AdminScoreMultiplier> {
+    const action = active ? 'activate' : 'deactivate';
+    return this.http.post<AdminScoreMultiplier>(
+      `/api/staff/sessions/${sessionId}/score-multipliers/${id}/${action}/`,
+      {},
     );
   }
 }

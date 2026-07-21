@@ -126,6 +126,13 @@ export class GameApiService {
     return this.http.get<SessionTimeline>(`/api/sessions/${id}/timeline/`);
   }
 
+  /** Multipliers in effect right now — map/scoreboard banner source. */
+  sessionActiveMultipliers(id: number): Observable<ActiveMultiplier[]> {
+    return this.http.get<ActiveMultiplier[]>(
+      `/api/sessions/${id}/score-multipliers/active/`,
+    );
+  }
+
   zones(params?: { group?: number; groupSlug?: string }): Observable<ZoneFeature[]> {
     const parts: string[] = [];
     if (params?.group) parts.push(`group=${params.group}`);
@@ -203,6 +210,28 @@ export interface SessionScoreboardEntry {
 export interface SessionScoreboard {
   session: CurrentSession;
   entries: SessionScoreboardEntry[];
+  /** Multipliers in effect right now (score-multipliers capability). */
+  active_multipliers: ActiveMultiplier[];
+}
+
+// ---- score-multipliers -----------------------------------------------------
+
+export type ScoreMultiplierScope = 'TOWER' | 'ZONE' | 'GLOBAL';
+export type ScoreMultiplierType = 'MANUAL' | 'SCHEDULED' | 'RANDOM_BONUS';
+
+/** One multiplier in effect right now (read-only banner payload). */
+export interface ActiveMultiplier {
+  id: number;
+  factor: number;
+  scope: ScoreMultiplierScope;
+  multiplier_type: ScoreMultiplierType;
+  tower_id: number | null;
+  tower_name: string | null;
+  zone_id: number | null;
+  zone_name: string | null;
+  label: string;
+  active_until: string | null;
+  owned_by: 'session' | 'game';
 }
 
 export interface SessionTimelineEvent {

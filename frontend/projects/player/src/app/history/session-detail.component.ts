@@ -4,6 +4,7 @@ import { ActivatedRoute, RouterLink } from '@angular/router';
 import { forkJoin } from 'rxjs';
 
 import {
+  ActiveMultiplier,
   GameApiService,
   SessionScoreboard,
   SessionTimeline,
@@ -37,6 +38,16 @@ import { extractErrorMessage } from '../auth/form-error';
           </div>
 
           <h2 class="h5 mt-4 mb-2">Scoreboard</h2>
+          @if (sb.active_multipliers.length > 0) {
+            <div class="mb-2">
+              @for (b of sb.active_multipliers; track b.id) {
+                <span class="badge text-bg-warning me-1">
+                  <i class="bi bi-lightning-charge-fill"></i>
+                  &times;{{ b.factor }} points {{ boostTarget(b) }}
+                </span>
+              }
+            </div>
+          }
           <div class="table-responsive">
             <table class="table">
               <thead>
@@ -126,6 +137,13 @@ export class SessionDetailComponent {
   protected readonly scoreboard = signal<SessionScoreboard | null>(null);
   protected readonly timeline = signal<SessionTimeline | null>(null);
   protected readonly loadError = signal<string | null>(null);
+
+  protected boostTarget(b: ActiveMultiplier): string {
+    if (b.label) return `— ${b.label}`;
+    if (b.scope === 'TOWER') return `at ${b.tower_name}`;
+    if (b.scope === 'ZONE') return `in ${b.zone_name}`;
+    return 'everywhere';
+  }
 
   constructor() {
     const id = Number(this.route.snapshot.paramMap.get('id'));
