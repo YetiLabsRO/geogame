@@ -3,6 +3,7 @@ import { FormBuilder, ReactiveFormsModule, Validators, FormsModule } from '@angu
 import { RouterLink } from '@angular/router';
 
 import {
+  AdminCollection,
   AdminGame,
   AdminGamePayload,
   FailCounterReset,
@@ -139,6 +140,18 @@ interface Row {
                     [ngModel]="row.draft.name"
                     (ngModelChange)="update(row, 'name', $event)"
                   />
+                  <div class="mt-1">
+                    @if (row.game.created_by_username; as creator) {
+                      <span class="badge text-bg-light border me-1">
+                        by {{ creator }}
+                      </span>
+                    }
+                    @if (row.game.cloned_from !== null) {
+                      <span class="badge text-bg-info">
+                        clone of #{{ row.game.cloned_from }}
+                      </span>
+                    }
+                  </div>
                 </td>
                 <td>
                   <input
@@ -196,6 +209,13 @@ interface Row {
                     </button>
                     <button
                       type="button"
+                      class="btn btn-sm btn-outline-secondary"
+                      (click)="clone(row)"
+                    >
+                      Clone game
+                    </button>
+                    <button
+                      type="button"
                       class="btn btn-sm btn-outline-warning"
                       (click)="pauseAll(row)"
                     >
@@ -232,6 +252,32 @@ interface Row {
                 <tr class="table-light">
                   <td colspan="7">
                     <div class="row g-3 py-2">
+                      <div class="col-12">
+                        <div class="fw-semibold small mb-2">Map collections</div>
+                        @if (allCollections().length === 0) {
+                          <div class="text-body-secondary small">
+                            No collections in the repository yet — create one on
+                            the Collections page.
+                          </div>
+                        }
+                        @for (c of allCollections(); track c.id) {
+                          <div class="form-check form-check-inline">
+                            <input
+                              type="checkbox"
+                              class="form-check-input"
+                              [id]="'col-' + c.id + '-' + row.game.id"
+                              [checked]="row.draft.collections.includes(c.id)"
+                              (change)="toggleCollection(row, c.id)"
+                            />
+                            <label
+                              class="form-check-label small"
+                              [for]="'col-' + c.id + '-' + row.game.id"
+                            >
+                              {{ c.name }}
+                            </label>
+                          </div>
+                        }
+                      </div>
                       <div class="col-md-6">
                         <div class="fw-semibold small mb-2">Day pausing</div>
                         @for (k of pauseKnobs; track k.field) {
@@ -381,6 +427,7 @@ export class GamesComponent {
   private readonly api = inject(StaffApiService);
 
   protected readonly rows = signal<Row[]>([]);
+  protected readonly allCollections = signal<AdminCollection[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
   protected readonly creating = signal(false);
@@ -423,6 +470,42 @@ export class GamesComponent {
 
   constructor() {
     this.refresh();
+    this.api.listCollections().subscribe({
+      next: (list) => this.allCollections.set(list),
+      error: () => {},
+    });
+  }
+
+  protected toggleCollection(row: Row, collectionId: number): void {
+    const has = row.draft.collections.includes(collectionId);
+    const next = has
+      ? row.draft.collections.filter((id) => id !== collectionId)
+      : [...row.draft.collections, collectionId];
+    this.update(row, 'collections', next);
+  }
+
+  protected clone(row: Row): void {
+    this.patch(row, { pauseMsg: 'Cloning…' });
+    this.api.cloneGame(row.game.id).subscribe({
+      next: (created) => {
+        // Append the clone locally so the status message survives.
+        this.rows.update((rows) => [
+          ...rows,
+          {
+            game: created,
+            draft: { ...created },
+            dirty: false,
+            saving: false,
+            error: null,
+            pauseMsg: null,
+          },
+        ]);
+        this.patch(row, {
+          pauseMsg: `Cloned as "${created.name}" (${created.slug}).`,
+        });
+      },
+      error: (err) => this.patch(row, { pauseMsg: extractErrorMessage(err) }),
+    });
   }
 
   protected toggleRules(id: number): void {
@@ -531,6 +614,7 @@ export class GamesComponent {
       .updateGame(row.game.id, {
         name: row.draft.name,
         is_active: row.draft.is_active,
+        collections: row.draft.collections,
         proximity_meters: row.draft.proximity_meters,
         cooloff_minutes: row.draft.cooloff_minutes,
         initial_bonus_default: row.draft.initial_bonus_default,

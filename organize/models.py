@@ -134,19 +134,82 @@ class Game(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True, null=True)
 
+    # The Game's map: one or more reusable Collections of repository
+    # Towers/Zones. Geometry scoping resolves Session → Game →
+    # collections → Towers/Zones (see towers() / zones()).
+    collections = models.ManyToManyField(
+        'game.Collection', related_name='games', blank=True,
+    )
+
+    # Provenance for cloned templates: a runner clones a Game to
+    # personalise it; the clone shares the source's Collections (and
+    # therefore geometry) but owns its rules/challenges/team groups.
+    cloned_from = models.ForeignKey(
+        'self',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='clones',
+    )
+
     def __str__(self):
         return self.name
 
-    def clone(self, slug, name=None, created_by=None):
-        """Deep-copy this Game template.
+    def towers(self):
+        """Distinct union of Towers across this Game's linked collections."""
+        from game.models import Tower
+        return Tower.objects.filter(collections__games=self).distinct()
 
-        Copies config fields, TeamGroups, GameRoles, and Challenges,
-        remapping each cloned Challenge's `required_roles` to the
-        clone's own roles so the clone never references the original's
-        roles. Zones/Towers are not cloned yet — that belongs to the
-        `game-authoring-roles` capability, which extends this routine;
-        until then tower-linked challenges are copied as generic
-        (tower=None).
+    def zones(self):
+        """Distinct union of Zones across this Game's linked collections."""
+        from game.models import Zone
+        return Zone.objects.filter(collections__games=self).distinct()
+
+    def can_edit(self, user):
+        """Template-authoring permission (creator side).
+
+        The creator, a CREATOR collaborator, and superusers may mutate
+        the template (rules, collections, challenge bank, team groups).
+        Legacy games with no recorded creator stay editable by any
+        staff user — preserving pre-roles behavior.
+        """
+        if user is None or not getattr(user, 'is_authenticated', False) or not user.is_staff:
+            return False
+        if user.is_superuser:
+            return True
+        if self.created_by_id is None:
+            return True
+        if self.created_by_id == user.id:
+            return True
+        return self.collaborators.filter(
+            user=user, role=GameCollaborator.ROLE_CREATOR,
+        ).exists()
+
+    def can_run(self, user):
+        """Runner permission: who may launch/control Sessions under this Game.
+
+        Any staff user can run sessions (matching existing behavior);
+        editors are implicitly runners too.
+        """
+        if user is None or not getattr(user, 'is_authenticated', False):
+            return False
+        if user.is_staff:
+            return True
+        return self.collaborators.filter(
+            user=user, role=GameCollaborator.ROLE_RUNNER,
+        ).exists()
+
+    def clone(self, slug, name=None, created_by=None):
+        """Deep-copy this Game template, sharing the geometry repository.
+
+        Copies every config field, the TeamGroup taxonomy, GameRoles,
+        and the challenge bank, remapping each cloned Challenge's
+        `required_roles` to the clone's own roles so the clone never
+        references the original's roles. Geometry is never copied: the
+        clone links the SAME Collections (and therefore the same
+        Tower/Zone rows by PK), so tower-bound challenges keep their
+        tower reference. Records `cloned_from` provenance; the clone
+        starts inactive.
         """
         from game.models import Challenge
 
@@ -159,7 +222,12 @@ class Game(models.Model):
             clone.is_active = False
             clone.created_by = created_by
             clone.created_at = None  # auto_now_add repopulates on save
+            clone.cloned_from = self
             clone.save()
+
+            # Share the geometry: link the SAME collections, never copy
+            # Tower/Zone rows.
+            clone.collections.set(self.collections.all())
 
             for group in TeamGroup.objects.filter(game=self):
                 TeamGroup.objects.create(game=clone, name=group.name, slug=group.slug)
@@ -180,7 +248,9 @@ class Game(models.Model):
                 challenge_clone = Challenge.objects.create(
                     game=clone,
                     text=challenge.text,
-                    tower=None,
+                    # Geometry is shared by PK across clones, so
+                    # tower-bound challenges keep their tower link.
+                    tower=challenge.tower,
                     difficulty=challenge.difficulty,
                     role_requirement_mode=challenge.role_requirement_mode,
                     require_holders_present=challenge.require_holders_present,
@@ -218,6 +288,40 @@ class GameRole(models.Model):
 
     def __str__(self):
         return f'{self.game.slug}/{self.slug}'
+
+
+class GameCollaborator(models.Model):
+    """Lightweight authoring permission on a Game (creator vs runner).
+
+    CREATOR rows may edit the template alongside `Game.created_by`;
+    RUNNER rows may launch/control Sessions without edit rights.
+    """
+
+    ROLE_CREATOR = 'CREATOR'
+    ROLE_RUNNER = 'RUNNER'
+    ROLE_CHOICES = [
+        (ROLE_CREATOR, 'Creator — may edit the game template'),
+        (ROLE_RUNNER, 'Runner — may run sessions under the game'),
+    ]
+
+    game = models.ForeignKey(
+        Game, on_delete=models.CASCADE, related_name='collaborators',
+    )
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='game_collaborations',
+    )
+    role = models.CharField(
+        max_length=16, choices=ROLE_CHOICES, default=ROLE_RUNNER,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        unique_together = (('game', 'user'),)
+
+    def __str__(self):
+        return f'{self.user} as {self.role} on {self.game}'
 
 
 class UserProfile(models.Model):
@@ -384,6 +488,14 @@ class Session(models.Model):
         if value is None:
             return getattr(self.game, field)
         return value
+
+    def towers(self):
+        """Convenience resolver: the Session's geometry is its Game's."""
+        return self.game.towers()
+
+    def zones(self):
+        """Convenience resolver: the Session's geometry is its Game's."""
+        return self.game.zones()
 
     # ------------------------------------------------------------------
     # Lifecycle state machine (session-lifecycle capability)

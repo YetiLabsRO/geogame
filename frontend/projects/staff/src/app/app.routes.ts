@@ -47,6 +47,12 @@ export const routes: Routes = [
       import('./admin/challenges.component').then((m) => m.ChallengesComponent),
   },
   {
+    path: 'collections',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/collections.component').then((m) => m.CollectionsComponent),
+  },
+  {
     path: 'games',
     canActivate: [staffGuard],
     loadComponent: () =>

@@ -18,7 +18,7 @@ from django.db import transaction
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 
-from game.models import Challenge, Tower, Zone
+from game.models import Challenge, Collection, Tower, Zone
 from organize.models import Game, Invite, Session, Team, TeamGroup
 
 User = get_user_model()
@@ -45,6 +45,7 @@ class Command(BaseCommand):
         Challenge.objects.filter(text__startswith=MARKER).delete()
         Tower.objects.filter(name__startswith=MARKER).delete()
         Zone.objects.filter(name__startswith=MARKER).delete()
+        Collection.objects.filter(name__startswith=MARKER).delete()
         Team.objects.filter(name__startswith=MARKER).delete()
         TeamGroup.objects.filter(slug__startswith=MARKER).delete()
         Session.objects.filter(game__name__startswith=MARKER).delete()
@@ -78,23 +79,28 @@ class Command(BaseCommand):
             color='#ff3366',
         )
 
-        # ---- Zone / tower / challenge ------------------------------------
+        # ---- Collection / zone / tower / challenge -----------------------
+        collection = Collection.objects.create(
+            name=f'{MARKER}-collection',
+            slug=f'{MARKER}-collection',
+        )
+        game.collections.add(collection)
         zone = Zone.objects.create(
             name=f'{MARKER}-zone',
-            game=game,
             color='#224466',
             scoring_type=Zone.SCORE_LIN,
             shape=Polygon.from_bbox((23.5, 46.0, 23.7, 46.15)),
         )
         tower = Tower.objects.create(
             name=f'{MARKER}-tower-alpha',
-            game=game,
             zone=zone,
             location=Point(23.571797, 46.068374),
             is_active=True,
             category=Tower.CATEGORY_NORMAL,
             initial_bonus=10,
         )
+        collection.zones.add(zone)
+        collection.towers.add(tower)
         Challenge.objects.create(
             text=f'{MARKER} challenge text — do a thing at the tower',
             tower=tower,

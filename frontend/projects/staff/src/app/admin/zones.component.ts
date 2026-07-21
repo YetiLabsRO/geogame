@@ -44,6 +44,7 @@ interface Row {
               <th>Name</th>
               <th>Color</th>
               <th>Scoring type</th>
+              <th>Used by</th>
               <th></th>
             </tr>
           </thead>
@@ -77,6 +78,19 @@ interface Row {
                     <option [ngValue]="3">Linear (proportional)</option>
                     <option [ngValue]="4">Bonus (capped 200)</option>
                   </select>
+                </td>
+                <td>
+                  <!-- Usage guard: which collections + games share this
+                       repository zone — edit with awareness. -->
+                  @for (c of row.zone.collections; track c.id) {
+                    <span class="badge text-bg-light border me-1">{{ c.name }}</span>
+                  }
+                  @for (g of row.zone.games; track g.id) {
+                    <span class="badge text-bg-secondary me-1">{{ g.name }}</span>
+                  }
+                  @if (row.zone.collections.length === 0) {
+                    <span class="text-body-secondary small">orphan</span>
+                  }
                 </td>
                 <td class="text-end">
                   <button
