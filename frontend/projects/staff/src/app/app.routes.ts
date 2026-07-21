@@ -73,6 +73,14 @@ export const routes: Routes = [
       import('./scoreboard/scoreboard.component').then((m) => m.ScoreboardComponent),
   },
   {
+    path: 'dementors',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./dementors/dementors-dashboard.component').then(
+        (m) => m.DementorsDashboardComponent,
+      ),
+  },
+  {
     path: 'game-state',
     canActivate: [staffGuard],
     loadComponent: () =>

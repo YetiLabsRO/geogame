@@ -71,6 +71,8 @@ export interface CurrentSession {
   end_time: string;
   game: GameConfig;
   allow_player_team_creation: boolean;
+  /** Effective dementors-mode opt-in (mode-dementors-ble). */
+  dementors_enabled: boolean;
 }
 
 export interface ZoneFeature {
