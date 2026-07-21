@@ -20,6 +20,7 @@ from game.models import (
     TeamTowerOwnership,
     TeamZoneOwnership,
     Tower,
+    TowerLock,
     Zone,
 )
 from game.scoping import (
@@ -519,6 +520,69 @@ class AdminTeamMembershipViewSet(SessionScopedViewSetMixin, viewsets.ReadOnlyMod
         return Response(self.get_serializer(membership).data)
 
 
+# ---------------------------------------------------------------------------
+# tower-locking: staff visibility of active locks + cancel
+# ---------------------------------------------------------------------------
+
+
+class StaffTowerLockSerializer(serializers.ModelSerializer):
+    tower_name = serializers.CharField(source='tower.name', read_only=True)
+    team_name = serializers.CharField(source='team.name', read_only=True)
+    team_color = serializers.CharField(source='team.color', read_only=True)
+    group_name = serializers.CharField(
+        source='group.name', read_only=True, default=None,
+    )
+    remaining_seconds = serializers.SerializerMethodField()
+
+    class Meta:
+        model = TowerLock
+        fields = (
+            'id', 'tower', 'tower_name', 'team', 'team_name', 'team_color',
+            'group', 'group_name', 'started_at', 'expires_at',
+            'released_at', 'release_reason', 'remaining_seconds',
+        )
+
+    def get_remaining_seconds(self, lock):
+        return lock.remaining_seconds()
+
+
+class StaffTowerLockViewSet(SessionScopedViewSetMixin, viewsets.ReadOnlyModelViewSet):
+    """Staff-only view of the current session's ACTIVE tower locks.
+
+    `GET /api/staff/tower_locks/` lists active locks (released and
+    lapsed locks are excluded — lazy expiry); `POST {id}/cancel/`
+    force-releases one with `release_reason=CANCELLED`.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = (
+        TowerLock.objects
+        .select_related('tower', 'team', 'group')
+        .order_by('expires_at')
+    )
+    serializer_class = StaffTowerLockSerializer
+    session_scope_field = 'team__session'
+
+    def get_queryset(self):
+        qs = super().get_queryset()
+        if getattr(self, 'action', None) == 'list':
+            return qs.filter(
+                released_at__isnull=True, expires_at__gt=timezone.now(),
+            )
+        return qs
+
+    @action(detail=True, methods=['post'])
+    def cancel(self, request, pk=None):
+        lock = self.get_object()
+        if not lock.is_active():
+            return Response(
+                {'detail': 'Lock is no longer active.'},
+                status=status.HTTP_409_CONFLICT,
+            )
+        lock.release(TowerLock.CANCELLED)
+        return Response(self.get_serializer(lock).data)
+
+
 class ResetScoresView(APIView):
     """Staff-only: zero out all Team.score and close every open ownership.
 
@@ -622,6 +686,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             # Team-composition rule defaults (maxima: 0 = no cap).
             'min_teams', 'max_teams',
             'min_members_per_team', 'max_members_per_team',
+            # Tower-locking knobs (default FREE_FOR_ALL = today's behavior).
+            'tower_lock_mode', 'tower_lock_finish_minutes',
             # Team-formation knobs (defaults preserve staff-only rosters).
             'allow_player_team_creation', 'team_join_confirmation',
             # Repository / roles / cloning.
@@ -782,6 +848,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             # Team-rule overrides (null = inherit; maxima: 0 = no cap).
             'min_teams', 'max_teams',
             'min_members_per_team', 'max_members_per_team',
+            # Tower-locking overrides (null = inherit Game default).
+            'tower_lock_mode', 'tower_lock_finish_minutes',
             # Team-formation override (null = inherit Game default).
             'allow_player_team_creation',
             'created_at',

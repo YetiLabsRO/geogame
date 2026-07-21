@@ -195,6 +195,18 @@ class Tower(models.Model):
 
         TeamTowerOwnership.objects.create(tower=self, team=team, timestamp_start=handover_time)
 
+        # tower-locking: a confirmed finish captures then releases — close
+        # the capturing team's active lock with FINISHED. Mode-independent
+        # (under FREE_FOR_ALL no lock exists, so this is a no-op) and
+        # scoped to still-active locks so an expired lock is left for the
+        # sweep to stamp EXPIRED.
+        TowerLock.objects.filter(
+            tower=self,
+            team=team,
+            released_at__isnull=True,
+            expires_at__gt=handover_time,
+        ).update(released_at=handover_time, release_reason=TowerLock.FINISHED)
+
         #   when towers are reassigned, recalculate zone assignments
         zone_tower_count = Tower.objects.filter(zone=self.zone, is_active=True).count()
         if zone_tower_count == 1:
@@ -282,6 +294,23 @@ class Tower(models.Model):
             return TeamTowerOwnership.objects.get(timestamp_end__isnull=True, tower=self, team__group=group).team
         except TeamTowerOwnership.DoesNotExist:
             return None
+
+    def active_lock(self, group):
+        """The active TowerLock for `group`, honoring lazy expiry.
+
+        A lock whose `expires_at` has passed is treated as free even if
+        the sweep has not yet stamped `released_at` (tower-locking §4.1).
+        Returns None when `group` is None — locks are strictly per
+        TeamGroup.
+        """
+        if group is None:
+            return None
+        return TowerLock.objects.filter(
+            tower=self,
+            group=group,
+            released_at__isnull=True,
+            expires_at__gt=_now(),
+        ).select_related('team').first()
 
     def team_pending(self, team):
         return TeamTowerChallenge.objects.filter(team=team, tower=self, outcome=TeamTowerChallenge.PENDING).exists()
@@ -574,6 +603,140 @@ class TeamTowerOwnership(models.Model):
         super(TeamTowerOwnership, self).save(*args, **kwargs)
         if self.__timestamp_end != self.timestamp_end and self.timestamp_end is not None:
             pass
+
+
+class TowerLock(models.Model):
+    """An exclusive attempt window on a tower (tower-locking capability).
+
+    Created by `initiate` under LOCK_ON_INITIATE: the tower is locked to
+    `team` for its TeamGroup until `expires_at`. A lock is ACTIVE while
+    `released_at` is null and `expires_at` is in the future; the partial
+    unique constraint allows at most one un-released lock per
+    (tower, group), so a lock in one group never blocks another group.
+    `group` is denormalized from `team.group` so the constraint can
+    target the group directly.
+    """
+
+    FINISHED = 'FINISHED'
+    EXPIRED = 'EXPIRED'
+    CANCELLED = 'CANCELLED'
+    RELEASE_REASON_CHOICES = [
+        (FINISHED, 'Finished — a confirmed finish captured the tower'),
+        (EXPIRED, 'Expired — the finish deadline passed without a confirmed finish'),
+        (CANCELLED, 'Cancelled — voluntarily or by staff, before finishing'),
+    ]
+
+    tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='locks')
+    team = models.ForeignKey('organize.Team', on_delete=models.CASCADE, related_name='tower_locks')
+    group = models.ForeignKey(
+        'organize.TeamGroup', on_delete=models.CASCADE, related_name='tower_locks',
+    )
+    started_at = models.DateTimeField()
+    expires_at = models.DateTimeField()
+    released_at = models.DateTimeField(null=True, blank=True)
+    release_reason = models.CharField(
+        max_length=16, choices=RELEASE_REASON_CHOICES, null=True, blank=True,
+    )
+
+    class Meta:
+        ordering = ['-started_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['tower', 'group'],
+                condition=models.Q(released_at__isnull=True),
+                name='unique_active_tower_lock_per_group',
+            ),
+        ]
+
+    def __str__(self):
+        state = self.release_reason or ('active' if self.is_active() else 'expired')
+        return f'TowerLock({self.team} @ {self.tower}, {state})'
+
+    def is_active(self, now=None):
+        """Active ⇔ not released AND the finish deadline is still ahead."""
+        now = now or _now()
+        return self.released_at is None and self.expires_at > now
+
+    def remaining_seconds(self, now=None):
+        now = now or _now()
+        if not self.is_active(now):
+            return 0
+        return max(0, int((self.expires_at - now).total_seconds()))
+
+    def release(self, reason, when=None):
+        """Idempotently release this lock: only sets `released_at` when null.
+
+        Performed as a guarded UPDATE so concurrent releases (finish vs
+        sweep vs cancel) cannot double-release — the first writer wins
+        and later calls are no-ops. Returns True when this call did the
+        release.
+        """
+        when = when or _now()
+        updated = TowerLock.objects.filter(
+            pk=self.pk, released_at__isnull=True,
+        ).update(released_at=when, release_reason=reason)
+        if updated:
+            self.released_at = when
+            self.release_reason = reason
+        else:
+            self.refresh_from_db(fields=['released_at', 'release_reason'])
+        return bool(updated)
+
+    @classmethod
+    def sweep_expired(cls, now=None):
+        """Stamp EXPIRED on every lapsed, un-released lock. Idempotent.
+
+        `released_at` is pinned to `expires_at` — the instant the lock
+        logically stopped protecting the tower — rather than the sweep
+        time. Lazy-on-read checks make this a tidy-up, never a
+        correctness dependency.
+        """
+        now = now or _now()
+        return cls.objects.filter(
+            released_at__isnull=True, expires_at__lte=now,
+        ).update(released_at=F('expires_at'), release_reason=cls.EXPIRED)
+
+    @classmethod
+    def acquire(cls, tower, team, minutes, now=None):
+        """Try to lock `tower` for `team`'s group for `minutes` minutes.
+
+        Returns `(lock, created)`; `(None, False)` means another team in
+        the group holds an active lock (the caller maps that to 409).
+        Re-initiating while already holding the active lock returns the
+        existing lock (idempotent). Expired locks on this (tower, group)
+        are lazily released first so a stale row never blocks the
+        partial-unique constraint.
+        """
+        from django.db import IntegrityError
+        now = now or _now()
+        group = team.group
+        with transaction.atomic():
+            # Lazy expiry (§4.1): free any lapsed lock before acquiring.
+            cls.objects.filter(
+                tower=tower, group=group,
+                released_at__isnull=True, expires_at__lte=now,
+            ).update(released_at=F('expires_at'), release_reason=cls.EXPIRED)
+
+            current = cls.objects.filter(
+                tower=tower, group=group, released_at__isnull=True,
+            ).select_related('team').first()
+            if current is not None:
+                if current.team_id == team.id:
+                    return current, False
+                return None, False
+            try:
+                with transaction.atomic():
+                    lock = cls.objects.create(
+                        tower=tower,
+                        team=team,
+                        group=group,
+                        started_at=now,
+                        expires_at=now + timedelta(minutes=minutes),
+                    )
+            except IntegrityError:
+                # A concurrent initiate won the partial-unique race.
+                return None, False
+            return lock, True
 
 
 class PauseWindow(models.Model):

@@ -13,6 +13,7 @@ from game.models import (
     TeamTowerFailCounter,
     TeamTowerOwnership,
     Tower,
+    TowerLock,
     Zone,
 )
 from organize.models import Team, TeamGroup
@@ -133,6 +134,15 @@ class TeamTowerFailCounterAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'tower__name')
 
 
+class TowerLockAdmin(admin.ModelAdmin):
+    list_display = (
+        'tower', 'team', 'group', 'started_at', 'expires_at',
+        'released_at', 'release_reason',
+    )
+    list_filter = ('release_reason', 'group')
+    search_fields = ('tower__name', 'team__name')
+
+
 class CollectionAdmin(admin.ModelAdmin):
     list_display = ('name', 'slug', 'tower_count', 'zone_count', 'created_by', 'created_at')
     search_fields = ('name', 'slug')
@@ -156,3 +166,4 @@ admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)
 admin.site.register(TeamTowerOwnership, TeamTowerOwnershipAdmin)
 admin.site.register(PauseWindow, PauseWindowAdmin)
 admin.site.register(TeamTowerFailCounter, TeamTowerFailCounterAdmin)
+admin.site.register(TowerLock, TowerLockAdmin)
