@@ -86,6 +86,14 @@ export const routes: Routes = [
       ),
   },
   {
+    path: 'sessions/:id/discovery',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/discovery-matrix.component').then(
+        (m) => m.DiscoveryMatrixComponent,
+      ),
+  },
+  {
     path: 'sessions/:id/locations',
     canActivate: [staffGuard],
     loadComponent: () =>

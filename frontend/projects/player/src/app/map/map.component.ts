@@ -25,6 +25,7 @@ import {
   RealtimeEnvelope,
   RealtimeService,
   RealtimeTeamSummary,
+  RevealedTower,
   TowerFeature,
   TowerOwnershipChangedPayload,
   ZoneControlChangedPayload,
@@ -40,6 +41,14 @@ const LIVE_POLL_MIN_SECONDS = 10;
 const FALLBACK_POLL_MS = 30_000;
 /** Poll interval for the active-multiplier boost banner. */
 const BOOST_POLL_MS = 60_000;
+const DISCOVERY_PING_SECONDS = 20;
+const DISCOVERY_TOAST_SECONDS = 8;
+
+interface DiscoveryToast {
+  id: number;
+  name: string;
+  method: string;
+}
 
 @Component({
   selector: 'app-map',
@@ -78,6 +87,16 @@ const BOOST_POLL_MS = 60_000;
       @if (errorMessage(); as msg) {
         <div class="alert alert-warning map-error">{{ msg }}</div>
       }
+      <!-- tower-visibility: discovery cues as HIDDEN towers pop up. -->
+      <div class="discovery-toasts">
+        @for (toast of discoveryToasts(); track toast.id) {
+          <div class="alert alert-info py-2 mb-2 shadow-sm">
+            <i class="bi bi-binoculars-fill me-1"></i>
+            <strong>{{ toast.name }}</strong> discovered!
+            <span class="small text-body-secondary">({{ methodLabel(toast.method) }})</span>
+          </div>
+        }
+      </div>
     </div>
   `,
   styles: `
@@ -96,7 +115,8 @@ const BOOST_POLL_MS = 60_000;
     }
     .map-error,
     .badges,
-    .boost-banner {
+    .boost-banner,
+    .discovery-toasts {
       position: absolute;
       z-index: 1000;
     }
@@ -108,6 +128,12 @@ const BOOST_POLL_MS = 60_000;
     .boost-banner .badge {
       font-size: 0.85rem;
       box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+    }
+    .discovery-toasts {
+      bottom: 0.75rem;
+      left: 0.75rem;
+      right: 0.75rem;
+      pointer-events: none;
     }
     .badges {
       top: 0.75rem;
@@ -147,15 +173,21 @@ export class MapComponent {
     () => this.route.snapshot.paramMap.get('slug') ?? null,
   );
 
+  protected readonly discoveryToasts = signal<DiscoveryToast[]>([]);
+
   private map: L.Map | null = null;
   private liveLayer: L.LayerGroup | null = null;
+  private geometryLayer: L.LayerGroup | null = null;
+  private fogLayer: L.Polygon | null = null;
   private livePollHandle: ReturnType<typeof setInterval> | null = null;
+  private discoveryHandle: ReturnType<typeof setInterval> | null = null;
   private session: CurrentSession | null = null;
   /** Live-recolor registries: rendered leaflet layers by identity. */
   private readonly towerMarkers = new Map<number, L.CircleMarker>();
   private readonly towerData = new Map<number, TowerFeature>();
   private readonly zoneLayers = new Map<string, L.GeoJSON>();
   private seenConnections = 0;
+  private toastSeq = 0;
 
   constructor() {
     afterNextRender(() => this.init());
@@ -189,6 +221,9 @@ export class MapComponent {
       if (this.livePollHandle) {
         clearInterval(this.livePollHandle);
       }
+      if (this.discoveryHandle) {
+        clearInterval(this.discoveryHandle);
+      }
       this.map?.remove();
     });
   }
@@ -214,13 +249,20 @@ export class MapComponent {
           const [lng, lat] = game.base_point.coordinates;
           this.map?.setView([lat, lng], game.base_zoom_level || FALLBACK_ZOOM);
         }
-        this.renderZones(zones, slug !== null);
-        this.renderTowers(towers);
+        this.renderGeometry(zones, towers, slug !== null);
         this.setupLocation(session);
         // Open the live socket (skipped when realtime is disabled for
         // the session — polling then remains the update path).
         this.realtime.connect(session.id, session.realtime_enabled);
         this.watchBoosts(session.id);
+        // Consent gating (tower-visibility × live-location): with
+        // tracking disabled there is no consent framework — start the
+        // self-contained discovery fallback right away. With tracking
+        // enabled, discovery starts only after consent is confirmed
+        // (see setupLocation).
+        if (!session.location.tracking_enabled) {
+          this.setupDiscovery(session);
+        }
       },
       error: (err) => {
         // 404 (no session) and 409 (multiple candidates) mean the
@@ -260,6 +302,8 @@ export class MapComponent {
         }
         this.stream.markConsented();
         this.startLivePolling(session.location.ping_interval_seconds);
+        // Consent granted — positions may now drive discovery too.
+        this.setupDiscovery(session);
       },
       error: () => {},
     });
@@ -300,6 +344,56 @@ export class MapComponent {
     }
   }
 
+  /**
+   * tower-visibility: report positions and surface discoveries.
+   *
+   * The server evaluates discovery from BOTH position sources — the
+   * live-location stream (when tracking is on and consented) and the
+   * self-contained `POST /api/discovery/ping/` fallback. The map runs
+   * the fallback loop whenever the session uses any non-VISIBLE tower;
+   * the endpoint is idempotent, so overlapping with the stream is
+   * harmless and the loop doubles as the toast source.
+   */
+  private setupDiscovery(session: CurrentSession): void {
+    if (!session.visibility?.uses_discovery) return;
+    if (!('geolocation' in navigator)) return;
+    const sendPing = () => {
+      navigator.geolocation.getCurrentPosition(
+        (position) => {
+          this.api
+            .discoveryPing({
+              lat: position.coords.latitude,
+              lng: position.coords.longitude,
+            })
+            .subscribe({
+              next: (result) => this.onRevealed(result.newly_revealed),
+              error: () => {},
+            });
+        },
+        () => undefined,
+        { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
+      );
+    };
+    sendPing();
+    this.discoveryHandle = setInterval(sendPing, DISCOVERY_PING_SECONDS * 1000);
+  }
+
+  /** Discovery cue: toast each reveal and redraw the newly visible geometry. */
+  private onRevealed(revealed: RevealedTower[]): void {
+    if (!revealed.length) return;
+    const toasts = revealed.map((r) => ({
+      id: ++this.toastSeq,
+      name: r.tower_name,
+      method: r.method,
+    }));
+    this.discoveryToasts.update((current) => [...current, ...toasts]);
+    setTimeout(() => {
+      const ids = new Set(toasts.map((t) => t.id));
+      this.discoveryToasts.update((current) => current.filter((t) => !ids.has(t.id)));
+    }, DISCOVERY_TOAST_SECONDS * 1000);
+    this.refreshData();
+  }
+
   /** Refetch the zone/tower snapshot and redraw layers in place. */
   private refreshData(): void {
     if (!this.map) return;
@@ -308,10 +402,7 @@ export class MapComponent {
       zones: this.api.zones(slug ? { groupSlug: slug } : undefined),
       towers: this.api.towers(),
     }).subscribe({
-      next: ({ zones, towers }) => {
-        this.renderZones(zones, slug !== null);
-        this.renderTowers(towers);
-      },
+      next: ({ zones, towers }) => this.renderGeometry(zones, towers, slug !== null),
       error: () => {
         // Keep the last rendered state; the next poll retries.
       },
@@ -397,14 +488,76 @@ export class MapComponent {
     return 'everywhere';
   }
 
+  protected methodLabel(method: string): string {
+    switch (method) {
+      case 'PROXIMITY':
+        return 'walked up to it';
+      case 'ZONE_ENTRY':
+        return 'entered the area';
+      case 'ZONE_COVERAGE':
+        return 'covered the area';
+      case 'STAFF':
+        return 'revealed by staff';
+      default:
+        return 'revealed';
+    }
+  }
+
   // ---- rendering -----------------------------------------------------------
 
-  private renderZones(zones: ZoneFeature[], scoreMode: boolean): void {
+  private renderGeometry(zones: ZoneFeature[], towers: TowerFeature[], scoreMode: boolean): void {
     if (!this.map) return;
-    for (const layer of this.zoneLayers.values()) {
-      layer.remove();
+    if (this.geometryLayer === null) {
+      this.geometryLayer = L.layerGroup().addTo(this.map);
     }
+    this.geometryLayer.clearLayers();
+    // Reset the realtime-recolor registries in lockstep with the cleared
+    // layer group so live events resolve against the freshly drawn layers.
     this.zoneLayers.clear();
+    this.towerMarkers.clear();
+    this.towerData.clear();
+    this.renderZones(zones, scoreMode);
+    this.renderTowers(towers);
+    this.renderFog(zones);
+  }
+
+  /**
+   * Fog-of-war overlay (tower-visibility): a translucent veil over the
+   * whole map with the team-visible zones punched out. A `FOG_REVEAL`
+   * zone only reaches the payload once revealed (zone entry / coverage),
+   * so its hole appears — clearing the fog — as the team roams.
+   */
+  private renderFog(zones: ZoneFeature[]): void {
+    if (!this.map) return;
+    if (this.fogLayer) {
+      this.fogLayer.remove();
+      this.fogLayer = null;
+    }
+    if (!this.session?.visibility?.uses_fog) return;
+    const world: L.LatLngExpression[] = [
+      [-89, -359],
+      [-89, 359],
+      [89, 359],
+      [89, -359],
+    ];
+    const holes = zones
+      .filter((z) => !!z.shape)
+      .map(
+        (z) =>
+          z.shape.coordinates[0].map(
+            ([lng, lat]) => [lat, lng] as L.LatLngExpression,
+          ),
+      );
+    this.fogLayer = L.polygon([world, ...holes], {
+      stroke: false,
+      fillColor: '#1f2937',
+      fillOpacity: 0.45,
+      interactive: false,
+    }).addTo(this.map);
+  }
+
+  private renderZones(zones: ZoneFeature[], scoreMode: boolean): void {
+    if (!this.map || !this.geometryLayer) return;
     for (const zone of zones) {
       if (!zone.shape) continue;
       const fill = scoreMode ? zone.team_color : zone.color;
@@ -418,18 +571,13 @@ export class MapComponent {
         },
       })
         .bindTooltip(zone.name)
-        .addTo(this.map);
+        .addTo(this.geometryLayer);
       this.zoneLayers.set(zone.name, layer);
     }
   }
 
   private renderTowers(towers: TowerFeature[]): void {
-    if (!this.map) return;
-    for (const marker of this.towerMarkers.values()) {
-      marker.remove();
-    }
-    this.towerMarkers.clear();
-    this.towerData.clear();
+    if (!this.map || !this.geometryLayer) return;
     for (const tower of towers) {
       if (!tower.location) continue;
       const [lng, lat] = tower.location.coordinates;
@@ -440,7 +588,7 @@ export class MapComponent {
         weight: 2,
         fillColor: owner.color || '#fff',
         fillOpacity: owner.name ? 0.9 : 0.3,
-      }).addTo(this.map);
+      }).addTo(this.geometryLayer);
       marker.bindPopup(this.towerPopup(tower));
       this.towerMarkers.set(tower.id, marker);
       this.towerData.set(tower.id, tower);

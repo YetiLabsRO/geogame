@@ -217,12 +217,30 @@ class LocationPingView(APIView):
             accuracy=accuracy,
             recorded_at=recorded_at,
         )
+        # discovery-tracking: the live-location stream is the primary
+        # position source for tower discovery — every stored ping runs
+        # the same evaluation as the discovery-ping fallback, so both
+        # sources create discoveries identically.
+        newly_revealed = []
+        if team is not None:
+            from game.discovery import evaluate_discovery
+            newly_revealed = evaluate_discovery(
+                session, team, point, user=request.user,
+            )
         return Response(
             {
                 'id': ping.id,
                 'recorded_at': ping.recorded_at,
                 'received_at': ping.received_at,
                 'ping_interval_seconds': session.effective('location_ping_interval_seconds'),
+                'newly_revealed': [
+                    {
+                        'tower_id': d.tower_id,
+                        'tower_name': d.tower.name,
+                        'method': d.method,
+                    }
+                    for d in newly_revealed
+                ],
             },
             status=status.HTTP_201_CREATED,
         )

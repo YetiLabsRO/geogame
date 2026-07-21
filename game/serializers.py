@@ -55,6 +55,17 @@ class ZoneSerializer(serializers.HyperlinkedModelSerializer):
         if group:
             control_team_ids = zone.zone_control(group=group)
             teams = Team.objects.filter(pk__in=control_team_ids)
+            # tower-visibility: when the effective
+            # `reveal_other_teams_ownership` is False, colour only the
+            # caller's own control — other teams' conquests render as
+            # uncontrolled. The default (True / no team context)
+            # preserves the shipped colouring exactly.
+            if not self.context.get('reveal_others', True):
+                own_team = self.context.get('team')
+                teams = (
+                    teams.filter(pk=own_team.pk)
+                    if own_team is not None else teams.none()
+                )
             if teams.count() > 1:
                 return "#FFFFFF"
             elif teams.count() == 1:
@@ -77,6 +88,21 @@ class TowerSerializer(serializers.HyperlinkedModelSerializer):
     has_initial_bonus = serializers.SerializerMethodField()
 
     def get_ownership(self, obj):
+        # With a caller-team context, resolve control in the caller's
+        # TeamGroup and honour `reveal_other_teams_ownership`: when the
+        # knob is off, another team's control is reported as no owner
+        # (tower-visibility). Without context, the legacy group-1 lookup
+        # is preserved verbatim.
+        team = self.context.get('team')
+        if team is not None and team.group_id:
+            owner = obj.tower_control(team.group)
+            if (
+                owner is not None
+                and owner.pk != team.pk
+                and not self.context.get('reveal_others', True)
+            ):
+                owner = None
+            return TeamSerializer(owner).data
         #   TODO: fix this
         return TeamSerializer(obj.tower_control(1)).data
 

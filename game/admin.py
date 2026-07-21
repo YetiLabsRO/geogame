@@ -36,7 +36,9 @@ from game.models import (
     TeamTowerOwnership,
     TeamTrailProgress,
     TeamTrailRoute,
+    TeamZoneCoverage,
     Tower,
+    TowerDiscovery,
     TowerLock,
     TowerPhoto,
     Trail,
@@ -50,6 +52,7 @@ from organize.models import Team, TeamGroup
 class ZoneAdmin(LeafletGeoAdmin):
     list_display = [
         '__str__', 'scoring_type', 'color', 'conquest_rule',
+        'fog_reveal_coverage_pct',
         'get_member_towers', 'get_zone_control',
     ]
 
@@ -127,11 +130,12 @@ class TowerAdmin(LeafletGeoAdmin):
     list_display = [
         '__str__', 'is_active', 'get_zones', 'category', 'get_tower_control', 'get_rfid_url',
         'get_capture_mode', 'get_nfc_payload', 'id',
-        'initial_bonus', 'decrease_initial_bonus'
+        'initial_bonus', 'decrease_initial_bonus',
+        'discoverability', 'challenge_visibility',
     ]
     # `zones` is the many-to-many membership (tower-zone-topology): the
     # list filters by member zone and the edit form uses a multi-select.
-    list_filter = ['zones', 'is_active', 'category']
+    list_filter = ['zones', 'is_active', 'category', 'discoverability', 'challenge_visibility']
     filter_horizontal = ['zones']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]
@@ -414,6 +418,20 @@ class PresenceCheckAdmin(admin.ModelAdmin):
     readonly_fields = ('created_at',)
 
 
+class TowerDiscoveryAdmin(admin.ModelAdmin):
+    list_display = ('session', 'team', 'tower', 'method', 'discovered_by', 'discovered_at')
+    list_filter = ('session', 'method', 'team')
+    readonly_fields = ('discovered_at',)
+
+
+class TeamZoneCoverageAdmin(admin.ModelAdmin):
+    list_display = ('session', 'team', 'zone', 'coverage_pct', 'revealed', 'updated_at')
+    list_filter = ('session', 'revealed')
+    readonly_fields = ('updated_at',)
+
+
+admin.site.register(TowerDiscovery, TowerDiscoveryAdmin)
+admin.site.register(TeamZoneCoverage, TeamZoneCoverageAdmin)
 admin.site.register(LocationPing, LocationPingAdmin)
 admin.site.register(LocationConsent, LocationConsentAdmin)
 admin.site.register(PresenceRequirement, PresenceRequirementAdmin)

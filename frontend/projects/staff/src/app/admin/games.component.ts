@@ -6,7 +6,9 @@ import {
   AdminCollection,
   AdminGame,
   AdminGamePayload,
+  ChallengeVisibility,
   ConquestRule,
+  Discoverability,
   FailCounterReset,
   ScoreTimeUnit,
   StaffApiService,
@@ -469,6 +471,72 @@ interface Row {
                         </div>
                       </div>
                       <div class="col-md-6">
+                        <div class="fw-semibold small mb-2">
+                          Tower visibility
+                          <i
+                            class="bi bi-info-circle text-body-secondary"
+                            title="Game-wide defaults for the two visibility axes; individual towers/zones may override (tower-visibility)"
+                          ></i>
+                        </div>
+                        <div class="row g-2">
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Discoverability default</label>
+                            <select
+                              class="form-select form-select-sm"
+                              [ngModel]="row.draft.tower_discoverability_default"
+                              (ngModelChange)="update(row, 'tower_discoverability_default', $event)"
+                            >
+                              @for (o of discoverabilityOptions; track o.value) {
+                                <option [ngValue]="o.value">{{ o.label }}</option>
+                              }
+                            </select>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Challenge visibility default</label>
+                            <select
+                              class="form-select form-select-sm"
+                              [ngModel]="row.draft.challenge_visibility_default"
+                              (ngModelChange)="update(row, 'challenge_visibility_default', $event)"
+                            >
+                              @for (o of challengeVisibilityOptions; track o.value) {
+                                <option [ngValue]="o.value">{{ o.label }}</option>
+                              }
+                            </select>
+                          </div>
+                          <div class="col-6">
+                            <label class="form-label small mb-0">Fog reveal coverage (%)</label>
+                            <input
+                              class="form-control form-control-sm"
+                              type="number"
+                              min="0"
+                              max="100"
+                              [ngModel]="row.draft.fog_reveal_coverage_pct_default"
+                              (ngModelChange)="update(row, 'fog_reveal_coverage_pct_default', $event)"
+                            />
+                          </div>
+                          <div class="col-6">
+                            <div class="form-check form-switch mt-4">
+                              <input
+                                type="checkbox"
+                                class="form-check-input"
+                                role="switch"
+                                [id]="'roto-' + row.game.id"
+                                [ngModel]="row.draft.reveal_other_teams_ownership"
+                                (ngModelChange)="update(row, 'reveal_other_teams_ownership', $event)"
+                              />
+                              <label class="form-check-label small" [for]="'roto-' + row.game.id">
+                                Reveal other teams' ownership
+                              </label>
+                            </div>
+                          </div>
+                          <div class="col-12 text-body-secondary small">
+                            Hidden towers pop up on approach; fog-reveal zones
+                            uncover on entry or once a team covers the
+                            percentage above.
+                          </div>
+                        </div>
+                      </div>
+                      <div class="col-md-6">
                         <div class="fw-semibold small mb-2">Conquest &amp; scoring</div>
                         <div class="mb-2">
                           <label class="form-label small mb-0" [for]="'zcr-' + row.game.id">
@@ -601,6 +669,20 @@ export class GamesComponent {
     { value: 'MAJORITY', label: 'Majority of towers (default)' },
     { value: 'ALL', label: 'All towers — hold every active tower' },
     { value: 'ANY', label: 'Any tower — most towers, latest capture breaks ties' },
+  ];
+
+  protected readonly discoverabilityOptions: { value: Discoverability; label: string }[] = [
+    { value: 'VISIBLE', label: 'Visible (default)' },
+    { value: 'HIDDEN', label: 'Hidden — pops up on approach' },
+    { value: 'FOG_REVEAL', label: 'Fog reveal — uncover the zone' },
+  ];
+
+  protected readonly challengeVisibilityOptions: {
+    value: ChallengeVisibility;
+    label: string;
+  }[] = [
+    { value: 'VISIBLE_ANYWHERE', label: 'Visible anywhere (default)' },
+    { value: 'HIDDEN_UNTIL_ARRIVAL', label: 'Hidden until arrival' },
   ];
 
   protected readonly timeUnitOptions: { value: ScoreTimeUnit; label: string }[] = [
@@ -801,6 +883,10 @@ export class GamesComponent {
         teammate_visibility_mode: row.draft.teammate_visibility_mode,
         teammate_visibility_count: row.draft.teammate_visibility_count,
         presence_window_seconds: row.draft.presence_window_seconds,
+        tower_discoverability_default: row.draft.tower_discoverability_default,
+        challenge_visibility_default: row.draft.challenge_visibility_default,
+        fog_reveal_coverage_pct_default: row.draft.fog_reveal_coverage_pct_default,
+        reveal_other_teams_ownership: row.draft.reveal_other_teams_ownership,
       })
       .subscribe({
         next: (updated) => {

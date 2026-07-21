@@ -156,6 +156,8 @@ class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
             'id', 'name', 'color', 'scoring_type', 'conquest_rule',
             'towers', 'shape', 'vertices', 'collection',
             'collections', 'games',
+            # tower-visibility: per-zone fog threshold (null = inherit).
+            'fog_reveal_coverage_pct',
         )
 
     def get_towers(self, zone):
@@ -221,6 +223,9 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         fields = (
             'id', 'name', 'zones', 'category', 'is_active',
             'proximity_meters',
+            # tower-visibility: the two per-tower axes (null = inherit
+            # the Session/Game default).
+            'discoverability', 'challenge_visibility',
             'initial_bonus', 'rfid_code',
             'location', 'lat', 'lng', 'authored_accuracy_m',
             'collection', 'photos', 'collections', 'games',
@@ -1258,6 +1263,9 @@ class AdminGameSerializer(serializers.ModelSerializer):
             'tower_lock_mode', 'tower_lock_finish_minutes',
             # BLE proximity + dementors mode defaults (mode-dementors-ble).
             *DEMENTOR_BLE_FIELDS,
+            # Tower-visibility defaults (tower-visibility capability).
+            'tower_discoverability_default', 'challenge_visibility_default',
+            'fog_reveal_coverage_pct_default', 'reveal_other_teams_ownership',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -1438,6 +1446,9 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             'mode',
             # BLE proximity + dementors overrides (null = inherit).
             *DEMENTOR_BLE_FIELDS,
+            # Tower-visibility overrides (null = inherit Game default).
+            'tower_discoverability_default', 'challenge_visibility_default',
+            'fog_reveal_coverage_pct_default', 'reveal_other_teams_ownership',
             'created_at',
         )
         read_only_fields = (
@@ -1600,6 +1611,60 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
             'blockers': blockers,
             'min_members_per_team': session.effective('min_members_per_team'),
             'teams': teams,
+        })
+
+    @action(detail=True, methods=['get'], url_path='discovery-matrix')
+    def discovery_matrix(self, request, pk=None):
+        """Team × tower discovery state for the session (tower-visibility UI).
+
+        Lists the session's teams, the game's non-always-visible towers
+        (any tower whose effective discoverability is not VISIBLE), and
+        the existing TowerDiscovery cells, so staff can see who found
+        what and reveal towers by hand (POST /api/staff/discovery/reveal/).
+        """
+        from game.discovery import _visible_now_q
+        from game.models import TowerDiscovery
+        session = self.get_object()
+        default = session.effective('tower_discoverability_default')
+        towers = list(
+            session.towers()
+            .filter(is_active=True)
+            .exclude(_visible_now_q(default))
+            .order_by('name'),
+        )
+        teams = list(session.teams.order_by('name'))
+        discoveries = (
+            TowerDiscovery.objects
+            .filter(session=session)
+            .select_related('discovered_by')
+        )
+        cells = [
+            {
+                'team_id': d.team_id,
+                'tower_id': d.tower_id,
+                'method': d.method,
+                'discovered_at': d.discovered_at,
+                'discovered_by': (
+                    d.discovered_by.username if d.discovered_by else None
+                ),
+            }
+            for d in discoveries
+        ]
+        return Response({
+            'session': session.id,
+            'default_discoverability': default,
+            'teams': [
+                {'id': t.id, 'name': t.name, 'color': t.color} for t in teams
+            ],
+            'towers': [
+                {
+                    'id': t.id,
+                    'name': t.name,
+                    'discoverability': t.effective_discoverability(session=session),
+                }
+                for t in towers
+            ],
+            'discoveries': cells,
         })
 
     @action(detail=True, methods=['get'])

@@ -428,6 +428,10 @@ class CurrentSessionSerializer(serializers.Serializer):
     # Effective dementors-mode opt-in (mode-dementors-ble) so the player
     # app knows whether to surface the Dementors screen.
     dementors_enabled = serializers.SerializerMethodField()
+    # Effective tower-visibility config (tower-visibility capability) —
+    # lets the player app decide whether to render the fog overlay and
+    # run discovery pings at all.
+    visibility = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
@@ -451,6 +455,30 @@ class CurrentSessionSerializer(serializers.Serializer):
 
     def get_dementors_enabled(self, session):
         return bool(session.effective('dementors_enabled'))
+
+    def get_visibility(self, session):
+        from organize.models import (
+            DISCOVERABILITY_FOG_REVEAL,
+            DISCOVERABILITY_VISIBLE,
+        )
+        default = session.effective('tower_discoverability_default')
+        uses_fog = default == DISCOVERABILITY_FOG_REVEAL or session.towers().filter(
+            discoverability=DISCOVERABILITY_FOG_REVEAL,
+        ).exists()
+        # Any non-VISIBLE effective tower means positions should be
+        # reported for discovery even when live-location is off.
+        uses_discovery = uses_fog or default != DISCOVERABILITY_VISIBLE or (
+            session.towers().exclude(discoverability__isnull=True)
+            .exclude(discoverability=DISCOVERABILITY_VISIBLE).exists()
+        )
+        return {
+            'default_discoverability': default,
+            'uses_fog': uses_fog,
+            'uses_discovery': uses_discovery,
+            'reveal_other_teams_ownership': bool(
+                session.effective('reveal_other_teams_ownership'),
+            ),
+        }
 
 
 class MySessionsView(APIView):

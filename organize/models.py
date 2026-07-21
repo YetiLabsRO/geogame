@@ -139,6 +139,28 @@ MODE_CHOICES = [
     (MODE_TRAIL, 'Trail / discovery — clue-driven point-to-point run'),
 ]
 
+# Tower discoverability axis (tower-visibility capability): whether and
+# how a team comes to see a tower on the map. VISIBLE is the historical
+# behavior and the default everywhere.
+DISCOVERABILITY_HIDDEN = 'HIDDEN'
+DISCOVERABILITY_VISIBLE = 'VISIBLE'
+DISCOVERABILITY_FOG_REVEAL = 'FOG_REVEAL'
+DISCOVERABILITY_CHOICES = [
+    (DISCOVERABILITY_HIDDEN, 'Hidden — pops up when a team walks within proximity'),
+    (DISCOVERABILITY_VISIBLE, 'Visible — always on the map (default, historical behavior)'),
+    (DISCOVERABILITY_FOG_REVEAL, 'Fog reveal — revealed by entering or covering the zone'),
+]
+
+# Challenge visibility axis (tower-visibility capability): whether a
+# tower's challenge is legible before the player physically arrives.
+# VISIBLE_ANYWHERE is the historical behavior and the default.
+CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL = 'HIDDEN_UNTIL_ARRIVAL'
+CHALLENGE_VIS_VISIBLE_ANYWHERE = 'VISIBLE_ANYWHERE'
+CHALLENGE_VISIBILITY_CHOICES = [
+    (CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL, 'Hidden until arrival — legible only inside the activation area'),
+    (CHALLENGE_VIS_VISIBLE_ANYWHERE, 'Visible anywhere — legible from afar (default, historical behavior)'),
+]
+
 # Config fields that live on Game as defaults and are overridable per
 # Session. `Session.effective(field)` resolves override-or-default.
 OVERRIDABLE_CONFIG_FIELDS = (
@@ -206,6 +228,12 @@ OVERRIDABLE_CONFIG_FIELDS = (
     'dementor_restore_per_second',
     'dementor_wizard_regen_per_second',
     'dementor_tick_seconds',
+    # Tower-visibility knobs (tower-visibility capability). Defaults are
+    # today's behavior: everything visible, no fog, all ownership shown.
+    'tower_discoverability_default',
+    'challenge_visibility_default',
+    'fog_reveal_coverage_pct_default',
+    'reveal_other_teams_ownership',
 )
 
 
@@ -396,6 +424,25 @@ class Game(models.Model):
     dementor_restore_per_second = models.FloatField(default=1.0)
     dementor_wizard_regen_per_second = models.FloatField(default=0.0)
     dementor_tick_seconds = models.PositiveSmallIntegerField(default=5)
+
+    # --- Tower-visibility knobs (tower-visibility capability). Defaults
+    # reproduce the shipped behavior exactly: every tower VISIBLE, every
+    # challenge legible from afar, fog threshold inert at 60% (no tower
+    # opts into FOG_REVEAL by default), full ownership colouring.
+    # Overridable per Session; per-tower / per-zone nullable overrides
+    # live on game.Tower / game.Zone. ---
+    tower_discoverability_default = models.CharField(
+        max_length=16,
+        choices=DISCOVERABILITY_CHOICES,
+        default=DISCOVERABILITY_VISIBLE,
+    )
+    challenge_visibility_default = models.CharField(
+        max_length=32,
+        choices=CHALLENGE_VISIBILITY_CHOICES,
+        default=CHALLENGE_VIS_VISIBLE_ANYWHERE,
+    )
+    fog_reveal_coverage_pct_default = models.FloatField(default=60)
+    reveal_other_teams_ownership = models.BooleanField(default=True)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -859,6 +906,17 @@ class Session(models.Model):
     dementor_wizard_regen_per_second = models.FloatField(null=True, blank=True)
     dementor_tick_seconds = models.PositiveSmallIntegerField(null=True, blank=True)
 
+    # --- Tower-visibility overrides (tower-visibility capability). NULL
+    # means "inherit the Game default"; resolve with Session.effective(field). ---
+    tower_discoverability_default = models.CharField(
+        max_length=16, choices=DISCOVERABILITY_CHOICES, null=True, blank=True,
+    )
+    challenge_visibility_default = models.CharField(
+        max_length=32, choices=CHALLENGE_VISIBILITY_CHOICES, null=True, blank=True,
+    )
+    fog_reveal_coverage_pct_default = models.FloatField(null=True, blank=True)
+    reveal_other_teams_ownership = models.BooleanField(null=True, blank=True)
+
     class Meta:
         unique_together = (('game', 'slug'),)
 
@@ -881,6 +939,16 @@ class Session(models.Model):
     def zones(self):
         """Convenience resolver: the Session's geometry is its Game's."""
         return self.game.zones()
+
+    def visible_towers(self, team):
+        """Towers `team` may currently see in this Session.
+
+        Every tower whose effective discoverability is VISIBLE plus every
+        tower the team holds a TowerDiscovery for — computed entirely
+        independently of ownership (tower-visibility capability).
+        """
+        from game.discovery import visible_towers as _visible_towers
+        return _visible_towers(self, team)
 
     # ------------------------------------------------------------------
     # Lifecycle state machine (session-lifecycle capability)

@@ -145,6 +145,20 @@ interface Position {
             <div class="alert alert-info">
               A submission is already pending review.
             </div>
+          } @else if (s.challenge_hidden) {
+            <!-- tower-visibility (challenge axis): HIDDEN_UNTIL_ARRIVAL —
+                 the server withholds the challenge until we report a
+                 position inside the activation area. -->
+            <div class="card mb-3 border-secondary">
+              <div class="card-body text-center text-body-secondary">
+                <i class="bi bi-eye-slash fs-2 d-block mb-2"></i>
+                <div class="fw-semibold">Challenge hidden until arrival</div>
+                <div class="small">
+                  Get within {{ s.proximity_meters }} m of the tower to reveal
+                  the challenge.
+                </div>
+              </div>
+            </div>
           } @else if (s.next_challenge; as c) {
             <div class="card mb-3">
               <div class="card-body">
@@ -495,7 +509,11 @@ export class TowerDetailComponent implements OnInit {
   }
 
   private fetchState(id: number): void {
-    this.api.towerState(id).subscribe({
+    // Pass the current position so a HIDDEN_UNTIL_ARRIVAL challenge is
+    // revealed by the server the moment we are inside the activation
+    // area (tower-visibility, challenge axis).
+    const pos = this.position();
+    this.api.towerState(id, pos ? { lat: pos.lat, lng: pos.lng } : undefined).subscribe({
       next: (s) => this.state.set(s),
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
@@ -514,6 +532,12 @@ export class TowerDetailComponent implements OnInit {
           lng: pos.coords.longitude,
           accuracy: pos.coords.accuracy,
         });
+        // Concealed challenge + now in range → ask the server again
+        // with our position; it reveals inside the activation area.
+        const s = this.state();
+        if (s?.challenge_hidden && this.withinRange()) {
+          this.fetchState(s.id);
+        }
       },
       (err) => {
         this.locationError.set(err.message || 'Could not determine your location.');
