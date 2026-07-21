@@ -20,20 +20,25 @@ Tests target the post-refactor structure:
     hardcoded categories). Each Game has its own set of TeamGroups.
 """
 import base64
+import json
 import math
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
+from unittest.mock import patch
 
+from channels.db import database_sync_to_async
+from channels.testing import HttpCommunicator, WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
 from django.db import connection
 from django.db.migrations.executor import MigrationExecutor
-from django.test import TestCase, TransactionTestCase
+from django.test import TestCase, TransactionTestCase, override_settings
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
+from game import events
 from game.admin import unassign_all
 from game.models import (
     ROLE_REQUIREMENT_ALL,
@@ -54,17 +59,20 @@ from game.models import (
     TowerPhoto,
     Zone,
 )
+from geogame.asgi import application as asgi_application
 from organize.models import (
     Game,
     GameCollaborator,
     GameRole,
     Invite,
+    PushSubscription,
     Session,
     Team,
     TeamGroup,
     TeamMembership,
     TeamRole,
 )
+from organize.push import BasePushSender
 
 User = get_user_model()
 
@@ -5817,3 +5825,475 @@ class FieldAuthoringDraftStagingTest(TestCase):
         self._drop_draft()
         resp = self.staff_client.get('/api/staff/towers/')
         self.assertIn('Draft', [t['name'] for t in resp.json()])
+
+
+# ---------------------------------------------------------------------------
+# realtime-and-notifications — broadcasts, consumer, fallback, ASGI smoke
+# ---------------------------------------------------------------------------
+
+
+class _RecorderPushSender(BasePushSender):
+    """Test double for the push-sender interface: records, delivers nothing."""
+
+    def __init__(self, fail_with=None):
+        self.sent = []
+        self.fail_with = fail_with
+
+    def send(self, subscription, payload):
+        if self.fail_with is not None:
+            raise self.fail_with
+        self.sent.append((subscription, payload))
+
+
+class _BrokenLayer:
+    """Channel-layer stand-in whose group_send always fails."""
+
+    async def group_send(self, group, message):
+        raise RuntimeError('boom')
+
+
+@override_settings(REALTIME_SCOREBOARD_THROTTLE_SECONDS=0)
+class RealtimeBroadcastTest(TestCase):
+    """7.3 — the ownership/zone recompute seams emit typed events."""
+
+    def setUp(self):
+        events.reset_throttle()
+        self.game = _make_game('Realtime Game')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.t1 = _make_team(self.game, self.group, name='rt1', color='#111111')
+        self.t2 = _make_team(self.game, self.group, name='rt2', color='#222222')
+        self.session = self.t1.session
+
+    def _capture(self, team):
+        with patch('game.events.broadcast_session_event', return_value=True) as recorder:
+            self.tower.assign_to_team(team)
+        return recorder.call_args_list
+
+    @staticmethod
+    def _of_type(calls, event_type):
+        return [call.args for call in calls if call.args[1] == event_type]
+
+    def test_conquer_emits_ownership_zone_and_scoreboard(self):
+        calls = self._capture(self.t1)
+
+        ownership = self._of_type(calls, events.EVENT_TOWER_OWNERSHIP_CHANGED)
+        self.assertEqual(len(ownership), 1)
+        session_id, _, payload = ownership[0]
+        self.assertEqual(session_id, self.session.id)
+        self.assertEqual(payload['kind'], 'conquered')
+        self.assertEqual(payload['tower_id'], self.tower.id)
+        self.assertEqual(payload['zone_id'], self.zone.id)
+        self.assertEqual(payload['team']['team_id'], self.t1.id)
+        self.assertEqual(
+            payload['ownership'][self.group.slug]['team_id'], self.t1.id,
+        )
+
+        # First capture flips zone control from nobody to t1 → recolor.
+        zones = self._of_type(calls, events.EVENT_ZONE_CONTROL_CHANGED)
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0][2]['zone_id'], self.zone.id)
+        self.assertEqual(zones[0][2]['colors'][self.group.slug], '#111111')
+
+        # The initial-bonus award goes through Team.update_score, so a
+        # capture may emit more than one snapshot; each is complete, so
+        # only the LAST one matters to clients.
+        scoreboard = self._of_type(calls, events.EVENT_SCOREBOARD_UPDATED)
+        self.assertGreaterEqual(len(scoreboard), 1)
+        names = [e['team_name'] for e in scoreboard[-1][2]['entries']]
+        self.assertCountEqual(names, ['rt1', 'rt2'])
+        for entry in scoreboard[-1][2]['entries']:
+            for key in ('team_id', 'team_color', 'locked_score',
+                        'floating_score', 'current_score'):
+                self.assertIn(key, entry)
+
+    def test_steal_emits_stolen_and_zone_flip(self):
+        self._capture(self.t1)
+        calls = self._capture(self.t2)
+
+        ownership = self._of_type(calls, events.EVENT_TOWER_OWNERSHIP_CHANGED)
+        self.assertEqual(len(ownership), 1)
+        payload = ownership[0][2]
+        self.assertEqual(payload['kind'], 'stolen')
+        self.assertEqual(payload['team']['team_id'], self.t2.id)
+        self.assertEqual(
+            payload['ownership'][self.group.slug]['team_id'], self.t2.id,
+        )
+
+        zones = self._of_type(calls, events.EVENT_ZONE_CONTROL_CHANGED)
+        self.assertEqual(len(zones), 1)
+        self.assertEqual(zones[0][2]['colors'][self.group.slug], '#222222')
+
+    def test_recapture_by_same_team_is_conquered_not_stolen(self):
+        self._capture(self.t1)
+        calls = self._capture(self.t1)
+        payload = self._of_type(calls, events.EVENT_TOWER_OWNERSHIP_CHANGED)[0][2]
+        self.assertEqual(payload['kind'], 'conquered')
+
+    def test_unassign_emits_released(self):
+        self._capture(self.t1)
+        with patch('game.events.broadcast_session_event', return_value=True) as recorder:
+            self.tower.unassign()
+        calls = recorder.call_args_list
+
+        ownership = self._of_type(calls, events.EVENT_TOWER_OWNERSHIP_CHANGED)
+        self.assertEqual(len(ownership), 1)
+        payload = ownership[0][2]
+        self.assertEqual(payload['kind'], 'released')
+        self.assertIsNone(payload['team'])
+        self.assertIsNone(payload['ownership'][self.group.slug])
+
+        self.assertEqual(
+            len(self._of_type(calls, events.EVENT_ZONE_CONTROL_CHANGED)), 1,
+        )
+        self.assertGreaterEqual(
+            len(self._of_type(calls, events.EVENT_SCOREBOARD_UPDATED)), 1,
+        )
+
+    def test_update_score_emits_scoreboard_snapshot(self):
+        with patch('game.events.broadcast_session_event', return_value=True) as recorder:
+            self.t1.update_score(10)
+        scoreboard = self._of_type(
+            recorder.call_args_list, events.EVENT_SCOREBOARD_UPDATED,
+        )
+        self.assertEqual(len(scoreboard), 1)
+        entry = next(
+            e for e in scoreboard[0][2]['entries'] if e['team_id'] == self.t1.id
+        )
+        self.assertEqual(entry['locked_score'], 10)
+
+    def test_scoreboard_updates_coalesced_per_session(self):
+        with override_settings(REALTIME_SCOREBOARD_THROTTLE_SECONDS=60):
+            events.reset_throttle()
+            with patch('game.events.broadcast_session_event', return_value=True) as recorder:
+                self.t1.update_score(1)
+                self.t2.update_score(1)
+                scoreboard = self._of_type(
+                    recorder.call_args_list, events.EVENT_SCOREBOARD_UPDATED,
+                )
+                self.assertEqual(len(scoreboard), 1)
+                # force=True bypasses the window (used on demand).
+                events.emit_scoreboard_update(self.session, force=True)
+                scoreboard = self._of_type(
+                    recorder.call_args_list, events.EVENT_SCOREBOARD_UPDATED,
+                )
+                self.assertEqual(len(scoreboard), 2)
+        events.reset_throttle()
+
+    def test_session_transition_broadcasts_state_change(self):
+        with patch('game.events.broadcast_session_event', return_value=True) as recorder:
+            self.session.transition('pause')
+        state_events = self._of_type(
+            recorder.call_args_list, events.EVENT_SESSION_STATE_CHANGED,
+        )
+        self.assertEqual(len(state_events), 1)
+        payload = state_events[0][2]
+        self.assertEqual(payload['state'], Session.PAUSED)
+        self.assertEqual(payload['previous'], Session.RUNNING)
+        self.assertEqual(payload['action'], 'pause')
+
+    def _consented_member(self):
+        Session.objects.filter(pk=self.session.pk).update(
+            push_notifications_enabled=True,
+        )
+        self.session.refresh_from_db()
+        # Drop the Teams' cached (stale) Session FK instances too.
+        self.t1.refresh_from_db()
+        self.t2.refresh_from_db()
+        user = User.objects.create_user(
+            username='rt-push', email='rt-push@example.com', password='password123',
+        )
+        TeamMembership.objects.create(team=self.t1, user=user.profile, is_active=True)
+        return PushSubscription.objects.create(
+            user=user, endpoint='https://push.example/rt', p256dh='k', auth='a',
+        )
+
+    def test_capture_hands_off_to_push(self):
+        self._consented_member()
+        recorder = _RecorderPushSender()
+        with patch('organize.push.get_sender', return_value=recorder), \
+                patch('game.events.broadcast_session_event', return_value=True):
+            self.tower.assign_to_team(self.t1)  # conquer
+            self.tower.assign_to_team(self.t2)  # steal
+        sent_events = [payload['event'] for _, payload in recorder.sent]
+        self.assertEqual(sent_events, ['conquer', 'steal'])
+        conquer = recorder.sent[0][1]
+        self.assertEqual(conquer['url'], f'/tower/{self.tower.id}')
+        self.assertEqual(conquer['tower_id'], self.tower.id)
+        self.assertIn(self.tower.name, conquer['body'])
+
+    def test_bonus_emit_broadcasts_and_pushes(self):
+        self._consented_member()
+        recorder = _RecorderPushSender()
+        with patch('organize.push.get_sender', return_value=recorder), \
+                patch('game.events.broadcast_session_event', return_value=True) as broadcast:
+            events.emit_bonus_appeared(self.session, {'name': 'Double points'})
+        bonus = self._of_type(
+            broadcast.call_args_list, events.EVENT_BONUS_APPEARED,
+        )
+        self.assertEqual(len(bonus), 1)
+        self.assertEqual(bonus[0][2]['name'], 'Double points')
+        self.assertEqual(len(recorder.sent), 1)
+        self.assertEqual(recorder.sent[0][1]['event'], 'bonus')
+        self.assertIn('Double points', recorder.sent[0][1]['body'])
+
+
+class RealtimeFallbackTest(TestCase):
+    """7.4 — without a channel layer (or with realtime off) REST stays correct."""
+
+    def setUp(self):
+        self.game = _make_game('Fallback Game')
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group, name='fb1')
+        self.session = self.team.session
+        self.api, self.user = _authed_client(self.team, username='fb-player')
+
+    def _assert_rest_snapshot_correct(self):
+        towers_resp = self.api.get('/api/towers/')
+        self.assertEqual(towers_resp.status_code, 200)
+        self.assertIn(self.tower.id, [t['id'] for t in towers_resp.json()])
+        state = self.api.get(f'/api/towers/{self.tower.id}/state/').json()
+        self.assertEqual(state['ownership']['team_name'], 'fb1')
+        resp = self.api.get(f'/api/sessions/{self.session.id}/scoreboard/')
+        self.assertEqual(resp.status_code, 200)
+        names = [e['team_name'] for e in resp.json()['entries']]
+        self.assertIn('fb1', names)
+
+    @override_settings(CHANNEL_LAYERS={})
+    def test_no_channel_layer_degrades_to_noop(self):
+        self.assertFalse(
+            events.broadcast_session_event(self.session.id, 'x', {}),
+        )
+        self.tower.assign_to_team(self.team)  # must not raise
+        self._assert_rest_snapshot_correct()
+
+    def test_realtime_disabled_keeps_rest_path_working(self):
+        Session.objects.filter(pk=self.session.pk).update(realtime_enabled=False)
+        self.tower.assign_to_team(self.team)
+        self._assert_rest_snapshot_correct()
+        body = self.api.get('/api/current-session/').json()
+        self.assertFalse(body['realtime_enabled'])
+
+    def test_layer_send_failure_is_swallowed(self):
+        with patch('game.events._channel_layer', return_value=_BrokenLayer()):
+            self.assertFalse(
+                events.broadcast_session_event(self.session.id, 'x', {}),
+            )
+            self.tower.assign_to_team(self.team)  # must not raise
+        self._assert_rest_snapshot_correct()
+
+
+class RealtimeConfigKnobTest(TestCase):
+    """7.5 — Game defaults + nullable Session overrides via effective()."""
+
+    def setUp(self):
+        self.game = _make_game('Knob Game')
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group, name='kn1')
+        self.session = self.team.session
+
+    def test_defaults_preserve_current_behavior(self):
+        self.assertTrue(self.game.realtime_enabled)
+        self.assertFalse(self.game.push_notifications_enabled)
+        self.assertIsNone(self.session.realtime_enabled)
+        self.assertIsNone(self.session.push_notifications_enabled)
+        self.assertTrue(self.session.effective('realtime_enabled'))
+        self.assertFalse(self.session.effective('push_notifications_enabled'))
+
+    def test_session_override_wins_over_game_default(self):
+        self.session.realtime_enabled = False
+        self.session.push_notifications_enabled = True
+        self.session.save()
+        self.assertFalse(self.session.effective('realtime_enabled'))
+        self.assertTrue(self.session.effective('push_notifications_enabled'))
+
+    def test_fields_are_registered_overridable(self):
+        from organize.models import OVERRIDABLE_CONFIG_FIELDS
+        self.assertIn('realtime_enabled', OVERRIDABLE_CONFIG_FIELDS)
+        self.assertIn('push_notifications_enabled', OVERRIDABLE_CONFIG_FIELDS)
+
+    def test_current_session_payload_carries_effective_values(self):
+        api, _ = _authed_client(self.team, username='kn-player')
+        self.session.realtime_enabled = False
+        self.session.push_notifications_enabled = True
+        self.session.save()
+        body = api.get('/api/current-session/').json()
+        self.assertFalse(body['realtime_enabled'])
+        self.assertTrue(body['push_notifications_enabled'])
+
+
+class RealtimeConsumerTest(TransactionTestCase):
+    """7.1 / 7.2 — socket auth, Session scoping, cross-Session isolation.
+
+    Runs against the full ASGI stack (token middleware + URL router +
+    consumer) with the InMemory channel layer — no Redis involved.
+    """
+
+    def setUp(self):
+        events.reset_throttle()
+        self.game = _make_game('WS Game')
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group, name='ws1')
+        self.session = self.team.session
+        _, self.member = _authed_client(self.team, username='ws-member')
+        self.member_token = Token.objects.get(user=self.member).key
+
+        self.game_b = _make_game('WS Game B')
+        self.group_b = _make_group(self.game_b, name='Explo B', slug='explo-b')
+        self.team_b = _make_team(self.game_b, self.group_b, name='ws2')
+        self.session_b = self.team_b.session
+        _, self.member_b = _authed_client(self.team_b, username='ws-member-b')
+        self.member_b_token = Token.objects.get(user=self.member_b).key
+
+    @staticmethod
+    def _path(session, token=None):
+        suffix = f'?token={token}' if token else ''
+        return f'/ws/session/{session.id}/{suffix}'
+
+    async def _connect(self, session, token=None):
+        communicator = WebsocketCommunicator(
+            asgi_application, self._path(session, token),
+        )
+        connected, code = await communicator.connect()
+        return communicator, connected, code
+
+    async def test_member_connects_and_receives_broadcast(self):
+        communicator, connected, _ = await self._connect(
+            self.session, self.member_token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        self.assertEqual(message['session'], self.session.id)
+        self.assertIn('ts', message)
+        names = [e['team_name'] for e in message['payload']['entries']]
+        self.assertIn('ws1', names)
+        # Heartbeat: the only client→server message honoured.
+        await communicator.send_json_to({'type': 'ping'})
+        self.assertEqual(await communicator.receive_json_from(), {'type': 'pong'})
+        await communicator.disconnect()
+
+    async def test_staff_without_membership_admitted(self):
+        def _make_staff():
+            _, staff = _staff_client(username='ws-staff')
+            return Token.objects.get(user=staff).key
+
+        staff_token = await database_sync_to_async(_make_staff)()
+        communicator, connected, _ = await self._connect(self.session, staff_token)
+        self.assertTrue(connected)
+        await communicator.disconnect()
+
+    async def test_unauthenticated_socket_rejected(self):
+        communicator, connected, code = await self._connect(self.session)
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_bad_token_rejected(self):
+        communicator, connected, code = await self._connect(
+            self.session, 'not-a-real-token',
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_non_member_rejected(self):
+        communicator, connected, code = await self._connect(
+            self.session, self.member_b_token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4403)
+        await communicator.disconnect()
+
+    async def test_unknown_session_rejected(self):
+        communicator = WebsocketCommunicator(
+            asgi_application, f'/ws/session/999999/?token={self.member_token}',
+        )
+        connected, code = await communicator.connect()
+        self.assertFalse(connected)
+        self.assertEqual(code, 4404)
+        await communicator.disconnect()
+
+    async def test_realtime_disabled_refuses_socket(self):
+        await database_sync_to_async(
+            lambda: Session.objects.filter(pk=self.session.pk).update(
+                realtime_enabled=False,
+            )
+        )()
+        communicator, connected, code = await self._connect(
+            self.session, self.member_token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4423)
+        await communicator.disconnect()
+
+    async def test_events_do_not_leak_across_sessions(self):
+        comm_a, connected_a, _ = await self._connect(self.session, self.member_token)
+        comm_b, connected_b, _ = await self._connect(
+            self.session_b, self.member_b_token,
+        )
+        self.assertTrue(connected_a)
+        self.assertTrue(connected_b)
+
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await comm_a.receive_json_from()
+        self.assertEqual(message['session'], self.session.id)
+        # The Session-B socket must see NOTHING from Session A.
+        self.assertTrue(await comm_b.receive_nothing(timeout=0.2))
+
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session_b, force=True,
+        )
+        message_b = await comm_b.receive_json_from()
+        self.assertEqual(message_b['session'], self.session_b.id)
+
+        await comm_a.disconnect()
+        await comm_b.disconnect()
+
+
+class AsgiHttpSmokeTest(TransactionTestCase):
+    """7.7 — HTTP behaves identically served under the Channels ASGI app."""
+
+    def setUp(self):
+        self.game = _make_game('ASGI Game')
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group, name='asgi1')
+        self.session = self.team.session
+        _, self.user = _authed_client(self.team, username='asgi-player')
+        self.token = Token.objects.get(user=self.user).key
+
+    async def test_health_under_asgi(self):
+        communicator = HttpCommunicator(
+            asgi_application, 'GET', '/health/',
+            headers=[(b'host', b'testserver')],
+        )
+        response = await communicator.get_response()
+        self.assertEqual(response['status'], 200)
+        self.assertEqual(json.loads(response['body']), {'status': 'ok'})
+
+    async def test_authed_api_matches_wsgi(self):
+        communicator = HttpCommunicator(
+            asgi_application, 'GET', '/api/current-session/',
+            headers=[
+                (b'host', b'testserver'),
+                (b'authorization', f'Token {self.token}'.encode()),
+            ],
+        )
+        response = await communicator.get_response()
+        self.assertEqual(response['status'], 200)
+        asgi_body = json.loads(response['body'])
+
+        def _wsgi_body():
+            client = APIClient()
+            client.credentials(HTTP_AUTHORIZATION=f'Token {self.token}')
+            return client.get('/api/current-session/').json()
+
+        self.assertEqual(asgi_body, await database_sync_to_async(_wsgi_body)())

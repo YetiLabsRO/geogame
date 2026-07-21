@@ -4,6 +4,12 @@
     "secure": false,
     "changeOrigin": true
   },
+  "/ws": {
+    "target": "http://localhost:8200",
+    "secure": false,
+    "changeOrigin": true,
+    "ws": true
+  },
   "/admin": {
     "target": "http://localhost:8200",
     "secure": false,

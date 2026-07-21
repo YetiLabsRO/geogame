@@ -8,3 +8,6 @@ django-smart-selects @ git+https://github.com/jazzband/django-smart-selects.git@
 pillow>=12
 psycopg[binary]>=3.2
 gunicorn>=23
+channels>=4.3
+channels-redis>=4.3
+pywebpush>=2.0

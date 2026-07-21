@@ -5,6 +5,8 @@ from organize.models import (
     GameCollaborator,
     GameRole,
     Invite,
+    NotificationPreference,
+    PushSubscription,
     Session,
     TeamJoinRequest,
     TeamMembership,
@@ -94,6 +96,26 @@ class InviteAdmin(admin.ModelAdmin):
     search_fields = ('email', 'team__name', 'token')
     autocomplete_fields = ('team', 'created_by', 'accepted_by')
     readonly_fields = ('token', 'created_at', 'accepted_at')
+
+
+@admin.register(PushSubscription)
+class PushSubscriptionAdmin(admin.ModelAdmin):
+    list_display = ('user', 'kind', 'created_at', 'revoked_at')
+    list_filter = ('kind',)
+    search_fields = ('user__username', 'user__email', 'endpoint')
+    autocomplete_fields = ('user',)
+    readonly_fields = ('created_at',)
+
+
+@admin.register(NotificationPreference)
+class NotificationPreferenceAdmin(admin.ModelAdmin):
+    list_display = (
+        'user', 'enabled', 'notify_steal', 'notify_conquer', 'notify_bonus',
+    )
+    list_filter = ('enabled',)
+    search_fields = ('user__username', 'user__email')
+    autocomplete_fields = ('user',)
+    readonly_fields = ('updated_at',)
 
 
 @admin.register(TeamJoinRequest)

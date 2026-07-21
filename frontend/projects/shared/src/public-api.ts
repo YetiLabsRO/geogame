@@ -13,3 +13,4 @@ export * from './lib/staff-api.service';
 export * from './lib/field-sync.service';
 export * from './lib/qr-code.component';
 export * from './lib/team-formation.service';
+export * from './lib/realtime.service';

@@ -95,6 +95,9 @@ export interface CurrentSession {
   game: GameConfig;
   allow_player_team_creation: boolean;
   location: LocationConfig;
+  /** Effective realtime/push toggles (realtime-and-notifications). */
+  realtime_enabled: boolean;
+  push_notifications_enabled: boolean;
 }
 
 export interface ZoneFeature {

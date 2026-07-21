@@ -231,15 +231,43 @@ class Tower(models.Model):
         return self.name
 
     def unassign(self):
+        from game import events
+
         handover_time = datetime.now(timezone.utc)
         ownerships = TeamTowerOwnership.objects.filter(tower=self, timestamp_end__isnull=True)
+        # Realtime: remember whose map/scoreboard this release affects.
+        affected_team_ids = set(ownerships.values_list('team_id', flat=True))
         ownerships.update(timestamp_end=handover_time)
 
         # Recompute control of EVERY zone this tower belongs to — each
-        # zone independently (tower-zone-topology).
-        self._recompute_zones_control(handover_time)
+        # zone independently (tower-zone-topology). Collect the zones
+        # whose control actually flipped for the realtime recolor below.
+        changed_zones = self._recompute_zones_control(handover_time)
+
+        # Realtime: broadcast the release + recolor to every Session whose
+        # teams were touched by this deactivation (a repository tower can
+        # be live in several Sessions at once).
+        for session in self._sessions_for_teams(affected_team_ids):
+            events.emit_tower_ownership_changed(session, self, team=None, kind='released')
+            for zone in changed_zones:
+                events.emit_zone_control_changed(session, zone)
+            events.emit_scoreboard_update(session)
+
+    @staticmethod
+    def _sessions_for_teams(team_ids):
+        from organize.models import Session
+        if not team_ids:
+            return Session.objects.none()
+        return Session.objects.filter(teams__id__in=team_ids).distinct()
 
     def assign_to_team(self, team, challenge=None, no_bonus=False):
+        from game import events
+
+        # Realtime: a same-group open ownership held by ANOTHER team means
+        # this capture is a steal; otherwise it is a (re)conquest.
+        was_steal = TeamTowerOwnership.objects.filter(
+            tower=self, timestamp_end__isnull=True, team__group=team.group,
+        ).exclude(team=team).exists()
         if not no_bonus:
             bonus = self.initial_bonus
             if self.decrease_initial_bonus:
@@ -262,7 +290,20 @@ class Tower(models.Model):
 
         # When towers are reassigned, recalculate zone control across
         # every zone the tower belongs to (tower-zone-topology).
-        self._recompute_zones_control(handover_time, capturing_team=team)
+        changed_zones = self._recompute_zones_control(handover_time, capturing_team=team)
+
+        # Realtime: broadcast the capture (and any zone-control flip) to
+        # the Session group, then a fresh scoreboard snapshot. Push
+        # notifications for steal/conquer hang off the same emit (see
+        # game/events.py); everything degrades to a no-op without a
+        # channel layer.
+        session = team.session
+        events.emit_tower_ownership_changed(
+            session, self, team=team, kind='stolen' if was_steal else 'conquered',
+        )
+        for zone in changed_zones:
+            events.emit_zone_control_changed(session, zone)
+        events.emit_scoreboard_update(session)
 
     # --- Zone-control recompute (implements the `Zone conquest rule`
     # requirement from zone-conquest-and-scoring-config over the
@@ -276,7 +317,10 @@ class Tower(models.Model):
         A change of controller closes the prior owner's TeamZoneOwnership
         (finalizing its floating score into the locked team score) and
         opens a new one for the new controller, if any.
+
+        Returns the list of zones whose control changed (realtime recolor).
         """
+        changed_zones = []
         for zone in self.zones.all():
             active_tower_ids = list(
                 zone.towers.filter(is_active=True).values_list('pk', flat=True),
@@ -287,18 +331,27 @@ class Tower(models.Model):
                 open_ownerships = TeamZoneOwnership.objects.filter(
                     zone=zone, timestamp_end__isnull=True,
                 ).select_related('team__session__game', 'zone')
+                closed_any = False
                 for zone_ownership in open_ownerships:
                     zone_ownership.timestamp_end = handover_time
                     zone_ownership.save()
                     zone_ownership.team.update_score(zone_ownership.get_score())
+                    closed_any = True
+                if closed_any:
+                    changed_zones.append(zone)
                 continue
 
             # One control computation per TeamGroup of every Game that
             # reaches this zone through its collections.
+            zone_changed = False
             for group in TeamGroup.objects.filter(game__collections__zones=zone).distinct():
-                self._recompute_zone_group_control(
+                if self._recompute_zone_group_control(
                     zone, group, active_tower_ids, handover_time, capturing_team,
-                )
+                ):
+                    zone_changed = True
+            if zone_changed:
+                changed_zones.append(zone)
+        return changed_zones
 
     def _resolve_rule_session(self, group, active_tower_ids, capturing_team):
         """Best Session context for resolving a zone's effective rule.
@@ -401,6 +454,10 @@ class Tower(models.Model):
             TeamZoneOwnership.objects.create(
                 zone=zone, team_id=team_id, timestamp_start=handover_time,
             )
+
+        # Report whether this group's control of the zone changed
+        # (drives the realtime zone recolor emit in the callers).
+        return bool(to_remove or to_add)
 
     def _difficulty_rollback(self, team):
         """Phase 10: how many difficulty buckets to drop after failures.
@@ -885,6 +942,10 @@ class TeamTowerChallenge(models.Model):
             Team.objects.filter(pk=self.team_id).update(
                 score=Greatest(F('score') - penalty, Value(0)),
             )
+            # Realtime: the queryset update bypasses Team.update_score,
+            # so broadcast the scoreboard change explicitly.
+            from game import events
+            events.emit_scoreboard_update(session)
 
 
 class PresenceCheck(models.Model):

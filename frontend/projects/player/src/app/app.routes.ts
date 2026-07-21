@@ -53,6 +53,14 @@ export const routes: Routes = [
       import('./history/my-sessions.component').then((m) => m.MySessionsComponent),
   },
   {
+    path: 'settings',
+    canActivate: [authGuard],
+    loadComponent: () =>
+      import('./settings/notification-settings.component').then(
+        (m) => m.NotificationSettingsComponent,
+      ),
+  },
+  {
     path: 'history/:id',
     canActivate: [authGuard],
     loadComponent: () =>

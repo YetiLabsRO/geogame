@@ -131,6 +131,9 @@ OVERRIDABLE_CONFIG_FIELDS = (
     # Zone-conquest & scoring knobs (zone-conquest-and-scoring-config).
     'zone_conquest_rule',
     'score_time_unit',
+    # Realtime + push knobs (realtime-and-notifications).
+    'realtime_enabled',
+    'push_notifications_enabled',
 )
 
 
@@ -246,6 +249,14 @@ class Game(models.Model):
     )
     teammate_visibility_count = models.PositiveIntegerField(default=0)
     presence_window_seconds = models.PositiveIntegerField(default=0)
+
+    # --- Realtime + notifications knobs (realtime-and-notifications).
+    # `realtime_enabled` defaults ON (real-time available; clients still
+    # fall back to polling when no socket can be established), push
+    # defaults OFF so existing games send no notifications. Both are
+    # overridable per Session (see Session.effective). ---
+    realtime_enabled = models.BooleanField(default=True)
+    push_notifications_enabled = models.BooleanField(default=False)
 
     created_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
@@ -626,6 +637,10 @@ class Session(models.Model):
     teammate_visibility_count = models.PositiveIntegerField(null=True, blank=True)
     presence_window_seconds = models.PositiveIntegerField(null=True, blank=True)
 
+    # --- Realtime + notifications overrides (null = inherit Game). ---
+    realtime_enabled = models.BooleanField(null=True, blank=True)
+    push_notifications_enabled = models.BooleanField(null=True, blank=True)
+
     class Meta:
         unique_together = (('game', 'slug'),)
 
@@ -699,10 +714,15 @@ class Session(models.Model):
             raise IllegalTransition(
                 f'Cannot {action} a session in state {self.state}.',
             )
+        previous = self.state
         with transaction.atomic():
             getattr(self, f'_apply_{action}')(override=override)
             self.state = target
             self.save(update_fields=['state'])
+        # Realtime: announce the lifecycle change to connected clients
+        # (no-op without a channel layer — see game/events.py).
+        from game import events
+        events.emit_session_state_changed(self, previous=previous, action=action)
         return self
 
     def _apply_open_participation(self, override=False):
@@ -966,6 +986,11 @@ class Team(models.Model):
     def update_score(self, score):
         self.score += score
         self.save()
+        # Realtime: a locked-score change moves the live scoreboard.
+        # Throttled per Session inside the emit helper; no-op without a
+        # channel layer (see game/events.py).
+        from game import events
+        events.emit_scoreboard_update(self.session)
 
     def floating_score(self, when=None):
         floating_score_current = 0
@@ -1250,3 +1275,94 @@ class Invite(models.Model):
     def __str__(self):
         label = self.email or 'no-email'
         return f'Invite({self.team.name} → {label})'
+
+
+class PushSubscription(models.Model):
+    """A user/device push subscription (realtime-and-notifications).
+
+    Web Push (VAPID) subscriptions carry `endpoint` + `p256dh`/`auth`
+    keys; FCM subscriptions carry `fcm_token`. A subscription exists
+    only because the user explicitly granted permission and registered
+    it (consent), and it stays active until `revoked_at` is set —
+    either by the user revoking, or by pruning after the push service
+    reports the endpoint gone (HTTP 404/410).
+    """
+
+    KIND_WEBPUSH = 'WEBPUSH'
+    KIND_FCM = 'FCM'
+    KIND_CHOICES = [
+        (KIND_WEBPUSH, 'Web Push (VAPID)'),
+        (KIND_FCM, 'Firebase Cloud Messaging'),
+    ]
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='push_subscriptions',
+    )
+    kind = models.CharField(
+        max_length=8, choices=KIND_CHOICES, default=KIND_WEBPUSH,
+    )
+    endpoint = models.TextField(blank=True, default='')
+    p256dh = models.CharField(max_length=255, blank=True, default='')
+    auth = models.CharField(max_length=255, blank=True, default='')
+    fcm_token = models.TextField(blank=True, default='')
+    created_at = models.DateTimeField(auto_now_add=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ['-created_at']
+
+    def __str__(self):
+        state = 'active' if self.is_active else 'revoked'
+        return f'PushSubscription({self.user}, {self.kind}, {state})'
+
+    @property
+    def is_active(self):
+        return self.revoked_at is None
+
+    def revoke(self):
+        """Stop all future sends to this subscription (user revocation or pruning)."""
+        if self.revoked_at is None:
+            self.revoked_at = timezone.now()
+            self.save(update_fields=['revoked_at'])
+
+
+class NotificationPreference(models.Model):
+    """Per-user notification opt-in + per-event toggles.
+
+    `enabled` is the user-level master consent flag; the per-event
+    toggles refine which of steal / conquer / bonus actually notify.
+    Absent a row, defaults apply (all on) — but nothing is ever sent
+    without an active PushSubscription, so defaults never cause
+    unsolicited notifications.
+    """
+
+    user = models.OneToOneField(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name='notification_preference',
+    )
+    enabled = models.BooleanField(default=True)
+    notify_steal = models.BooleanField(default=True)
+    notify_conquer = models.BooleanField(default=True)
+    notify_bonus = models.BooleanField(default=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f'NotificationPreference({self.user}, enabled={self.enabled})'
+
+    @classmethod
+    def for_user(cls, user):
+        preference, _ = cls.objects.get_or_create(user=user)
+        return preference
+
+    def allows(self, event):
+        """Does this preference allow a 'steal' / 'conquer' / 'bonus' event?"""
+        if not self.enabled:
+            return False
+        return {
+            'steal': self.notify_steal,
+            'conquer': self.notify_conquer,
+            'bonus': self.notify_bonus,
+        }.get(event, False)

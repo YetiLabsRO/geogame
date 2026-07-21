@@ -4,3 +4,6 @@
 ipython==8.28.0
 coverage>=7.6
 ruff>=0.9
+# `channels.testing` (WebsocketCommunicator et al.) imports daphne at
+# module level; only the test suite needs it (realtime-and-notifications).
+daphne>=4.1

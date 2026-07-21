@@ -418,6 +418,10 @@ class CurrentSessionSerializer(serializers.Serializer):
     # paces streaming off `location_ping_interval_seconds`; there is no
     # player-facing frequency control.
     location = serializers.SerializerMethodField()
+    # Effective realtime/push toggles (realtime-and-notifications) so
+    # clients know whether to open the websocket / offer push opt-in.
+    realtime_enabled = serializers.SerializerMethodField()
+    push_notifications_enabled = serializers.SerializerMethodField()
 
     def get_allow_player_team_creation(self, session):
         return effective_allow_player_team_creation(session)
@@ -429,6 +433,12 @@ class CurrentSessionSerializer(serializers.Serializer):
             'visibility': session.effective('location_visibility'),
             'consent_text': session.effective('location_consent_text') or '',
         }
+
+    def get_realtime_enabled(self, session):
+        return session.effective('realtime_enabled')
+
+    def get_push_notifications_enabled(self, session):
+        return session.effective('push_notifications_enabled')
 
 
 class MySessionsView(APIView):

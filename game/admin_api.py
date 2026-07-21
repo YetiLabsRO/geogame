@@ -1027,6 +1027,8 @@ class AdminGameSerializer(serializers.ModelSerializer):
             # Presence-rules knobs (defaults preserve base behavior).
             'togetherness_mode', 'teammate_visibility_mode',
             'teammate_visibility_count', 'presence_window_seconds',
+            # Realtime + push defaults (realtime-and-notifications).
+            'realtime_enabled', 'push_notifications_enabled',
             # Repository / roles / cloning.
             'collections', 'created_by', 'created_by_username', 'cloned_from',
             'created_at',
@@ -1197,6 +1199,8 @@ class AdminSessionSerializer(serializers.ModelSerializer):
             # Presence-rules overrides (null = inherit Game default).
             'togetherness_mode', 'teammate_visibility_mode',
             'teammate_visibility_count', 'presence_window_seconds',
+            # Realtime + push overrides (null = inherit Game default).
+            'realtime_enabled', 'push_notifications_enabled',
             'created_at',
         )
         read_only_fields = (
