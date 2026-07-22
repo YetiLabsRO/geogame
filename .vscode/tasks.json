@@ -2,7 +2,7 @@
   "version": "2.0.0",
   "tasks": [
     {
-      "label": "Django: runserver",
+      "label": "Run: Django (runserver)",
       "type": "shell",
       "command": "/home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8200",
       "options": {
@@ -12,6 +12,10 @@
         }
       },
       "isBackground": true,
+      "presentation": {
+        "group": "run",
+        "panel": "dedicated"
+      },
       "problemMatcher": {
         "owner": "django",
         "pattern": {
@@ -23,6 +27,68 @@
           "endsPattern": ".*Quit the server with.*|.*Starting development server at.*"
         }
       }
+    },
+    {
+      "label": "Run: player SPA (ng serve :4500)",
+      "type": "shell",
+      "command": "npx ng serve player --port 4500",
+      "options": {
+        "cwd": "${workspaceFolder}/frontend"
+      },
+      "isBackground": true,
+      "presentation": {
+        "group": "run",
+        "panel": "dedicated"
+      },
+      "problemMatcher": {
+        "owner": "ng-player",
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*(Building\\.\\.\\.|Application bundle generation|Changes detected|Watch mode).*",
+          "endsPattern": ".*(Local:|Watch mode enabled|Application bundle generation complete).*"
+        }
+      }
+    },
+    {
+      "label": "Run: staff SPA (ng serve :4501)",
+      "type": "shell",
+      "command": "npx ng serve staff --port 4501",
+      "options": {
+        "cwd": "${workspaceFolder}/frontend"
+      },
+      "isBackground": true,
+      "presentation": {
+        "group": "run",
+        "panel": "dedicated"
+      },
+      "problemMatcher": {
+        "owner": "ng-staff",
+        "pattern": {
+          "regexp": "^$"
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": ".*(Building\\.\\.\\.|Application bundle generation|Changes detected|Watch mode).*",
+          "endsPattern": ".*(Local:|Watch mode enabled|Application bundle generation complete).*"
+        }
+      }
+    },
+    {
+      "label": "Run: full stack (Django + player + staff)",
+      "dependsOn": [
+        "Run: Django (runserver)",
+        "Run: player SPA (ng serve :4500)",
+        "Run: staff SPA (ng serve :4501)"
+      ],
+      "dependsOrder": "parallel",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
     },
     {
       "label": "Django: migrate",
