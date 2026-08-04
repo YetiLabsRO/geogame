@@ -41,6 +41,16 @@ export const routes: Routes = [
     canActivate: [staffGuard],
     loadComponent: () => import('./admin/zones.component').then((m) => m.ZonesComponent),
   },
+  // --- map-editor ---
+  {
+    path: 'map-editor',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/map-editor/map-editor.component').then(
+        (m) => m.MapEditorComponent,
+      ),
+  },
+  // --- end map-editor ---
   {
     path: 'teams',
     canActivate: [staffGuard],
