@@ -2008,12 +2008,12 @@ export class StaffSessionDetailComponent {
     const s = this.session();
     if (!s) return;
     const ok = await this.confirmService.confirm({
-      title: 'Reset all scores?',
+      title: 'Reset scores for this session?',
       message:
-        `This zeroes EVERY team's cumulative score and closes every open tower/zone ` +
-        `ownership across ALL games and sessions in this installation — not only ` +
-        `"${s.name}". This cannot be undone.`,
-      confirmLabel: 'Reset all scores',
+        `This zeroes every team's cumulative score and closes every open ` +
+        `tower/zone ownership in "${s.name}". Other games and sessions are ` +
+        `not affected. This cannot be undone.`,
+      confirmLabel: 'Reset scores',
       danger: true,
       requireTyping: s.slug,
     });
@@ -2021,19 +2021,12 @@ export class StaffSessionDetailComponent {
     this.dangerBusy.set('reset');
     this.dangerError.set(null);
     this.dangerNotice.set(null);
-    this.api.setCurrentSession(this.sessionId).subscribe({
-      next: () => {
-        this.staff.resetScores().subscribe({
-          next: (res) => {
-            this.dangerBusy.set(null);
-            this.dangerNotice.set(`Scores reset for ${res.teams_reset} team(s).`);
-            this.reloadState();
-          },
-          error: (err) => {
-            this.dangerBusy.set(null);
-            this.dangerError.set(extractErrorMessage(err));
-          },
-        });
+    // Session-scoped server-side — no need to set the nav "current session".
+    this.staff.resetScores(this.sessionId).subscribe({
+      next: (res) => {
+        this.dangerBusy.set(null);
+        this.dangerNotice.set(`Scores reset for ${res.teams_reset} team(s).`);
+        this.reloadState();
       },
       error: (err) => {
         this.dangerBusy.set(null);

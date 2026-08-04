@@ -1994,21 +1994,62 @@ class StaffAdminEndpointsTest(TestCase):
         resp = self.player_client.get('/api/staff/challenges/')
         self.assertEqual(resp.status_code, 403)
 
-    def test_reset_scores_zeroes_every_team_and_closes_ownerships(self):
+    def test_reset_scores_zeroes_session_teams_and_closes_ownerships(self):
         self.tower.assign_to_team(self.team)
         self.team.score = 50
         self.team.save()
         resp = self.staff_client.post(
-            '/api/staff/game-state/reset-scores/', format='json',
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
         )
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 200, resp.content)
         self.team.refresh_from_db()
         self.assertEqual(self.team.score, 0)
         self.assertIsNone(self.tower.tower_control(self.group))
 
+    def test_reset_scores_is_scoped_to_one_session(self):
+        # Regression: reset used to be installation-wide. A second
+        # session's team + score must survive a reset aimed elsewhere.
+        from datetime import timedelta
+
+        self.team.score = 50
+        self.team.save()
+        now = timezone.now()
+        other_session = Session.objects.create(
+            game=self.game, slug='other-run', name='Other run',
+            start_time=now, end_time=now + timedelta(hours=1),
+            state=Session.RUNNING,
+        )
+        other_team = Team.objects.create(
+            name='other-team', color='#0a0a0a',
+            session=other_session, group=self.group,
+        )
+        other_team.score = 77
+        other_team.save()
+
+        resp = self.staff_client.post(
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.team.refresh_from_db()
+        other_team.refresh_from_db()
+        self.assertEqual(self.team.score, 0)
+        self.assertEqual(other_team.score, 77)  # untouched by the scoped reset
+
+    def test_reset_scores_requires_a_session(self):
+        resp = self.staff_client.post(
+            '/api/staff/game-state/reset-scores/', format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+
     def test_reset_scores_requires_staff(self):
         resp = self.player_client.post(
-            '/api/staff/game-state/reset-scores/', format='json',
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
         )
         self.assertEqual(resp.status_code, 403)
 

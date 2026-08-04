@@ -1228,27 +1228,42 @@ class AdminNfcTagViewSet(viewsets.ModelViewSet):
 
 
 class ResetScoresView(APIView):
-    """Staff-only: zero out all Team.score and close every open ownership.
+    """Staff-only: zero out ONE session's Team.score and close its open ownerships.
 
-    Intended as a "start a fresh round" button. Distinct from
-    unassign_all (which just closes current tower ownerships) in that
-    this also resets the locked, cumulative Team.score to 0.
+    Scoped to the required `session` id: a "start a fresh round" button
+    for that run only. Distinct from unassign_all (which just closes
+    current tower ownerships) in that this also resets the locked,
+    cumulative Team.score to 0. Session scoping is deliberate — an
+    unscoped reset would wipe scores and ownerships across every other
+    game/session in the installation.
     """
 
     permission_classes = [IsAdminUser]
 
     @transaction.atomic
     def post(self, request):
+        session_id = request.data.get('session')
+        if session_id in (None, ''):
+            return Response(
+                {'session': 'This field is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        session = Session.objects.filter(pk=session_id).first()
+        if session is None:
+            return Response(
+                {'session': 'No session with that id.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         now = timezone.now()
         TeamTowerOwnership.objects.filter(
-            timestamp_end__isnull=True,
+            team__session=session, timestamp_end__isnull=True,
         ).update(timestamp_end=now)
         TeamZoneOwnership.objects.filter(
-            timestamp_end__isnull=True,
+            team__session=session, timestamp_end__isnull=True,
         ).update(timestamp_end=now)
-        updated = Team.objects.update(score=0)
+        updated = Team.objects.filter(session=session).update(score=0)
         return Response(
-            {'teams_reset': updated},
+            {'teams_reset': updated, 'session': session.id},
             status=status.HTTP_200_OK,
         )
 

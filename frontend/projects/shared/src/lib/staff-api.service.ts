@@ -799,10 +799,12 @@ export class StaffApiService {
     );
   }
 
-  resetScores(): Observable<{ teams_reset: number }> {
-    return this.http.post<{ teams_reset: number }>(
+  resetScores(sessionId: number): Observable<{ teams_reset: number; session: number }> {
+    // Session-scoped: zeroes only THIS session's team scores + open
+    // ownerships (never installation-wide). `session` is required server-side.
+    return this.http.post<{ teams_reset: number; session: number }>(
       '/api/staff/game-state/reset-scores/',
-      {},
+      { session: sessionId },
     );
   }
 
