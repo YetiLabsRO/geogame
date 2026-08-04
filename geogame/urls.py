@@ -328,6 +328,8 @@ urlpatterns = [
     path('api/', include('organize.urls')),
     # mcp-authoring-server: staff review + MCP credential endpoints.
     path('', include('authoring.urls')),
+    # game-simulator-backend: staff-only fake-game runner (record/replay).
+    path('', include('simulator.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),
 

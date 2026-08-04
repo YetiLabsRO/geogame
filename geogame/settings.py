@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'game',
     'organize',
     'authoring',
+    'simulator',
 
 ]
 
