@@ -179,8 +179,112 @@ class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     def validate(self, attrs):
         vertices = attrs.pop('vertices', None)
         if vertices is not None:
-            attrs['shape'] = _close_ring(vertices)
+            if self.instance is None:
+                self._require_create_collection_author(attrs)
+            shape = _close_ring(vertices)
+            if not shape.valid:
+                raise serializers.ValidationError(
+                    {
+                        'vertices': (
+                            'Self-intersecting or otherwise invalid polygon: '
+                            f'{shape.valid_reason}'
+                        ),
+                    },
+                )
+            attrs['shape'] = self._clip_against_existing_zones(shape, attrs)
         return attrs
+
+    def _require_create_collection_author(self, attrs):
+        """Authorization wins over content validation (map-editor capability).
+
+        `_close_ring`'s vertex-count/validity check and the
+        existing-zone-wins clip below both raise 400s from inside
+        `validate()`, which DRF runs BEFORE the view's `perform_create`
+        permission gate (`CollectionAuthorGateMixin`). Without this early
+        re-check, an unauthorised POST whose ring also happens to be
+        invalid/overlapping would surface as 400 instead of the expected
+        403. Mirrors `AdminZoneViewSet.perform_create`, which still runs
+        too (defense in depth) -- this just makes sure authorization wins
+        the ordering race for zone-boundary writes specifically.
+        """
+        collection = attrs.get('collection')
+        request = self.context.get('request')
+        if (
+            collection is not None
+            and request is not None
+            and not collection.can_author(request.user)
+        ):
+            raise PermissionDenied(
+                'You are not authorised to author into this collection. '
+                'Ask its game creator for CREATOR collaboration, or clone the game.',
+            )
+
+    def _clip_against_existing_zones(self, shape, attrs):
+        """Existing-zone-wins clipping (map-editor capability).
+
+        Authoritative server-side pass: subtract the union of every
+        OTHER zone sharing a Collection with this one from the incoming
+        ring, so overlapping geometry can never be introduced -- even
+        via a direct API call bypassing the desktop map editor's own
+        (advisory, client-side) preview clip.
+
+        Scope is the zone's own Collections on update, or the target
+        `collection` (if any) on create -- a zone/collection combo not
+        tied to any Collection has no defined "map" to avoid overlapping,
+        so it is left untouched (legacy zones, standalone geometry).
+        """
+        if self.instance is not None:
+            collections = list(self.instance.collections.all())
+            exclude_pk = self.instance.pk
+        else:
+            collection = attrs.get('collection')
+            collections = [collection] if collection is not None else []
+            exclude_pk = None
+
+        if not collections:
+            return shape
+
+        others = Zone.objects.filter(
+            collections__in=collections, shape__isnull=False,
+        ).distinct()
+        if exclude_pk is not None:
+            others = others.exclude(pk=exclude_pk)
+
+        union = None
+        for other in others:
+            union = other.shape if union is None else union.union(other.shape)
+        if union is None:
+            return shape
+
+        clipped = shape.difference(union)
+
+        if clipped.empty or clipped.area <= 0:
+            raise serializers.ValidationError(
+                {
+                    'vertices': (
+                        'This zone is fully contained within existing zone(s). '
+                        'Existing zones win overlaps -- draw a boundary outside '
+                        'them, or edit the existing zone instead.'
+                    ),
+                },
+            )
+
+        if clipped.geom_type == 'MultiPolygon':
+            # The new ring straddled a gap between existing zones and
+            # got split into disconnected pieces -- keep the largest.
+            clipped = max(clipped, key=lambda piece: piece.area)
+        elif clipped.geom_type != 'Polygon':
+            raise serializers.ValidationError(
+                {
+                    'vertices': (
+                        'Clipping against existing zones left an unusable '
+                        f'{clipped.geom_type} (likely a sliver along a shared '
+                        'edge). Adjust the boundary and try again.'
+                    ),
+                },
+            )
+
+        return clipped
 
     def create(self, validated_data):
         collection = validated_data.pop('collection', None)

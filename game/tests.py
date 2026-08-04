@@ -11449,3 +11449,102 @@ class LocationPingDrivenDiscoveryTest(TestCase):
         discovery = TowerDiscovery.objects.get()
         self.assertEqual(discovery.method, TowerDiscovery.METHOD_PROXIMITY)
         self.assertEqual(discovery.team, self.team)
+
+
+# ---------------------------------------------------------------------------
+# --- map-editor --- staff desktop map editor: server-side authority for
+# "existing zones win" overlap clipping + ring-validity rejection. The
+# frontend map editor (staff/src/app/admin/map-editor/) does the same clip
+# client-side for a live preview, but this is the pass that actually
+# guards the database -- overlaps can't be introduced even by a direct API
+# call that bypasses the desktop editor.
+# ---------------------------------------------------------------------------
+
+
+class ZoneOverlapClippingTest(TestCase):
+    """AdminZoneSerializer: existing-zone-wins clipping (task: map-editor)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.collection = _game_collection(self.game)
+        self.staff_client, self.staff = _staff_client(username='curator')
+        # Existing zone: a clean 1deg x 1deg box, lng [23.0, 24.0] x lat [46.0, 47.0].
+        self.existing = _make_zone(
+            self.game, name='Existing', shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
+        )
+
+    def test_overlapping_new_zone_gets_clipped_to_the_non_overlapping_remainder(self):
+        # New box overlaps the right half of the existing one: lng [23.5, 24.5].
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'New',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.5, 46.0], [24.5, 46.0], [24.5, 47.0], [23.5, 47.0]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        zone = Zone.objects.get(pk=resp.json()['id'])
+        # Existing zone wins: only the non-overlapping sliver (lng [24.0, 24.5])
+        # survives -- half the drawn area, and no interior overlap remains.
+        self.assertAlmostEqual(zone.shape.area, 0.5, places=6)
+        self.assertAlmostEqual(
+            zone.shape.intersection(self.existing.shape).area, 0.0, places=6,
+        )
+        xmin, ymin, xmax, ymax = zone.shape.extent
+        self.assertAlmostEqual(xmin, 24.0, places=6)
+        self.assertAlmostEqual(xmax, 24.5, places=6)
+        self.assertAlmostEqual(ymin, 46.0, places=6)
+        self.assertAlmostEqual(ymax, 47.0, places=6)
+
+    def test_self_intersecting_ring_rejected(self):
+        # A bowtie quad: crossing diagonals make an invalid (self-intersecting) ring.
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Bowtie',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.0, 46.0], [24.0, 47.0], [24.0, 46.0], [23.0, 47.0]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn('vertices', resp.json())
+
+    def test_fully_contained_new_zone_rejected(self):
+        # Entirely inside the existing box -- clipping empties it.
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Swallowed',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.2, 46.2], [23.8, 46.2], [23.8, 46.8], [23.2, 46.8]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn('vertices', resp.json())
+        self.assertFalse(Zone.objects.filter(name='Swallowed').exists())
+
+    def test_updating_a_zone_clips_against_its_other_collection_members(self):
+        # Growing `self.existing` itself must not clip against itself --
+        # only against OTHER zones sharing a collection with it.
+        other = _make_zone(
+            self.game, name='Other', shape=Polygon.from_bbox((24.0, 46.0, 25.0, 47.0)),
+        )
+        resp = self.staff_client.patch(
+            f'/api/staff/zones/{self.existing.id}/',
+            {'vertices': [[23.0, 46.0], [24.5, 46.0], [24.5, 47.0], [23.0, 47.0]]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.existing.refresh_from_db()
+        # Grew from 1.0 to 1.5 wide, minus the half that overlaps `other`.
+        self.assertAlmostEqual(self.existing.shape.area, 1.0, places=6)
+        self.assertAlmostEqual(
+            self.existing.shape.intersection(other.shape).area, 0.0, places=6,
+        )
