@@ -46,6 +46,9 @@
             "browser": "projects/player/src/main.ts",
             "tsConfig": "projects/player/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
+            "stylePreprocessorOptions": {
+              "includePaths": ["node_modules"]
+            },
             "allowedCommonJsDependencies": ["qrcode", "leaflet"],
             "assets": [
               {
@@ -54,7 +57,6 @@
               }
             ],
             "styles": [
-              "node_modules/bootstrap/dist/css/bootstrap.min.css",
               "node_modules/bootstrap-icons/font/bootstrap-icons.css",
               "node_modules/leaflet/dist/leaflet.css",
               "projects/player/src/styles.scss"
@@ -66,8 +68,8 @@
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "500kB",
-                  "maximumError": "1MB"
+                  "maximumWarning": "850kB",
+                  "maximumError": "1.2MB"
                 },
                 {
                   "type": "anyComponentStyle",
@@ -142,6 +144,9 @@
             "browser": "projects/staff/src/main.ts",
             "tsConfig": "projects/staff/tsconfig.app.json",
             "inlineStyleLanguage": "scss",
+            "stylePreprocessorOptions": {
+              "includePaths": ["node_modules"]
+            },
             "allowedCommonJsDependencies": ["qrcode", "leaflet"],
             "assets": [
               {
@@ -150,7 +155,6 @@
               }
             ],
             "styles": [
-              "node_modules/bootstrap/dist/css/bootstrap.min.css",
               "node_modules/bootstrap-icons/font/bootstrap-icons.css",
               "node_modules/leaflet/dist/leaflet.css",
               "projects/staff/src/styles.scss"
@@ -162,8 +166,8 @@
               "budgets": [
                 {
                   "type": "initial",
-                  "maximumWarning": "500kB",
-                  "maximumError": "1MB"
+                  "maximumWarning": "850kB",
+                  "maximumError": "1.2MB"
                 },
                 {
                   "type": "anyComponentStyle",

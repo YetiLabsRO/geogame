@@ -1,1 +1,52 @@
-/* You can add global styles to this file, and also import other style files */
+/* Global styles — Modern Outdoors / Topographic theme (staff, "denser"). */
+/* See frontend/THEME.md for the token list and how to use the shared primitives. */
+
+@use '../../shared/src/lib/theme/bootstrap-overrides' as palette;
+
+// Denser control density than player.
+$app-radius: 8px;
+$app-radius-sm: 6px;
+$app-radius-lg: 12px;
+
+@use 'bootstrap/scss/bootstrap' with (
+  $primary: palette.$color-primary,
+  $secondary: palette.$color-secondary,
+  $success: palette.$color-success,
+  $info: palette.$color-info,
+  $warning: palette.$color-warning,
+  $danger: palette.$color-danger,
+  $body-bg: palette.$color-bg,
+  $body-color: palette.$color-ink,
+  $border-color: palette.$color-border,
+  $border-color-translucent: palette.$color-border,
+  $border-radius: $app-radius,
+  $border-radius-sm: $app-radius-sm,
+  $border-radius-lg: $app-radius-lg,
+  $font-family-base: ('Inter Variable', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif),
+  $font-size-base: 0.875rem,
+  $headings-font-weight: 650,
+  $btn-font-weight: 600,
+  $link-color: palette.$color-primary,
+  $focus-ring-color: palette.$color-focus,
+  $body-secondary-bg: palette.$color-panel-sunken,
+  $body-tertiary-bg: palette.$color-panel-sunken,
+  // Tighter control padding — staff is a dense, data-heavy console.
+  $input-btn-padding-y: 0.3rem,
+  $input-btn-padding-x: 0.6rem,
+  $card-spacer-y: 0.75rem,
+  $card-spacer-x: 0.75rem,
+  // Dark-mode counterparts Bootstrap doesn't infer from the light values above.
+  $body-bg-dark: palette.$color-bg-dark,
+  $body-color-dark: palette.$color-ink-dark,
+  $border-color-dark: palette.$color-border-dark,
+  $border-color-translucent-dark: palette.$color-border-dark,
+  $body-secondary-bg-dark: palette.$color-panel-sunken-dark,
+  $body-tertiary-bg-dark: palette.$color-panel-sunken-dark,
+  $link-color-dark: palette.$color-primary-dark
+);
+
+@use '../../shared/src/lib/theme/tokens' with (
+  $radius: $app-radius,
+  $radius-sm: $app-radius-sm,
+  $radius-lg: $app-radius-lg
+);

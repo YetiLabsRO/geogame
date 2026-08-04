@@ -1,0 +1,49 @@
+// Modern Outdoors / Topographic palette.
+//
+// Single source of truth for the hex/rgba values used to configure
+// Bootstrap's `@use "bootstrap/scss/bootstrap" with (...)` map in each app's
+// `styles.scss`, and for the CSS custom-property token layer emitted by
+// `_tokens.scss`. Do NOT hardcode these values anywhere else — reference
+// this partial instead so the theme only ever has one place to change.
+//
+// See `frontend/THEME.md` for the full rationale and usage guide.
+
+// ---------------------------------------------------------------------------
+// Light palette
+// ---------------------------------------------------------------------------
+$color-bg: #f6f7f4 !default;
+$color-panel: #ffffff !default;
+$color-panel-sunken: #edf1ec !default;
+$color-ink: #1e2a32 !default;
+$color-ink-muted: #5a6b73 !default;
+$color-border: rgba(30, 42, 50, 0.12) !default;
+
+$color-primary: #2f7a4f !default; // trail green
+$color-primary-strong: #256440 !default;
+$color-secondary: #55636b !default; // stone
+$color-info: #2c74b3 !default; // lake blue
+$color-success: #379a5b !default;
+$color-warning: #e07b39 !default; // blaze
+$color-danger: #c0453b !default; // clay
+
+$color-focus: rgba(47, 122, 79, 0.35) !default; // primary @ 35% alpha
+
+// ---------------------------------------------------------------------------
+// Dark palette (`[data-bs-theme="dark"]`)
+// ---------------------------------------------------------------------------
+$color-bg-dark: #10151a !default;
+$color-panel-dark: #171f26 !default;
+$color-panel-sunken-dark: #1e2831 !default;
+$color-ink-dark: #e6edf0 !default;
+$color-ink-muted-dark: #9aaab3 !default;
+$color-border-dark: rgba(230, 237, 240, 0.14) !default;
+
+$color-primary-dark: #4ba574 !default;
+// "keep others vivid" per spec — secondary/success are unchanged in dark mode.
+$color-secondary-dark: $color-secondary !default;
+$color-success-dark: $color-success !default;
+$color-info-dark: #5aa0de !default;
+$color-warning-dark: #e8935a !default;
+$color-danger-dark: #e06a5f !default;
+
+$color-focus-dark: rgba(75, 165, 116, 0.35) !default; // dark primary @ 35%
