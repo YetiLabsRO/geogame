@@ -2,7 +2,13 @@ import { HttpClient } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
-import { ChallengeType, ReviewMode, ScoreMultiplierScope, ScoreMultiplierType } from './game-api.service';
+import {
+  ChallengeType,
+  ReviewMode,
+  ScoreMultiplierScope,
+  ScoreMultiplierType,
+  TowerLockMode,
+} from './game-api.service';
 
 export type SubmissionOutcome = 0 | 1 | 2; // PENDING, CONFIRMED, REJECTED
 export type SubmissionFilter = 'pending' | 'confirmed' | 'rejected' | 'all';
@@ -359,12 +365,97 @@ export type LocationTrackingOverrides = {
   [K in keyof LocationTrackingConfig]: LocationTrackingConfig[K] | null;
 };
 
+// --- game-creation-wizard: config knobs that exist on the backend
+// (AdminGameSerializer / AdminSessionSerializer, game/admin_api.py) but
+// were not yet reflected here — mode, tower-locking, realtime/push, NFC,
+// BLE proximity, and dementors. Additive only; no existing field renamed. ---
+
+/** Game modes (mode-trail-discovery). */
+export type GameMode = 'DOMINATION' | 'TRAIL';
+
+/** Game-mode knob shared by Game (default) and Session (override). */
+export interface ModeConfig {
+  mode: GameMode;
+}
+export type ModeOverrides = { [K in keyof ModeConfig]: ModeConfig[K] | null };
+
+/** Tower-locking knobs shared by Game (default) and Session (override).
+ * (`TowerLockMode` itself is imported from game-api.service.ts, which
+ * already exports it for the player-facing tower-locking types.) */
+export interface TowerLockingConfig {
+  tower_lock_mode: TowerLockMode;
+  tower_lock_finish_minutes: number;
+}
+export type TowerLockingOverrides = {
+  [K in keyof TowerLockingConfig]: TowerLockingConfig[K] | null;
+};
+
+/** Realtime + push knobs (realtime-and-notifications). */
+export interface RealtimeConfig {
+  realtime_enabled: boolean;
+  push_notifications_enabled: boolean;
+}
+export type RealtimeOverrides = { [K in keyof RealtimeConfig]: RealtimeConfig[K] | null };
+
+/** NFC capture-mode knobs (nfc-native-and-secure-links). */
+export interface NfcConfig {
+  nfc_secure_mode: boolean;
+  nfc_require_app: boolean;
+  nfc_replay_hardening: boolean;
+}
+export type NfcOverrides = { [K in keyof NfcConfig]: NfcConfig[K] | null };
+
+/** Coarse BLE proximity buckets (ble-proximity capability). */
+export type ProximityBucket = 'VERY_CLOSE' | 'NEAR' | 'FAR';
+
+/** BLE proximity substrate knobs shared by Game (default) and Session (override). */
+export interface BleConfig {
+  require_ble_capable: boolean;
+  ble_report_interval_seconds: number;
+  ble_scan_duty_cycle_percent: number;
+  ble_freshness_window_seconds: number;
+  ble_identity_rotation_minutes: number;
+  ble_rssi_very_close_dbm: number;
+  ble_rssi_near_dbm: number;
+  ble_rssi_hysteresis_db: number;
+}
+export type BleOverrides = { [K in keyof BleConfig]: BleConfig[K] | null };
+
+/** What happens to a wizard drained to empty (mode-dementors). */
+export type DementorEmptyOutcome = 'FLIP' | 'DIE';
+
+/** Dementors mode knobs shared by Game (default) and Session (override). */
+export interface DementorConfig {
+  dementors_enabled: boolean;
+  dementor_initial_dementors: number;
+  dementor_starting_energy: number;
+  dementor_drain_per_second: number;
+  dementor_drain_range_bucket: ProximityBucket;
+  dementor_empty_outcome: DementorEmptyOutcome;
+  dementor_safety_in_numbers: boolean;
+  dementor_reverse_group_size: number;
+  dementor_reverse_hold_seconds: number;
+  dementor_conversion_threshold: number;
+  dementor_restore_per_second: number;
+  dementor_wizard_regen_per_second: number;
+  dementor_tick_seconds: number;
+}
+export type DementorOverrides = { [K in keyof DementorConfig]: DementorConfig[K] | null };
+
+// --- end game-creation-wizard additions ---
+
 export interface AdminGame
   extends Phase10Config,
     TeamRulesConfig,
     LocationTrackingConfig,
     PresenceRulesConfig,
-    TowerVisibilityConfig {
+    TowerVisibilityConfig,
+    ModeConfig,
+    TowerLockingConfig,
+    RealtimeConfig,
+    NfcConfig,
+    BleConfig,
+    DementorConfig {
   id: number;
   slug: string;
   name: string;
@@ -424,7 +515,13 @@ export interface AdminSession
     TeamRulesOverrides,
     LocationTrackingOverrides,
     PresenceRulesOverrides,
-    TowerVisibilityOverrides {
+    TowerVisibilityOverrides,
+    ModeOverrides,
+    TowerLockingOverrides,
+    RealtimeOverrides,
+    NfcOverrides,
+    BleOverrides,
+    DementorOverrides {
   id: number;
   /** Per-session override; null inherits the Game default. */
   allow_player_team_creation: boolean | null;
