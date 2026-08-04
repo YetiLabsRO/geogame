@@ -139,6 +139,13 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/badges.component').then((m) => m.BadgesComponent),
   },
+  // --- simulator ---
+  {
+    path: 'simulator',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./simulator/simulator.component').then((m) => m.SimulatorComponent),
+  },
   {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),

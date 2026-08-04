@@ -1082,6 +1082,48 @@ export class StaffApiService {
       {},
     );
   }
+
+  // --- simulator ---------------------------------------------------------
+  // game-simulator-backend: staff-only run driver under /api/staff/simulator/.
+
+  createSimulationRun(payload: CreateSimulationRunPayload): Observable<SimulationRun> {
+    return this.http.post<SimulationRun>('/api/staff/simulator/runs/', payload);
+  }
+
+  listSimulationRuns(): Observable<SimulationRun[]> {
+    return this.http.get<SimulationRun[]>('/api/staff/simulator/runs/');
+  }
+
+  /** Run row + a live `state` snapshot (null before setup finishes). */
+  getSimulationRun(id: number): Observable<SimulationRunDetail> {
+    return this.http.get<SimulationRunDetail>(`/api/staff/simulator/runs/${id}/`);
+  }
+
+  stepSimulation(id: number, ticks = 1): Observable<SimulationState> {
+    return this.http.post<SimulationState>(`/api/staff/simulator/runs/${id}/step/`, { ticks });
+  }
+
+  playSimulation(id: number, ticks: number): Observable<SimulationState> {
+    return this.http.post<SimulationState>(`/api/staff/simulator/runs/${id}/play/`, { ticks });
+  }
+
+  pauseSimulation(id: number): Observable<SimulationRun> {
+    return this.http.post<SimulationRun>(`/api/staff/simulator/runs/${id}/pause/`, {});
+  }
+
+  stopSimulation(id: number): Observable<SimulationRun> {
+    return this.http.post<SimulationRun>(`/api/staff/simulator/runs/${id}/stop/`, {});
+  }
+
+  /** The run's full append-only SimulationEvent tape, tick-ordered. */
+  simulationTimeline(id: number): Observable<SimulationEvent[]> {
+    return this.http.get<SimulationEvent[]>(`/api/staff/simulator/runs/${id}/timeline/`);
+  }
+
+  /** Full teardown: deletes the sim-created Game/Session + fake users. */
+  deleteSimulationRun(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/simulator/runs/${id}/`);
+  }
 }
 
 // ---- tower-visibility: discovery matrix ------------------------------------
@@ -1270,4 +1312,116 @@ export interface McpCredential {
   created_at: string;
   last_used_at: string | null;
   revoked_at: string | null;
+}
+
+// --- simulator ---------------------------------------------------------
+// game-simulator-backend: a SimulationRun spins up a REAL Game/Session/
+// roster and drives it through the same domain code the live API uses.
+// Every action is recorded to an append-only SimulationEvent tape for
+// replay/scrub (see simulator/driver.py + simulator/models.py).
+
+export type SimulationRunStatus = 'DRAFT' | 'RUNNING' | 'PAUSED' | 'FINISHED';
+
+/** A SimulationRun row: its config + pointers to the real Game/Session it drives. */
+export interface SimulationRun {
+  id: number;
+  name: string;
+  created_by: number | null;
+  game: number | null;
+  session: number | null;
+  status: SimulationRunStatus;
+  seed: number;
+  config: Record<string, unknown>;
+  tick_count: number;
+  created_at: string;
+}
+
+/**
+ * POST body for `createSimulationRun` — creates AND immediately sets up
+ * the run (real Game/Session/roster/teams). `template_game_id` clones an
+ * existing Game as the sim's template; omit it (optionally passing
+ * `game_name`) to spin up a fresh throwaway Game instead.
+ */
+export interface CreateSimulationRunPayload {
+  name?: string;
+  seed?: number;
+  template_game_id?: number | null;
+  /** Only used when no `template_game_id` is given. */
+  game_name?: string;
+  n_players?: number;
+  n_teams?: number;
+  /** Free-text label only; `dementors_enabled` is what actually switches behavior. */
+  mode?: string;
+  dementors_enabled?: boolean;
+  tick_seconds?: number;
+  capture_probability?: number;
+  center_lat?: number;
+  center_lng?: number;
+  radius_m?: number;
+}
+
+/** One fake roster member's live position + (dementors-mode) role/energy. */
+export interface SimPlayer {
+  id: number;
+  profile_id: number;
+  username: string;
+  team_id: number | null;
+  team_name: string | null;
+  lat: number;
+  lng: number;
+  /** '' outside dementors mode; 'WIZARD' | 'DEMENTOR' when it's on. */
+  role: string;
+  /** null outside dementors mode. */
+  energy: number | null;
+  alive: boolean;
+}
+
+export interface SimScoreEntry {
+  team_id: number;
+  name: string;
+  score: number;
+}
+
+export interface SimTowerState {
+  id: number;
+  name: string;
+  owner_team_id: number | null;
+  owner_team_name: string | null;
+}
+
+/** Live snapshot returned by step/play, and nested under `state` on the detail GET. */
+export interface SimulationState {
+  run_id: number;
+  status: SimulationRunStatus;
+  tick_count: number;
+  session_state: string | null;
+  players: SimPlayer[];
+  scoreboard: SimScoreEntry[];
+  towers: SimTowerState[];
+}
+
+/** GET .../runs/{id}/ response: the run row plus a live `state` snapshot. */
+export interface SimulationRunDetail extends SimulationRun {
+  /** null when the run somehow has no session yet (setup always sets one). */
+  state: SimulationState | null;
+}
+
+export type SimulationEventAction =
+  | 'SPAWN' | 'MOVE' | 'PROXIMITY' | 'CAPTURE' | 'TRANSITION' | 'TICK';
+
+/**
+ * One entry in a run's append-only replay tape. MOVE payload carries
+ * `{from:[lat,lng], to:[lat,lng]}`; CAPTURE payload carries
+ * `{tower_id, team_id}`; PROXIMITY outcome carries `roles`/`energy` maps
+ * keyed by (stringified) `profile_id`.
+ */
+export interface SimulationEvent {
+  id: number;
+  tick: number;
+  ts: string;
+  actor: number | null;
+  actor_username: string | null;
+  action: SimulationEventAction;
+  payload: Record<string, unknown>;
+  outcome: Record<string, unknown>;
 }
