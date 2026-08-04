@@ -143,5 +143,19 @@ export const routes: Routes = [
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },
+  // --- game-creation-wizard ---
+  {
+    path: 'games/new',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/game-wizard/game-wizard.component').then((m) => m.GameWizardComponent),
+  },
+  {
+    path: 'games/:id/edit',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/game-wizard/game-wizard.component').then((m) => m.GameWizardComponent),
+  },
+  // --- end game-creation-wizard ---
   { path: '**', redirectTo: '' },
 ];
