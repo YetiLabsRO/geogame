@@ -2,7 +2,16 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
 
-import { CurrentSession, GameApiService, TeamFormationService } from 'shared';
+import {
+  CurrentSession,
+  GameApiService,
+  TeamFormationService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiFieldComponent,
+  UiInputDirective,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -10,73 +19,112 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-create-team',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, RouterLink],
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiFieldComponent,
+    UiInputDirective,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-6">
-        <h1 class="h3 mb-3">Create a team</h1>
+    <div class="team-screen">
+      <h1 class="tr-h1">Found a Society</h1>
 
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
-        }
+      @if (loadError(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      }
 
-        @if (session(); as s) {
-          @if (!s.allow_player_team_creation) {
-            <div class="alert alert-warning">
-              Player team creation is not enabled for this session. Ask the
-              organisers to add you to a team.
-            </div>
-          } @else {
-            <div class="card">
-              <div class="card-body">
-                <form [formGroup]="form" (ngSubmit)="create()" novalidate>
-                  <div class="mb-3">
-                    <label class="form-label" for="name">Team name</label>
-                    <input id="name" type="text" class="form-control" formControlName="name" />
-                  </div>
-                  @if (s.game.team_groups.length > 0) {
-                    <div class="mb-3">
-                      <label class="form-label" for="group">Group (optional)</label>
-                      <select id="group" class="form-select" formControlName="group">
-                        <option [ngValue]="null">No group</option>
-                        @for (g of s.game.team_groups; track g.id) {
-                          <option [ngValue]="g.id">{{ g.name }}</option>
-                        }
-                      </select>
-                    </div>
+      @if (session(); as s) {
+        @if (!s.allow_player_team_creation) {
+          <ui-alert tone="warning" [withIcon]="true">
+            Player team creation is not enabled for this session. Ask the organisers to add you
+            to a team.
+          </ui-alert>
+        } @else {
+          <form [formGroup]="form" (ngSubmit)="create()" novalidate class="team-screen__form">
+            <ui-field
+              label="Team name"
+              icon="users"
+              [error]="
+                form.controls.name.invalid && form.controls.name.touched
+                  ? (form.controls.name.hasError('required')
+                      ? 'Team name is required.'
+                      : 'Team name is too long.')
+                  : undefined
+              "
+            >
+              <input uiInput type="text" formControlName="name" placeholder="The Wanderers" />
+            </ui-field>
+
+            @if (s.game.team_groups.length > 0) {
+              <ui-field label="Group (optional)">
+                <select uiInput formControlName="group">
+                  <option [ngValue]="null">No group</option>
+                  @for (g of s.game.team_groups; track g.id) {
+                    <option [ngValue]="g.id">{{ g.name }}</option>
                   }
+                </select>
+              </ui-field>
+            }
 
-                  @if (submitError(); as msg) {
-                    <div class="alert alert-danger py-2">{{ msg }}</div>
-                  }
+            @if (submitError(); as msg) {
+              <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+            }
 
-                  <button
-                    type="submit"
-                    class="btn btn-primary"
-                    [disabled]="form.invalid || submitting()"
-                  >
-                    @if (submitting()) {
-                      <span class="spinner-border spinner-border-sm me-1"></span>
-                    }
-                    Create team
-                  </button>
-                  <a class="btn btn-link" routerLink="/teams">Browse teams instead</a>
-                </form>
-              </div>
-            </div>
-            <p class="form-text mt-2">
-              You become the team captain: you can share a join QR, invite
-              people and approve join requests.
-            </p>
-          }
-        } @else if (!loadError()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading…
-          </div>
+            <ui-button
+              type="submit"
+              variant="primary"
+              [block]="true"
+              [loading]="submitting()"
+              [disabled]="form.invalid"
+            >
+              Create
+            </ui-button>
+            <ui-button variant="secondary" [block]="true" routerLink="/teams">
+              Browse societies instead
+            </ui-button>
+          </form>
+          <p class="tr-meta-tiny team-screen__hint">
+            You become the team captain: you can share a join QR, invite people and approve join
+            requests.
+          </p>
         }
-      </div>
+      } @else if (!loadError()) {
+        <div class="team-screen__loading">
+          <ui-spinner />
+          <span class="tr-body">Loading…</span>
+        </div>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-lg);
+      padding: var(--spacing-sm) var(--spacing-xl) var(--spacing-3xl);
+    }
+    .team-screen__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs);
+      color: var(--color-text-secondary);
+      padding-block: var(--spacing-xl);
+    }
+    .team-screen__form {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+    .team-screen__hint {
+      color: var(--color-text-muted);
+      text-align: center;
+    }
   `,
 })
 export class CreateTeamComponent {

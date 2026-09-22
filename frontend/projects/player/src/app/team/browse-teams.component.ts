@@ -1,7 +1,18 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { RouterLink } from '@angular/router';
 
-import { AuthService, JoinableTeam, TeamFormationService } from 'shared';
+import {
+  AuthService,
+  JoinableTeam,
+  TeamFormationService,
+  ToastService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiEmptyStateComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -9,93 +20,168 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-browse-teams',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiEmptyStateComponent,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-8">
-        <div class="d-flex justify-content-between align-items-center mb-3">
-          <h1 class="h3 mb-0">Teams forming</h1>
-          <a class="btn btn-sm btn-primary" routerLink="/team/create">
-            <i class="bi bi-plus-lg"></i> Create a team
-          </a>
+    <div class="team-screen">
+      <div class="team-screen__title-row">
+        <h1 class="tr-h1">Societies</h1>
+        <ui-button variant="tinted" size="sm" icon="users" routerLink="/team/create">
+          Create
+        </ui-button>
+      </div>
+
+      @if (error(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      }
+
+      @if (loading()) {
+        <div class="team-screen__loading">
+          <ui-spinner />
+          <span class="tr-body">Loading…</span>
         </div>
-
-        @if (error(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
-        }
-
-        @if (loading()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading…
-          </div>
-        } @else if (teams().length === 0 && !error()) {
-          <div class="alert alert-info">
-            No teams to join yet — be the first to create one!
-          </div>
-        } @else {
-          <ul class="list-group">
-            @for (t of teams(); track t.id) {
-              <li class="list-group-item d-flex justify-content-between align-items-center">
-                <div>
-                  <span
-                    class="badge me-2"
-                    [style.background-color]="t.color"
-                  >&nbsp;</span>
-                  <span class="fw-semibold">{{ t.name }}</span>
-                  @if (t.group_name) {
-                    <span class="text-body-secondary small ms-1">· {{ t.group_name }}</span>
-                  }
-                  <span class="text-body-secondary small ms-2">
-                    <i class="bi bi-people"></i> {{ t.member_count }}
-                  </span>
+      } @else if (teams().length === 0 && !error()) {
+        <ui-empty-state
+          icon="users"
+          title="No societies yet"
+          description="No teams to join yet — be the first to create one!"
+        >
+          <ui-button variant="primary" routerLink="/team/create">Create a society</ui-button>
+        </ui-empty-state>
+      } @else {
+        <div class="team-screen__list">
+          @for (t of teams(); track t.id) {
+            <ui-card padding="sm">
+              <div class="team-screen__browse-row">
+                <div class="team-screen__browse-info">
+                  <span class="tr-h3">{{ t.name }}</span>
+                  <div class="team-screen__browse-meta">
+                    @if (t.group_name) {
+                      <ui-chip [teamColor]="t.color">{{ t.group_name }}</ui-chip>
+                    }
+                    <span class="tr-meta-tiny" style="color: var(--color-text-muted)">
+                      {{ t.member_count }} member{{ t.member_count === 1 ? '' : 's' }}
+                    </span>
+                  </div>
                 </div>
-                <div>
+                <div class="team-screen__browse-action">
                   @switch (t.my_request_status) {
                     @case ('PENDING') {
-                      <span class="badge text-bg-warning">Requested — pending</span>
+                      <ui-chip tone="neutral">Pending</ui-chip>
                     }
                     @case ('REJECTED') {
-                      <span class="badge text-bg-danger me-2">Rejected</span>
-                      <button
-                        type="button"
-                        class="btn btn-sm btn-outline-primary"
-                        [disabled]="busyTeam() === t.id"
-                        (click)="request(t)"
-                      >
-                        Ask again
-                      </button>
+                      <div class="team-screen__browse-retry">
+                        <span class="tr-meta-tiny" style="color: var(--color-danger)">
+                          Rejected
+                        </span>
+                        <ui-button
+                          variant="secondary"
+                          size="sm"
+                          [loading]="busyTeam() === t.id"
+                          (pressed)="request(t)"
+                        >
+                          Ask again
+                        </ui-button>
+                      </div>
                     }
                     @case ('APPROVED') {
-                      <span class="badge text-bg-success">Joined</span>
+                      <ui-chip tone="brand">Joined</ui-chip>
                     }
                     @default {
-                      <button
-                        type="button"
-                        class="btn btn-sm btn-outline-primary"
-                        [disabled]="busyTeam() === t.id"
-                        (click)="request(t)"
+                      <ui-button
+                        variant="primary"
+                        size="sm"
+                        [loading]="busyTeam() === t.id"
+                        (pressed)="request(t)"
                       >
                         {{ t.join_confirmation === 'AUTO_APPROVE' ? 'Join' : 'Request to join' }}
-                      </button>
+                      </ui-button>
                     }
                   }
                 </div>
-              </li>
-            }
-          </ul>
-          <p class="form-text mt-2">
-            Teams needing confirmation put your request in a queue until the
-            captain or the staff approve it.
-          </p>
-        }
-      </div>
+              </div>
+            </ui-card>
+          }
+        </div>
+        <p class="tr-meta-tiny team-screen__hint">
+          Teams needing confirmation put your request in a queue until the captain or the staff
+          approve it.
+        </p>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-lg);
+      padding: var(--spacing-sm) var(--spacing-xl) var(--spacing-3xl);
+    }
+    .team-screen__title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs);
+      color: var(--color-text-secondary);
+      padding-block: var(--spacing-xl);
+    }
+    .team-screen__list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__browse-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__browse-info {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .team-screen__browse-meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .team-screen__browse-action {
+      flex-shrink: 0;
+    }
+    .team-screen__browse-retry {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 4px;
+    }
+    .team-screen__hint {
+      color: var(--color-text-muted);
+      text-align: center;
+    }
   `,
 })
 export class BrowseTeamsComponent {
   private readonly teamFormation = inject(TeamFormationService);
   private readonly auth = inject(AuthService);
+  private readonly toast = inject(ToastService);
 
   protected readonly teams = signal<JoinableTeam[]>([]);
   protected readonly loading = signal(false);
@@ -128,6 +214,7 @@ export class BrowseTeamsComponent {
         this.busyTeam.set(null);
         // Refresh the profile so the navbar picks up a new membership.
         this.auth.fetchProfile().subscribe({ error: () => {} });
+        this.toast.show('Request sent', { tone: 'brand' });
         this.load();
       },
       error: (err) => {

@@ -1,7 +1,17 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 
-import { JoinCodePayload, QrCodeComponent, TeamFormationService } from 'shared';
+import {
+  JoinCodePayload,
+  QrCodeComponent,
+  TeamFormationService,
+  ToastService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiIconComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -9,80 +19,143 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-team-share',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [QrCodeComponent, RouterLink],
+  imports: [
+    QrCodeComponent,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiIconComponent,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-6">
-        <h1 class="h3 mb-3">Share your team</h1>
+    <div class="team-screen">
+      @if (error(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      }
 
-        @if (error(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
-        }
+      @if (payload(); as p) {
+        <ui-card class="team-screen__share-panel">
+          <h1 class="tr-h2 team-screen__share-title">{{ p.team_name }}</h1>
 
-        @if (payload(); as p) {
-          <div class="card">
-            <div class="card-body text-center">
-              <h2 class="h5 mb-3">{{ p.team_name }}</h2>
-              @if (p.join_url; as url) {
-                <lib-qr-code [value]="url" [size]="220" />
-                <div class="input-group mt-3">
-                  <input class="form-control" type="text" readonly [value]="url" />
-                  <button type="button" class="btn btn-outline-secondary" (click)="copy(url)">
-                    <i class="bi bi-clipboard"></i>
-                    {{ copied() ? 'Copied!' : 'Copy' }}
-                  </button>
-                </div>
-                <p class="form-text mt-2">
-                  This QR / link is <strong>not tied to a person</strong> — anyone
-                  holding it can use it, so feel free to forward it to your whole
-                  group. Rotate it to invalidate every copy already out there.
-                </p>
-              } @else {
-                <div class="alert alert-secondary mb-0">
-                  The join code is currently revoked. Generate a new one to let
-                  people join.
-                </div>
-              }
+          @if (p.join_url; as url) {
+            <div class="team-screen__qr">
+              <lib-qr-code [value]="url" [size]="220" />
             </div>
-            <div class="card-footer d-flex gap-2 justify-content-center">
-              <button
-                type="button"
-                class="btn btn-sm btn-outline-primary"
-                [disabled]="busy()"
-                (click)="rotate()"
+
+            @if (p.join_code; as code) {
+              <span class="team-screen__code tr-h2">{{ code }}</span>
+            }
+
+            <ui-button variant="secondary" [block]="true" (pressed)="copy(url)">
+              Copy link
+            </ui-button>
+
+            <p class="tr-meta-tiny team-screen__hint">
+              This QR / link is not tied to a person — anyone holding it can use it, so feel free
+              to forward it to your whole group. Rotate it to invalidate every copy already out
+              there.
+            </p>
+          } @else {
+            <ui-alert tone="warning" [withIcon]="true">
+              The join code is currently revoked. Generate a new one to let people join.
+            </ui-alert>
+          }
+
+          <div cardActions class="team-screen__share-footer">
+            <ui-button
+              variant="secondary"
+              size="sm"
+              [loading]="busy()"
+              (pressed)="rotate()"
+            >
+              Rotate code
+            </ui-button>
+            @if (p.join_code) {
+              <ui-button
+                variant="secondary"
+                size="sm"
+                [loading]="busy()"
+                (pressed)="revoke()"
               >
-                <i class="bi bi-arrow-repeat"></i> Rotate code
-              </button>
-              @if (p.join_code) {
-                <button
-                  type="button"
-                  class="btn btn-sm btn-outline-danger"
-                  [disabled]="busy()"
-                  (click)="revoke()"
-                >
-                  <i class="bi bi-x-circle"></i> Revoke
-                </button>
-              }
-            </div>
+                Revoke
+              </ui-button>
+            }
           </div>
-          <div class="mt-3 text-center">
-            <a class="btn btn-link" [routerLink]="['/team', id, 'requests']">
-              Pending join requests
-            </a>
-          </div>
-        } @else if (!error()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading…
-          </div>
-        }
-      </div>
+        </ui-card>
+
+        <a class="team-screen__requests-link" [routerLink]="['/team', id, 'requests']">
+          <span class="tr-body" style="color: var(--color-brand-onSurface)">
+            Pending join requests
+          </span>
+          <ui-icon name="arrow-right" [size]="18" />
+        </a>
+      } @else if (!error()) {
+        <div class="team-screen__loading">
+          <ui-spinner />
+          <span class="tr-body">Loading…</span>
+        </div>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+      padding: var(--spacing-2xl) var(--spacing-xl) var(--spacing-3xl);
+    }
+    ui-card.team-screen__share-panel {
+      align-items: center;
+      text-align: center;
+      max-width: 420px;
+      width: 100%;
+      margin-inline: auto;
+    }
+    .team-screen__share-title {
+      color: var(--color-text-primary);
+    }
+    .team-screen__qr {
+      padding: var(--spacing-md);
+      border-radius: var(--radius-lg);
+      background: #fff;
+    }
+    .team-screen__code {
+      color: var(--color-brand-onSurface);
+      font-family: ui-monospace, monospace;
+      letter-spacing: 0.1em;
+    }
+    .team-screen__share-footer {
+      display: flex;
+      gap: var(--spacing-sm);
+      width: 100%;
+    }
+    .team-screen__share-footer > * {
+      flex: 1;
+    }
+    .team-screen__hint {
+      color: var(--color-text-muted);
+    }
+    .team-screen__requests-link {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--spacing-2xs);
+      max-width: 420px;
+      width: 100%;
+      margin-inline: auto;
+      padding-block: var(--spacing-sm);
+      text-decoration: none;
+    }
   `,
 })
 export class TeamShareComponent {
   private readonly teamFormation = inject(TeamFormationService);
   private readonly route = inject(ActivatedRoute);
+  private readonly toast = inject(ToastService);
 
   protected readonly id = Number(this.route.snapshot.paramMap.get('id'));
 
@@ -129,6 +202,7 @@ export class TeamShareComponent {
   protected copy(url: string): void {
     navigator.clipboard?.writeText(url).then(() => {
       this.copied.set(true);
+      this.toast.show('Link copied', { tone: 'success' });
       setTimeout(() => this.copied.set(false), 2000);
     });
   }

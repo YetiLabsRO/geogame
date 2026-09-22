@@ -2,7 +2,18 @@ import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@a
 import { DatePipe } from '@angular/common';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 
-import { TeamFormationService, TeamJoinRequest } from 'shared';
+import {
+  TeamFormationService,
+  TeamJoinRequest,
+  ToastService,
+  UiAlertComponent,
+  UiAvatarComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiEmptyStateComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -10,93 +21,184 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-join-requests',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, RouterLink],
+  imports: [
+    DatePipe,
+    RouterLink,
+    UiAlertComponent,
+    UiAvatarComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiEmptyStateComponent,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-8">
-        <div class="d-flex justify-content-between align-items-center mb-3">
-          <h1 class="h3 mb-0">Join requests</h1>
-          <a class="btn btn-sm btn-outline-secondary" [routerLink]="['/team', teamId, 'share']">
-            <i class="bi bi-qr-code"></i> Share team
-          </a>
+    <div class="team-screen">
+      <div class="team-screen__title-row">
+        <div class="team-screen__title-group">
+          <h1 class="tr-h1">Awaiting review</h1>
+          @if (pending().length > 0) {
+            <ui-chip tone="solid">{{ pending().length }}</ui-chip>
+          }
         </div>
+        <ui-button variant="secondary" size="sm" icon="key" [routerLink]="['/team', teamId, 'share']">
+          Share team
+        </ui-button>
+      </div>
 
-        @if (error(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
-        }
+      @if (error(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      }
 
-        @if (loading()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading…
-          </div>
+      @if (loading()) {
+        <div class="team-screen__loading">
+          <ui-spinner />
+          <span class="tr-body">Loading…</span>
+        </div>
+      } @else {
+        @if (pending().length === 0) {
+          <ui-empty-state icon="id-card" title="Nothing to review" description="No pending requests right now." />
         } @else {
-          @if (pending().length === 0) {
-            <div class="alert alert-info">No pending requests.</div>
-          } @else {
-            <ul class="list-group mb-4">
-              @for (r of pending(); track r.id) {
-                <li class="list-group-item d-flex justify-content-between align-items-center">
-                  <div>
-                    <span class="fw-semibold">{{ r.first_name || r.username }}</span>
-                    <span class="text-body-secondary small ms-1">
+          <div class="team-screen__list">
+            @for (r of pending(); track r.id) {
+              <ui-card padding="sm">
+                <div class="team-screen__member-row">
+                  <ui-avatar [size]="40" [name]="r.first_name || r.username" />
+                  <div class="team-screen__member-info">
+                    <span class="tr-h3">{{ r.first_name || r.username }}</span>
+                    <span class="tr-meta-tiny" style="color: var(--color-text-muted)">
                       &#64;{{ r.username }} · via {{ r.source }} ·
                       {{ r.requested_at | date: 'short' }}
                     </span>
-                    @if (r.note) {
-                      <div class="small text-body-secondary">“{{ r.note }}”</div>
-                    }
                   </div>
-                  <div class="btn-group btn-group-sm">
-                    <button
-                      type="button"
-                      class="btn btn-outline-success"
-                      [disabled]="busy() === r.id"
-                      (click)="approve(r)"
-                    >
-                      <i class="bi bi-check-lg"></i> Approve
-                    </button>
-                    <button
-                      type="button"
-                      class="btn btn-outline-danger"
-                      [disabled]="busy() === r.id"
-                      (click)="reject(r)"
-                    >
-                      <i class="bi bi-x-lg"></i> Reject
-                    </button>
-                  </div>
-                </li>
-              }
-            </ul>
-          }
-
-          @if (decided().length > 0) {
-            <h2 class="h6 text-body-secondary">Decided</h2>
-            <ul class="list-group">
-              @for (r of decided(); track r.id) {
-                <li class="list-group-item d-flex justify-content-between align-items-center">
-                  <span>
-                    {{ r.username }}
-                    <span class="text-body-secondary small">· via {{ r.source }}</span>
-                  </span>
-                  <span
-                    class="badge"
-                    [class]="r.status === 'APPROVED' ? 'text-bg-success' : 'text-bg-danger'"
+                </div>
+                @if (r.note) {
+                  <blockquote class="team-screen__quote tr-body-italic">{{ r.note }}</blockquote>
+                }
+                <div cardActions class="team-screen__request-actions">
+                  <ui-button
+                    variant="tinted"
+                    size="sm"
+                    [loading]="busy() === r.id"
+                    (pressed)="approve(r)"
                   >
-                    {{ r.status }}
-                  </span>
-                </li>
-              }
-            </ul>
-          }
+                    Accept
+                  </ui-button>
+                  <ui-button
+                    variant="secondary"
+                    size="sm"
+                    [loading]="busy() === r.id"
+                    (pressed)="reject(r)"
+                  >
+                    Decline
+                  </ui-button>
+                </div>
+              </ui-card>
+            }
+          </div>
         }
-      </div>
+
+        @if (decided().length > 0) {
+          <div class="team-screen__divider" role="separator">
+            <span class="team-screen__hairline"></span>
+            <span class="tr-eyebrow" style="color: var(--color-text-muted)">Decided</span>
+            <span class="team-screen__hairline"></span>
+          </div>
+          <div class="team-screen__list">
+            @for (r of decided(); track r.id) {
+              <ui-card padding="sm">
+                <div class="team-screen__decided-row">
+                  <span class="tr-body">{{ r.username }}</span>
+                  <ui-chip [tone]="r.status === 'APPROVED' ? 'brand' : 'neutral'">
+                    {{ r.status }}
+                  </ui-chip>
+                </div>
+              </ui-card>
+            }
+          </div>
+        }
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-lg);
+      padding: var(--spacing-sm) var(--spacing-xl) var(--spacing-3xl);
+    }
+    .team-screen__title-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+      flex-wrap: wrap;
+    }
+    .team-screen__title-group {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .team-screen__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs);
+      color: var(--color-text-secondary);
+      padding-block: var(--spacing-xl);
+    }
+    .team-screen__list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__member-row {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__member-info {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .team-screen__quote {
+      margin: 0;
+      padding-left: var(--spacing-sm);
+      border-left: 3px solid var(--color-brand-primary);
+      color: var(--color-text-secondary);
+    }
+    .team-screen__request-actions {
+      display: flex;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__request-actions > * {
+      flex: 1;
+    }
+    .team-screen__decided-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .team-screen__hairline {
+      flex: 1;
+      height: 1px;
+      background: var(--color-border-subtle);
+    }
+    .team-screen__divider {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
   `,
 })
 export class JoinRequestsComponent {
   private readonly teamFormation = inject(TeamFormationService);
   private readonly route = inject(ActivatedRoute);
+  private readonly toast = inject(ToastService);
 
   protected readonly teamId = Number(this.route.snapshot.paramMap.get('id'));
 
@@ -136,6 +238,7 @@ export class JoinRequestsComponent {
     this.teamFormation.approveJoinRequest(r.id).subscribe({
       next: () => {
         this.busy.set(null);
+        this.toast.show(`${r.first_name || r.username} accepted`, { tone: 'success' });
         this.load();
       },
       error: (err) => {
@@ -151,6 +254,7 @@ export class JoinRequestsComponent {
     this.teamFormation.rejectJoinRequest(r.id).subscribe({
       next: () => {
         this.busy.set(null);
+        this.toast.show(`${r.first_name || r.username} declined`, { tone: 'neutral' });
         this.load();
       },
       error: (err) => {

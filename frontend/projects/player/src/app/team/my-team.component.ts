@@ -8,129 +8,280 @@ import {
 } from '@angular/core';
 import { RouterLink } from '@angular/router';
 
-import { AuthService, GameApiService, Invite, InvitesService, MyTeam } from 'shared';
+import {
+  AuthService,
+  GameApiService,
+  Invite,
+  InvitesService,
+  MyTeam,
+  ToastService,
+  UiAlertComponent,
+  UiAvatarComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+  UiSpinnerComponent,
+  UiStatTileComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
 /**
- * Wireframe "My team" page (team-roles capability): the roster with each
- * member's in-game roles, the caller's own roles, and an invite
- * affordance for holders of a role with the INVITER built-in power.
+ * "My team" page (team-roles capability): the roster with each member's
+ * in-game roles, the caller's own roles, and an invite affordance for
+ * holders of a role with the INVITER built-in power.
  */
 @Component({
   selector: 'app-my-team',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [
+    RouterLink,
+    UiAlertComponent,
+    UiAvatarComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+    UiSpinnerComponent,
+    UiStatTileComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-8 col-lg-6">
-        <a routerLink="/" class="small text-body-secondary">&larr; Back to map</a>
+    <div class="team-screen">
+      <a routerLink="/" class="team-screen__back tr-body">
+        <ui-icon name="chevron-left" [size]="18" />
+        Back to map
+      </a>
 
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger mt-3">{{ msg }}</div>
-        } @else if (team(); as t) {
-          <h1 class="h3 mt-2 mb-1 d-flex align-items-center gap-2">
-            <span
-              class="d-inline-block rounded-circle"
-              style="width: 0.9rem; height: 0.9rem"
-              [style.background-color]="t.color"
-            ></span>
-            {{ t.name }}
-          </h1>
-          <div class="text-body-secondary small mb-3">
-            Score: {{ t.current_score }}
-          </div>
+      @if (loadError(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      } @else if (team(); as t) {
+        <header class="team-screen__header" [style.--team-color]="t.color">
+          <span class="tr-eyebrow" style="color: var(--color-brand-onSurface)">
+            Active society
+          </span>
+          <h1 class="tr-h1">{{ t.name }}</h1>
 
           @if (myRoles().length > 0) {
-            <div class="mb-3">
-              <span class="small text-body-secondary me-1">Your roles:</span>
+            <div class="team-screen__my-roles">
+              <span class="tr-meta-tiny" style="color: var(--color-text-muted)">
+                Your roles
+              </span>
               @for (role of myRoles(); track role.id) {
-                <span class="badge text-bg-primary me-1">{{ role.name }}</span>
+                <ui-chip tone="brand">{{ role.name }}</ui-chip>
               }
             </div>
-          } @else {
-            <div class="mb-3 small text-body-secondary">
-              You hold no in-game roles yet.
-            </div>
           }
+        </header>
 
-          <div class="card mb-3">
-            <div class="card-header py-2 small fw-semibold">Members</div>
-            <ul class="list-group list-group-flush">
-              @for (member of t.members; track member.user_id) {
-                <li class="list-group-item d-flex justify-content-between align-items-center">
-                  <span>
-                    {{ member.username }}
-                    @if (member.user_id === myUserId()) {
-                      <span class="text-body-secondary small">(you)</span>
-                    }
-                  </span>
-                  <span>
-                    @for (role of member.roles; track role.id) {
-                      <span class="badge text-bg-secondary ms-1">{{ role.name }}</span>
-                    } @empty {
-                      <span class="text-body-secondary small">no roles</span>
-                    }
-                  </span>
-                </li>
-              }
-            </ul>
-          </div>
+        <div class="team-screen__stats">
+          <ui-stat-tile icon="star" label="Score" [value]="t.current_score" />
+          <ui-stat-tile icon="users" label="Members" [value]="t.active_member_count" />
+        </div>
 
-          @if (t.can_invite) {
-            <div class="card mb-3">
-              <div class="card-body">
-                <div class="fw-semibold mb-1">
-                  <i class="bi bi-person-plus"></i> Invite a player
-                </div>
-                <p class="small text-body-secondary mb-2">
-                  You hold an inviter role — you can bring new players into
-                  your team.
-                </p>
-                @if (inviteError(); as msg) {
-                  <div class="alert alert-danger py-2">{{ msg }}</div>
-                }
-                @if (inviteLink(); as link) {
-                  <div class="input-group input-group-sm mb-2">
-                    <input class="form-control" type="text" readonly [value]="link" />
-                    <button
-                      type="button"
-                      class="btn btn-outline-secondary"
-                      (click)="copyLink(link)"
-                    >
-                      {{ copied() ? 'Copied!' : 'Copy' }}
-                    </button>
-                  </div>
-                }
-                <button
-                  type="button"
-                  class="btn btn-sm btn-primary"
-                  [disabled]="creatingInvite()"
-                  (click)="createInvite()"
-                >
-                  @if (creatingInvite()) {
-                    <span class="spinner-border spinner-border-sm me-1"></span>
-                  }
-                  Create invite link
-                </button>
-              </div>
-            </div>
-          }
-        } @else {
-          <div class="d-flex align-items-center text-body-secondary mt-4">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading team…
-          </div>
+        @if (!t.is_ready) {
+          <ui-alert tone="warning" [withIcon]="true">
+            @if (t.members_needed > 0) {
+              Your team needs {{ t.members_needed }} more
+              member{{ t.members_needed === 1 ? '' : 's' }} before the session can start.
+            } @else {
+              Your team has more members than this session allows.
+            }
+          </ui-alert>
         }
-      </div>
+
+        <div class="team-screen__divider" role="separator">
+          <span class="team-screen__hairline"></span>
+          <span class="tr-eyebrow" style="color: var(--color-text-muted)">
+            Members of the society
+          </span>
+          <span class="team-screen__hairline"></span>
+        </div>
+
+        <div class="team-screen__list">
+          @for (m of t.members; track m.user_id) {
+            <ui-card padding="sm">
+              <div class="team-screen__member-row">
+                <ui-avatar [size]="40" [name]="m.username" [teamColor]="t.color" />
+                <div class="team-screen__member-info">
+                  <span class="tr-h3">{{ m.username }}</span>
+                  <div class="team-screen__member-chips">
+                    @if (isCaptain() && m.user_id === myUserId()) {
+                      <ui-chip tone="brand">Lead</ui-chip>
+                    }
+                    @for (role of m.roles; track role.id) {
+                      <ui-chip tone="slate">{{ role.name }}</ui-chip>
+                    }
+                    @if (m.user_id === myUserId()) {
+                      <ui-chip tone="neutral">You</ui-chip>
+                    }
+                  </div>
+                </div>
+              </div>
+            </ui-card>
+          }
+        </div>
+
+        @if (t.can_invite) {
+          <ui-card class="team-screen__invite">
+            <div class="team-screen__invite-body">
+              <ui-icon name="users" [size]="32" />
+              <h3 class="tr-h3">Expand the Society</h3>
+              <p class="tr-body" style="color: var(--color-text-secondary)">
+                You hold an inviter role — bring new players into your team.
+              </p>
+            </div>
+
+            @if (inviteError(); as msg) {
+              <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+            }
+
+            @if (inviteLink(); as link) {
+              <ui-field label="Invite link">
+                <input uiInput type="text" readonly [value]="link" />
+              </ui-field>
+              <ui-button variant="secondary" size="sm" [block]="true" (pressed)="copyLink(link)">
+                Copy link
+              </ui-button>
+            } @else {
+              <ui-button
+                variant="tinted"
+                [block]="true"
+                [loading]="creatingInvite()"
+                (pressed)="createInvite()"
+              >
+                Share invite
+              </ui-button>
+            }
+          </ui-card>
+        }
+
+        @if (isCaptain()) {
+          <a [routerLink]="['/team', t.id, 'requests']" class="team-screen__requests-link">
+            <ui-card padding="sm" variant="flat">
+              <div class="team-screen__requests-row">
+                <span class="tr-h3">Join requests</span>
+                <ui-icon name="arrow-right" [size]="18" />
+              </div>
+            </ui-card>
+          </a>
+        }
+      } @else {
+        <div class="team-screen__loading">
+          <ui-spinner />
+          <span class="tr-body">Loading team…</span>
+        </div>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-lg);
+      padding: var(--spacing-sm) var(--spacing-xl) var(--spacing-3xl);
+    }
+    .team-screen__back {
+      display: inline-flex;
+      align-items: center;
+      gap: var(--spacing-2xs);
+      color: var(--color-text-secondary);
+      text-decoration: none;
+    }
+    .team-screen__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-xs);
+      color: var(--color-text-secondary);
+      padding-block: var(--spacing-xl);
+    }
+    .team-screen__header {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2xs);
+    }
+    .team-screen__my-roles {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--spacing-2xs);
+      margin-top: var(--spacing-xs);
+    }
+    .team-screen__stats {
+      display: flex;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__stats > * {
+      flex: 1;
+      min-width: 0;
+    }
+    .team-screen__divider {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__hairline {
+      flex: 1;
+      height: 1px;
+      background: var(--color-border-subtle);
+    }
+    .team-screen__list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__member-row {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+    .team-screen__member-info {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .team-screen__member-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-2xs);
+    }
+    ui-card.team-screen__invite {
+      border-style: dashed;
+      border-color: var(--color-border-default);
+    }
+    .team-screen__invite-body {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-2xs);
+      text-align: center;
+    }
+    .team-screen__requests-link {
+      display: block;
+      text-decoration: none;
+    }
+    .team-screen__requests-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--color-text-primary);
+    }
   `,
 })
 export class MyTeamComponent implements OnInit {
   private readonly api = inject(GameApiService);
   private readonly invites = inject(InvitesService);
   private readonly auth = inject(AuthService);
+  private readonly toast = inject(ToastService);
 
   protected readonly team = signal<MyTeam | null>(null);
   protected readonly loadError = signal<string | null>(null);
@@ -147,6 +298,15 @@ export class MyTeamComponent implements OnInit {
     if (!t || me === null) return [];
     return t.members.find((m) => m.user_id === me)?.roles ?? [];
   });
+
+  /**
+   * Derived purely from the already-fetched `UserProfile.captain_of_team_id`
+   * (no new API call). `MyTeamMember` has no per-row captain flag, so the
+   * "Lead" chip can only be shown on the viewer's own row.
+   */
+  protected readonly isCaptain = computed(
+    () => this.team()?.id === this.auth.profile()?.captain_of_team_id,
+  );
 
   protected readonly inviteLink = computed(() => {
     const inv = this.invite();
@@ -182,6 +342,9 @@ export class MyTeamComponent implements OnInit {
   }
 
   protected copyLink(link: string): void {
-    navigator.clipboard?.writeText(link).then(() => this.copied.set(true));
+    navigator.clipboard?.writeText(link).then(() => {
+      this.copied.set(true);
+      this.toast.show('Invite link copied', { tone: 'success' });
+    });
   }
 }

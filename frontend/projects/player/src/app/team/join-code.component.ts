@@ -1,7 +1,18 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 
-import { AuthService, JoinCodePreview, TeamFormationService, TeamJoinRequest } from 'shared';
+import {
+  AuthService,
+  JoinCodePreview,
+  TeamFormationService,
+  TeamJoinRequest,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiIconComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -9,74 +20,131 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-join-code',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiIconComponent,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-6">
-        <h1 class="h3 mb-3">Join a team</h1>
+    <div class="team-screen">
+      <ui-card class="team-screen__join-panel">
+        <div class="team-screen__join-icon">
+          <ui-icon name="key" [size]="28" />
+        </div>
+        <h1 class="tr-h2 team-screen__join-title">Join with a code</h1>
 
         @if (error(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
+          <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
         }
 
         @if (preview(); as p) {
-          <div class="card">
-            <div class="card-body text-center">
-              <span class="badge mb-2" [style.background-color]="p.color">&nbsp;</span>
-              <h2 class="h4">{{ p.team_name }}</h2>
-              @if (p.team_group) {
-                <div class="text-body-secondary">{{ p.team_group }}</div>
-              }
-              <div class="text-body-secondary small mb-3">
-                {{ p.game_name }} · {{ p.session_name }}
-              </div>
-
-              @if (result(); as r) {
-                @if (r.status === 'APPROVED') {
-                  <div class="alert alert-success">
-                    You joined <strong>{{ r.team_name }}</strong>!
-                  </div>
-                  <a class="btn btn-primary" routerLink="/">Go to the map</a>
-                } @else {
-                  <div class="alert alert-warning">
-                    Your request is <strong>pending</strong> — the
-                    {{ p.join_confirmation === 'STAFF' ? 'staff' : 'team captain' }}
-                    must approve it.
-                  </div>
-                  <a class="btn btn-outline-secondary" routerLink="/teams">Browse teams</a>
-                }
-              } @else if (isAuthenticated()) {
-                @if (p.join_confirmation !== 'AUTO_APPROVE') {
-                  <p class="form-text">
-                    This team confirms joins — your request will wait for approval.
-                  </p>
-                }
-                <button
-                  type="button"
-                  class="btn btn-primary"
-                  [disabled]="busy()"
-                  (click)="join()"
-                >
-                  @if (busy()) {
-                    <span class="spinner-border spinner-border-sm me-1"></span>
-                  }
-                  Join {{ p.team_name }}
-                </button>
-              } @else {
-                <p>Sign in or create an account to join this team.</p>
-                <a class="btn btn-primary me-2" routerLink="/login">Sign in</a>
-                <a class="btn btn-outline-primary" routerLink="/register">Register</a>
-              }
-            </div>
+          <div class="team-screen__join-preview">
+            <ui-chip [teamColor]="p.color">{{ p.team_name }}</ui-chip>
+            @if (p.team_group) {
+              <span class="tr-body" style="color: var(--color-text-secondary)">
+                {{ p.team_group }}
+              </span>
+            }
+            <span class="tr-meta-tiny" style="color: var(--color-text-muted)">
+              {{ p.game_name }} · {{ p.session_name }}
+            </span>
           </div>
+
+          @if (result(); as r) {
+            @if (r.status === 'APPROVED') {
+              <ui-alert tone="success" [withIcon]="true">
+                You joined <strong>{{ r.team_name }}</strong>!
+              </ui-alert>
+              <ui-button variant="primary" [block]="true" routerLink="/">Go to the map</ui-button>
+            } @else {
+              <ui-alert tone="warning" [withIcon]="true">
+                Your request is pending — the
+                {{ p.join_confirmation === 'STAFF' ? 'staff' : 'team captain' }}
+                must approve it.
+              </ui-alert>
+              <ui-button variant="secondary" [block]="true" routerLink="/teams">
+                Browse societies
+              </ui-button>
+            }
+          } @else if (isAuthenticated()) {
+            @if (p.join_confirmation !== 'AUTO_APPROVE') {
+              <p class="tr-body" style="color: var(--color-text-secondary)">
+                This team confirms joins — your request will wait for approval.
+              </p>
+            }
+            <ui-button
+              variant="primary"
+              [block]="true"
+              [loading]="busy()"
+              (pressed)="join()"
+            >
+              Join {{ p.team_name }}
+            </ui-button>
+          } @else {
+            <p class="tr-body" style="color: var(--color-text-secondary)">
+              Sign in or create an account to join this team.
+            </p>
+            <ui-button variant="primary" [block]="true" routerLink="/login">Sign in</ui-button>
+            <ui-button variant="secondary" [block]="true" routerLink="/register">
+              Register
+            </ui-button>
+          }
         } @else if (!error()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading…
+          <div class="team-screen__loading">
+            <ui-spinner />
+            <span class="tr-body">Loading…</span>
           </div>
         }
-      </div>
+      </ui-card>
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .team-screen {
+      display: flex;
+      flex-direction: column;
+      padding: var(--spacing-2xl) var(--spacing-xl) var(--spacing-3xl);
+    }
+    ui-card.team-screen__join-panel {
+      align-items: center;
+      text-align: center;
+      max-width: 420px;
+      width: 100%;
+      margin-inline: auto;
+    }
+    .team-screen__join-icon {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 56px;
+      height: 56px;
+      border-radius: var(--radius-full);
+      background: var(--color-brand-tint);
+      color: var(--color-brand-onSurface);
+    }
+    .team-screen__join-title {
+      color: var(--color-text-primary);
+    }
+    .team-screen__join-preview {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-2xs);
+    }
+    .team-screen__loading {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--spacing-xs);
+      color: var(--color-text-secondary);
+      padding-block: var(--spacing-xl);
+    }
   `,
 })
 export class JoinCodeComponent {
