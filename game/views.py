@@ -321,13 +321,12 @@ def nfc_landing(request, token):
     inert by construction, and an invalid token is indistinguishable
     from a valid one (no validity oracle).
 
-    App-link wiring notes (deployment, not code):
-    - Android App Links: serve /.well-known/assetlinks.json listing the
-      app package (settings.NFC_ANDROID_PACKAGE) + its signing cert
-      SHA-256 so Android routes https://<host>/nfc/* to the app.
-    - iOS Universal Links: serve /.well-known/apple-app-site-association
-      with an applinks entry for /nfc/*.
-    Both files belong to the reverse-proxy / static layer; the installed
+    App-link wiring (mobile-app, deployment D7): Django serves the two
+    verification documents the OS fetches to decide whether to route
+    here at all — /.well-known/assetlinks.json (Android App Links) and
+    /.well-known/apple-app-site-association (iOS Universal Links), both
+    built from settings.MOBILE_APP_LINKS by geogame/app_links.py and
+    covering /nfc/*, /join/* and /invite/*. Once verified, the installed
     app deep-links straight into the scan flow and never loads this page.
     """
     return render(request, 'game/nfc_landing.html', {

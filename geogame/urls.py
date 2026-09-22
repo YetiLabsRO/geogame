@@ -97,6 +97,7 @@ from game.views import (
     health,
     nfc_landing,
 )
+from geogame.app_links import apple_app_site_association, assetlinks
 
 router = routers.DefaultRouter()
 router.register(r'zones', ZoneViewSet)
@@ -150,6 +151,14 @@ admin_router.register(
 urlpatterns = [
     path('admin/', admin.site.urls),
     path('health/', health, name="health"),
+    # mobile-app / deployment: app-link verification for the Capacitor
+    # shell (D7) — no trailing slash, these paths are fixed by the OS.
+    path('.well-known/assetlinks.json', assetlinks, name='assetlinks'),
+    path(
+        '.well-known/apple-app-site-association',
+        apple_app_site_association,
+        name='apple-app-site-association',
+    ),
     # nfc-native-and-secure-links: browser fallback page (no capture side
     # effect) + the authenticated in-app capture boundary.
     path('nfc/<str:token>/', nfc_landing, name='nfc-landing'),

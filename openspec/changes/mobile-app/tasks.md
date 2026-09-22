@@ -1,9 +1,9 @@
 ## 1. Backend: native origins, app links, FCM
 
-- [ ] 1.1 Add `django-cors-headers` to `requirements.txt`, `corsheaders` app + middleware, `CORS_ALLOWED_ORIGINS` = `https://localhost`, `capacitor://localhost`, `http://localhost` plus the `CORS_EXTRA_ORIGINS` env list; test that a preflight from `https://localhost` is allowed and an unknown origin is not.
-- [ ] 1.2 Add `MOBILE_APP_LINKS` setting (`android_package='ro.yetilabs.geogame'`, `android_sha256_fingerprints=[]`, `apple_app_id=''`, `paths=['/nfc/*','/join/*','/invite/*']`, env-overridable) and views for `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` (`application/json`, no auth); tests for shape and empty-fingerprint default.
-- [ ] 1.3 Add `firebase-admin` to `requirements.txt`; implement `FcmPushSender` (HTTP v1 message from the existing payload dict, `UnregisteredError`/`SenderIdMismatchError` → `SubscriptionGone`, else `PushSendError`), `DispatchingPushSender` by subscription kind, `get_sender()` composing WebPush/FCM/Logging from `WEBPUSH_*` and `FCM_CREDENTIALS_FILE`/`GOOGLE_APPLICATION_CREDENTIALS`; update `organize/push.py` docstring.
-- [ ] 1.4 Tests in `organize/tests.py`: FCM send maps title/body/data/url, unregistered token revokes the subscription, no credentials → logging for FCM while Web Push still sends; `ruff check .` clean and coverage ≥ 80%.
+- [x] 1.1 Add `django-cors-headers` to `requirements.txt`, `corsheaders` app + middleware, `CORS_ALLOWED_ORIGINS` = `https://localhost`, `capacitor://localhost`, `http://localhost` plus the `CORS_EXTRA_ORIGINS` env list; test that a preflight from `https://localhost` is allowed and an unknown origin is not.
+- [x] 1.2 Add `MOBILE_APP_LINKS` setting (`android_package='ro.yetilabs.geogame'`, `android_sha256_fingerprints=[]`, `apple_app_id=''`, `paths=['/nfc/*','/join/*','/invite/*']`, env-overridable) and views for `/.well-known/assetlinks.json` and `/.well-known/apple-app-site-association` (`application/json`, no auth); tests for shape and empty-fingerprint default.
+- [x] 1.3 Add `firebase-admin` to `requirements.txt`; implement `FcmPushSender` (HTTP v1 message from the existing payload dict, `UnregisteredError`/`SenderIdMismatchError` → `SubscriptionGone`, else `PushSendError`), `DispatchingPushSender` by subscription kind, `get_sender()` composing WebPush/FCM/Logging from `WEBPUSH_*` and `FCM_CREDENTIALS_FILE`/`GOOGLE_APPLICATION_CREDENTIALS`; update `organize/push.py` docstring.
+- [x] 1.4 Tests in `organize/tests.py`: FCM send maps title/body/data/url, unregistered token revokes the subscription, no credentials → logging for FCM while Web Push still sends; `ruff check .` clean and coverage ≥ 80%.
 
 ## 2. Shared platform layer and API origin
 

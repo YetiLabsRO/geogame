@@ -32,6 +32,8 @@ from organize.models import (
 )
 from organize.push import (
     BasePushSender,
+    DispatchingPushSender,
+    FcmPushSender,
     LoggingPushSender,
     PushSendError,
     SubscriptionGone,
@@ -2778,11 +2780,35 @@ class PushDeliveryTest(TestCase):
         self.assertTrue(self.subscription.is_active)
 
     def test_sender_selection_by_configuration(self):
-        self.assertIsInstance(get_sender(), LoggingPushSender)
+        # With nothing configured, get_sender() dispatches by kind but
+        # every kind falls back to the logging stub.
+        sender = get_sender()
+        self.assertIsInstance(sender, DispatchingPushSender)
+        self.assertIsInstance(
+            sender.senders[PushSubscription.KIND_WEBPUSH], LoggingPushSender,
+        )
+        self.assertIsInstance(
+            sender.senders[PushSubscription.KIND_FCM], LoggingPushSender,
+        )
         with override_settings(
             WEBPUSH_VAPID_PUBLIC_KEY='pub', WEBPUSH_VAPID_PRIVATE_KEY='priv',
         ):
-            self.assertIsInstance(get_sender(), WebPushSender)
+            sender = get_sender()
+            self.assertIsInstance(
+                sender.senders[PushSubscription.KIND_WEBPUSH], WebPushSender,
+            )
+            # FCM is unaffected by VAPID configuration.
+            self.assertIsInstance(
+                sender.senders[PushSubscription.KIND_FCM], LoggingPushSender,
+            )
+        with override_settings(FCM_CREDENTIALS_FILE='/tmp/fake-fcm-creds.json'):
+            sender = get_sender()
+            self.assertIsInstance(
+                sender.senders[PushSubscription.KIND_FCM], FcmPushSender,
+            )
+            self.assertIsInstance(
+                sender.senders[PushSubscription.KIND_WEBPUSH], LoggingPushSender,
+            )
 
     def test_logging_sender_delivers_nothing(self):
         # The stub must accept any subscription without side effects.
@@ -2844,10 +2870,162 @@ class WebPushSenderTest(TestCase):
             with self.assertRaises(PushSendError):
                 WebPushSender().send(self.subscription, {'event': 'bonus'})
 
-    def test_fcm_subscription_falls_back_to_logging_stub(self):
-        fcm = PushSubscription.objects.create(
-            user=self.user, kind=PushSubscription.KIND_FCM, fcm_token='tok',
+
+@override_settings(FCM_CREDENTIALS_FILE='/tmp/fake-fcm-creds.json')
+class FcmPushSenderTest(TestCase):
+    """mobile-app / D5: FCM delivery maps firebase-admin errors onto the interface."""
+
+    def setUp(self):
+        self.user = _make_user('fcm-sender')
+        self.subscription = PushSubscription.objects.create(
+            user=self.user, kind=PushSubscription.KIND_FCM,
+            fcm_token='device-token-1',
         )
-        with patch('pywebpush.webpush') as webpush:
-            WebPushSender().send(fcm, {'event': 'bonus'})
-        webpush.assert_not_called()
+
+    def test_success_maps_token_title_body_and_data_url(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with patch.object(firebase_admin, '_apps', {}), \
+                patch('firebase_admin.credentials.Certificate') as certificate, \
+                patch('firebase_admin.initialize_app') as initialize_app, \
+                patch.object(messaging, 'send') as send:
+            FcmPushSender().send(
+                self.subscription,
+                {
+                    'event': 'bonus', 'title': 'Bonus!',
+                    'body': 'A bonus is active — go grab it!', 'url': '/',
+                    'session': 7,
+                },
+            )
+        certificate.assert_called_once_with('/tmp/fake-fcm-creds.json')
+        initialize_app.assert_called_once_with(certificate.return_value)
+        send.assert_called_once()
+        message = send.call_args.args[0]
+        self.assertEqual(message.token, 'device-token-1')
+        self.assertEqual(message.notification.title, 'Bonus!')
+        self.assertEqual(
+            message.notification.body, 'A bonus is active — go grab it!',
+        )
+        self.assertEqual(message.data['url'], '/')
+        self.assertEqual(message.data['session'], '7')  # data values are strings
+        self.assertEqual(message.android.priority, 'high')
+        self.assertTrue(message.apns.payload.aps.content_available)
+
+    def test_already_initialised_app_is_not_reinitialised(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with patch.object(firebase_admin, '_apps', {'[DEFAULT]': object()}), \
+                patch('firebase_admin.initialize_app') as initialize_app, \
+                patch.object(messaging, 'send'):
+            FcmPushSender().send(self.subscription, {'event': 'bonus'})
+        initialize_app.assert_not_called()
+
+    def test_no_credentials_file_uses_application_default_credentials(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with override_settings(FCM_CREDENTIALS_FILE=''), \
+                patch.object(firebase_admin, '_apps', {}), \
+                patch('firebase_admin.initialize_app') as initialize_app, \
+                patch.object(messaging, 'send'):
+            FcmPushSender().send(self.subscription, {'event': 'bonus'})
+        initialize_app.assert_called_once_with()
+
+    def test_unregistered_token_maps_to_subscription_gone(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with patch.object(firebase_admin, '_apps', {'[DEFAULT]': object()}), \
+                patch.object(
+                    messaging, 'send',
+                    side_effect=messaging.UnregisteredError('gone'),
+                ):
+            with self.assertRaises(SubscriptionGone):
+                FcmPushSender().send(self.subscription, {'event': 'bonus'})
+
+    def test_sender_id_mismatch_maps_to_subscription_gone(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with patch.object(firebase_admin, '_apps', {'[DEFAULT]': object()}), \
+                patch.object(
+                    messaging, 'send',
+                    side_effect=messaging.SenderIdMismatchError('mismatch'),
+                ):
+            with self.assertRaises(SubscriptionGone):
+                FcmPushSender().send(self.subscription, {'event': 'bonus'})
+
+    def test_other_failure_maps_to_push_send_error(self):
+        import firebase_admin
+        from firebase_admin import messaging
+
+        with patch.object(firebase_admin, '_apps', {'[DEFAULT]': object()}), \
+                patch.object(
+                    messaging, 'send', side_effect=RuntimeError('boom'),
+                ):
+            with self.assertRaises(PushSendError):
+                FcmPushSender().send(self.subscription, {'event': 'bonus'})
+
+    def test_end_to_end_through_notify_session_event_prunes_on_unregistered(self):
+        """The pipeline's SubscriptionGone handling (pruning) covers FCM too."""
+        import firebase_admin
+        from firebase_admin import messaging
+
+        game = _make_game('FCM Game')
+        session = _default_session(game)
+        team = _make_team(game, name='FCM Pushers')
+        TeamMembership.objects.create(
+            team=team, user=self.user.profile, is_active=True,
+        )
+        Session.objects.filter(pk=session.pk).update(
+            push_notifications_enabled=True,
+        )
+        session.refresh_from_db()
+
+        with patch.object(firebase_admin, '_apps', {'[DEFAULT]': object()}), \
+                patch.object(
+                    messaging, 'send',
+                    side_effect=messaging.UnregisteredError('gone'),
+                ):
+            sent = notify_session_event(
+                session, 'bonus', payload={'name': 'x2'},
+            )
+        self.assertEqual(sent, 0)
+        self.subscription.refresh_from_db()
+        self.assertFalse(self.subscription.is_active)
+
+
+class DispatchingPushSenderTest(TestCase):
+    """mobile-app / D5: routes delivery by `PushSubscription.kind`."""
+
+    def setUp(self):
+        self.user = _make_user('dispatch-sender')
+
+    def test_routes_by_kind(self):
+        webpush_recorder = _RecorderSender()
+        fcm_recorder = _RecorderSender()
+        dispatcher = DispatchingPushSender({
+            PushSubscription.KIND_WEBPUSH: webpush_recorder,
+            PushSubscription.KIND_FCM: fcm_recorder,
+        })
+        webpush_sub = PushSubscription.objects.create(
+            user=self.user, kind=PushSubscription.KIND_WEBPUSH,
+            endpoint='https://push.example/dispatch', p256dh='p', auth='a',
+        )
+        fcm_sub = PushSubscription.objects.create(
+            user=self.user, kind=PushSubscription.KIND_FCM,
+            fcm_token='dispatch-token',
+        )
+        payload = {'event': 'bonus'}
+        dispatcher.send(webpush_sub, payload)
+        dispatcher.send(fcm_sub, payload)
+        self.assertEqual(webpush_recorder.sent, [(webpush_sub, payload)])
+        self.assertEqual(fcm_recorder.sent, [(fcm_sub, payload)])
+
+    def test_unknown_kind_falls_back_to_logging_sender(self):
+        dispatcher = DispatchingPushSender({})
+        unknown = SimpleNamespace(kind='BOGUS', pk=1, user_id=self.user.id)
+        # Must not raise — the logging stub accepts any subscription.
+        dispatcher.send(unknown, {'event': 'bonus'})

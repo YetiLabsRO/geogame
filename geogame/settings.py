@@ -40,6 +40,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'django.contrib.gis',
 
+    'corsheaders',
     'channels',
     'leaflet',
     'rest_framework',
@@ -56,6 +57,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
+    'corsheaders.middleware.CorsMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -124,6 +126,54 @@ WEBPUSH_VAPID_CLAIMS_EMAIL = os.environ.get(
     'WEBPUSH_VAPID_CLAIMS_EMAIL', 'noreply@cercetador.albascout.ro',
 )
 FCM_SERVER_KEY = os.environ.get('FCM_SERVER_KEY', '')
+# Path to a Firebase service-account JSON file (HTTP v1 credentials for
+# FcmPushSender, organize/push.py). Falls back to GOOGLE_APPLICATION_CREDENTIALS
+# (the firebase-admin SDK default) when unset.
+FCM_CREDENTIALS_FILE = os.environ.get('FCM_CREDENTIALS_FILE', '')
+
+# CORS (mobile-app): the Capacitor native shell serves the player app from
+# a fixed WebView origin per platform (Android: https://localhost, iOS:
+# capacitor://localhost) rather than the site's own origin, so those
+# origins need an explicit CORS allow-list. `http://localhost` covers the
+# `cap run` / live-reload dev loop. CORS_EXTRA_ORIGINS adds any further
+# origins (comma-separated) without touching this file. Auth is a header
+# token (not cookies), so credentialed CORS is unnecessary.
+CORS_EXTRA_ORIGINS = [
+    origin.strip()
+    for origin in os.environ.get('CORS_EXTRA_ORIGINS', '').split(',')
+    if origin.strip()
+]
+CORS_ALLOWED_ORIGINS = [
+    'https://localhost',
+    'capacitor://localhost',
+    'http://localhost',
+] + CORS_EXTRA_ORIGINS
+CORS_ALLOW_CREDENTIALS = False
+
+# Mobile app-link verification (mobile-app, deployment): backs the
+# /.well-known/assetlinks.json (Android App Links) and
+# /.well-known/apple-app-site-association (iOS Universal Links) documents
+# served by geogame/app_links.py. Safe defaults (empty fingerprints / app
+# id) let the endpoints exist before signing keys and an Apple Team ID are
+# available.
+MOBILE_ANDROID_PACKAGE = os.environ.get(
+    'MOBILE_ANDROID_PACKAGE', 'ro.yetilabs.geogame',
+)
+MOBILE_ANDROID_SHA256_FINGERPRINTS = [
+    fingerprint.strip()
+    for fingerprint in os.environ.get(
+        'MOBILE_ANDROID_SHA256_FINGERPRINTS', '',
+    ).split(',')
+    if fingerprint.strip()
+]
+# Format: '<Apple Team ID>.ro.yetilabs.geogame'.
+MOBILE_APPLE_APP_ID = os.environ.get('MOBILE_APPLE_APP_ID', '')
+MOBILE_APP_LINKS = {
+    'android_package': MOBILE_ANDROID_PACKAGE,
+    'android_sha256_fingerprints': MOBILE_ANDROID_SHA256_FINGERPRINTS,
+    'apple_app_id': MOBILE_APPLE_APP_ID,
+    'paths': ['/nfc/*', '/join/*', '/invite/*'],
+}
 
 
 # Database

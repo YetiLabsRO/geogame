@@ -1,4 +1,4 @@
-"""Opt-in push notification delivery (realtime-and-notifications).
+"""Opt-in push notification delivery (realtime-and-notifications, mobile-app).
 
 Push is advisory and best-effort: the in-app websocket / polling path
 stays authoritative, and nothing in gameplay depends on a notification
@@ -11,22 +11,29 @@ arriving. A notification goes out only when EVERY gate passes:
 3. the recipient's ``NotificationPreference`` master flag and the
    per-event toggle (steal / conquer / bonus) allow it.
 
-Senders sit behind a tiny interface so tests inject a stub and the app
-never hard-depends on delivery infrastructure:
+Delivery is dispatched by subscription kind (``get_sender()`` returns a
+``DispatchingPushSender``) so each kind uses the real transport when it is
+configured and a logging stub otherwise:
 
-- ``WebPushSender`` (pywebpush + VAPID) is used only when VAPID keys are
-  configured via settings/env;
+- ``WEBPUSH`` subscriptions go through ``WebPushSender`` (pywebpush +
+  VAPID) when ``WEBPUSH_VAPID_PUBLIC_KEY``/``WEBPUSH_VAPID_PRIVATE_KEY``
+  are set;
+- ``FCM`` subscriptions (native app installs) go through
+  ``FcmPushSender`` (firebase-admin, HTTP v1) when
+  ``FCM_CREDENTIALS_FILE`` or ``GOOGLE_APPLICATION_CREDENTIALS`` is set;
 - otherwise ``LoggingPushSender`` logs what WOULD be sent and delivers
-  nothing. FCM subscriptions are likewise logged-only until an FCM
-  sender is configured (``FCM_SERVER_KEY`` reserved for it).
+  nothing, per kind independently — e.g. Web Push can be live while FCM
+  is still unconfigured.
 
 A sender signals a dead endpoint by raising ``SubscriptionGone`` (push
-service answered 404/410); the subscription is then pruned (revoked) and
+service answered 404/410, or FCM reports the token unregistered / the
+sender id mismatched); the subscription is then pruned (revoked) and
 never sent to again.
 """
 
 import json
 import logging
+import os
 
 from django.conf import settings
 
@@ -67,15 +74,15 @@ class LoggingPushSender(BasePushSender):
 
 
 class WebPushSender(BasePushSender):
-    """Real Web Push delivery via pywebpush + VAPID keys from settings."""
+    """Real Web Push delivery via pywebpush + VAPID keys from settings.
+
+    Dedicated to ``WEBPUSH``-kind subscriptions; routing by kind is
+    ``DispatchingPushSender``'s job (see ``get_sender()`` below).
+    """
 
     def send(self, subscription, payload):
         from pywebpush import WebPushException, webpush
 
-        if subscription.kind != subscription.KIND_WEBPUSH:
-            # FCM delivery is not implemented yet; log-only.
-            LoggingPushSender().send(subscription, payload)
-            return
         try:
             webpush(
                 subscription_info={
@@ -98,15 +105,92 @@ class WebPushSender(BasePushSender):
             raise PushSendError(str(exc)) from exc
 
 
-def get_sender():
-    """The active sender: real Web Push when VAPID keys exist, else the stub.
+class FcmPushSender(BasePushSender):
+    """Real FCM delivery via firebase-admin (HTTP v1).
 
-    Resolved per call so tests can patch this function (or the settings)
-    without import-order concerns.
+    Dedicated to ``FCM``-kind subscriptions (the native app installs).
+    The Firebase Admin SDK is imported lazily (inside this method) so the
+    module — and the rest of the push pipeline — imports fine without the
+    SDK installed; credentials are initialised once per process.
     """
+
+    def send(self, subscription, payload):
+        import firebase_admin
+        from firebase_admin import credentials, messaging
+
+        if not firebase_admin._apps:
+            if settings.FCM_CREDENTIALS_FILE:
+                firebase_admin.initialize_app(
+                    credentials.Certificate(settings.FCM_CREDENTIALS_FILE),
+                )
+            else:
+                # Relies on GOOGLE_APPLICATION_CREDENTIALS (SDK default).
+                firebase_admin.initialize_app()
+
+        message = messaging.Message(
+            token=subscription.fcm_token,
+            notification=messaging.Notification(
+                title=payload.get('title', ''),
+                body=payload.get('body', ''),
+            ),
+            # Same keys the Web Push service worker reads (title/body/url/…).
+            data={key: str(value) for key, value in payload.items()},
+            android=messaging.AndroidConfig(priority='high'),
+            apns=messaging.APNSConfig(
+                payload=messaging.APNSPayload(
+                    aps=messaging.Aps(content_available=True),
+                ),
+            ),
+        )
+        try:
+            messaging.send(message)
+        except (messaging.UnregisteredError, messaging.SenderIdMismatchError) as exc:
+            raise SubscriptionGone(str(exc)) from exc
+        except Exception as exc:
+            raise PushSendError(str(exc)) from exc
+
+
+class DispatchingPushSender(BasePushSender):
+    """Routes delivery to a per-kind sender.
+
+    ``senders`` maps a ``PushSubscription.kind`` value to the
+    ``BasePushSender`` that handles it; a kind with no entry (there is
+    none today, but new kinds are inevitable) falls back to
+    ``LoggingPushSender`` rather than raising.
+    """
+
+    def __init__(self, senders):
+        self.senders = senders
+
+    def send(self, subscription, payload):
+        sender = self.senders.get(subscription.kind) or LoggingPushSender()
+        sender.send(subscription, payload)
+
+
+def get_sender():
+    """The active sender: composes a per-kind ``DispatchingPushSender``.
+
+    ``WEBPUSH`` uses real Web Push when VAPID keys exist, ``FCM`` uses
+    real FCM when credentials exist, and each kind independently falls
+    back to the logging stub otherwise. Resolved per call so tests can
+    patch this function (or the settings) without import-order concerns.
+    """
+    from organize.models import PushSubscription
+
     if settings.WEBPUSH_VAPID_PRIVATE_KEY and settings.WEBPUSH_VAPID_PUBLIC_KEY:
-        return WebPushSender()
-    return LoggingPushSender()
+        webpush_sender = WebPushSender()
+    else:
+        webpush_sender = LoggingPushSender()
+
+    if settings.FCM_CREDENTIALS_FILE or os.environ.get('GOOGLE_APPLICATION_CREDENTIALS'):
+        fcm_sender = FcmPushSender()
+    else:
+        fcm_sender = LoggingPushSender()
+
+    return DispatchingPushSender({
+        PushSubscription.KIND_WEBPUSH: webpush_sender,
+        PushSubscription.KIND_FCM: fcm_sender,
+    })
 
 
 def _recipient_user_ids(session):

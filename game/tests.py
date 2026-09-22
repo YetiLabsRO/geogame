@@ -2253,6 +2253,45 @@ class HealthTest(TestCase):
 
 
 # ---------------------------------------------------------------------------
+# mobile-app — CORS for the Capacitor native shell origins (task 1.1)
+# ---------------------------------------------------------------------------
+
+
+class CorsNativeOriginsTest(TestCase):
+    """The Capacitor WebView origins get CORS headers; unknown origins don't."""
+
+    def test_allowed_origin_gets_cors_header_on_get(self):
+        resp = self.client.get('/health/', HTTP_ORIGIN='https://localhost')
+        self.assertEqual(
+            resp['Access-Control-Allow-Origin'], 'https://localhost',
+        )
+
+    def test_allowed_origin_gets_cors_header_on_preflight(self):
+        resp = self.client.options(
+            '/health/',
+            HTTP_ORIGIN='https://localhost',
+            HTTP_ACCESS_CONTROL_REQUEST_METHOD='GET',
+        )
+        self.assertEqual(
+            resp['Access-Control-Allow-Origin'], 'https://localhost',
+        )
+
+    def test_ios_capacitor_origin_is_allowed(self):
+        resp = self.client.get('/health/', HTTP_ORIGIN='capacitor://localhost')
+        self.assertEqual(
+            resp['Access-Control-Allow-Origin'], 'capacitor://localhost',
+        )
+
+    def test_unknown_origin_gets_no_cors_header(self):
+        resp = self.client.get('/health/', HTTP_ORIGIN='https://evil.example')
+        self.assertNotIn('Access-Control-Allow-Origin', resp)
+
+    def test_credentials_are_not_allowed(self):
+        resp = self.client.get('/health/', HTTP_ORIGIN='https://localhost')
+        self.assertNotIn('Access-Control-Allow-Credentials', resp)
+
+
+# ---------------------------------------------------------------------------
 # Phase 10 — Day cut-off pausing (task 4.2)
 # ---------------------------------------------------------------------------
 
@@ -7127,6 +7166,74 @@ class NfcCaptureTest(TestCase):
         self.assertEqual(resp.status_code, 201, resp.content)
         ttc = TeamTowerChallenge.objects.get(tower=rfid_tower, team=self.team)
         self.assertEqual(ttc.outcome, TeamTowerChallenge.CONFIRMED)
+
+
+# ---------------------------------------------------------------------------
+# mobile-app — app-link verification documents (task 1.2, D7)
+# ---------------------------------------------------------------------------
+
+
+class AppLinkVerificationTest(TestCase):
+    """`/.well-known/assetlinks.json` + `/.well-known/apple-app-site-association`."""
+
+    def test_assetlinks_default_shape_and_empty_fingerprints(self):
+        resp = self.client.get('/.well-known/assetlinks.json')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp['Content-Type'], 'application/json')
+        body = resp.json()
+        self.assertEqual(len(body), 1)
+        entry = body[0]
+        self.assertEqual(
+            entry['relation'], ['delegate_permission/common.handle_all_urls'],
+        )
+        self.assertEqual(entry['target']['namespace'], 'android_app')
+        self.assertEqual(entry['target']['package_name'], 'ro.yetilabs.geogame')
+        self.assertEqual(entry['target']['sha256_cert_fingerprints'], [])
+
+    @override_settings(MOBILE_APP_LINKS={
+        'android_package': 'ro.yetilabs.geogame.debug',
+        'android_sha256_fingerprints': ['AA:BB:CC', 'DD:EE:FF'],
+        'apple_app_id': '',
+        'paths': ['/nfc/*', '/join/*', '/invite/*'],
+    })
+    def test_assetlinks_reflects_configured_package_and_fingerprints(self):
+        resp = self.client.get('/.well-known/assetlinks.json')
+        body = resp.json()
+        target = body[0]['target']
+        self.assertEqual(target['package_name'], 'ro.yetilabs.geogame.debug')
+        self.assertEqual(
+            target['sha256_cert_fingerprints'], ['AA:BB:CC', 'DD:EE:FF'],
+        )
+
+    def test_assetlinks_rejects_non_get(self):
+        resp = self.client.post('/.well-known/assetlinks.json')
+        self.assertEqual(resp.status_code, 405)
+
+    def test_aasa_default_shape_has_empty_details_when_no_apple_app_id(self):
+        resp = self.client.get('/.well-known/apple-app-site-association')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp['Content-Type'], 'application/json')
+        body = resp.json()
+        self.assertEqual(body['applinks'], {'apps': [], 'details': []})
+
+    @override_settings(MOBILE_APP_LINKS={
+        'android_package': 'ro.yetilabs.geogame',
+        'android_sha256_fingerprints': [],
+        'apple_app_id': 'ABCDE12345.ro.yetilabs.geogame',
+        'paths': ['/nfc/*', '/join/*', '/invite/*'],
+    })
+    def test_aasa_reflects_configured_apple_app_id_and_paths(self):
+        resp = self.client.get('/.well-known/apple-app-site-association')
+        body = resp.json()
+        self.assertEqual(body['applinks']['apps'], [])
+        self.assertEqual(len(body['applinks']['details']), 1)
+        detail = body['applinks']['details'][0]
+        self.assertEqual(detail['appID'], 'ABCDE12345.ro.yetilabs.geogame')
+        self.assertEqual(detail['paths'], ['/nfc/*', '/join/*', '/invite/*'])
+
+    def test_aasa_rejects_non_get(self):
+        resp = self.client.post('/.well-known/apple-app-site-association')
+        self.assertEqual(resp.status_code, 405)
 
 
 class NfcReplayHardeningTest(TestCase):
