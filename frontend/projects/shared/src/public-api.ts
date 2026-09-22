@@ -16,3 +16,5 @@ export * from './lib/team-formation.service';
 export * from './lib/realtime.service';
 export * from './lib/dementors.service';
 export * from './lib/badges.service';
+export * from './lib/platform';
+export * from './lib/ui';
