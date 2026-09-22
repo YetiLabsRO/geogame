@@ -109,14 +109,17 @@ export const routes: Routes = [
         (m) => m.DiscoveryMatrixComponent,
       ),
   },
+  // --- session-replay ---
   {
-    path: 'sessions/:id/locations',
+    path: 'sessions/:id/replay',
     canActivate: [staffGuard],
     loadComponent: () =>
-      import('./location/location-history.component').then(
-        (m) => m.LocationHistoryComponent,
-      ),
+      import('./replay/session-replay.component').then((m) => m.SessionReplayComponent),
   },
+  // The replay view replaced the table-only location-history page;
+  // keep old links working.
+  { path: 'sessions/:id/locations', redirectTo: 'sessions/:id/replay' },
+  // --- end session-replay ---
   {
     path: 'trails',
     canActivate: [staffGuard],

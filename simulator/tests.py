@@ -423,3 +423,134 @@ class SimulatorApiTest(SimulatorDriverTestCase):
     def test_anonymous_forbidden(self):
         resp = self.client.get('/api/staff/simulator/runs/')
         self.assertEqual(resp.status_code, 403)
+
+
+class SimulatedRunReplayTest(SimulatorDriverTestCase):
+    """session-replay — a stopped sim run replays through the staff bundle.
+
+    This is the seam the session-replay change exists to close: the
+    simulator drives real domain code, so the Session it leaves behind
+    must be replayable by exactly the same endpoint a real game uses,
+    and the two views of the run must agree about who owned what.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.staff = _staff_user('replay-staff')
+        self.client_api = APIClient()
+        self.client_api.force_authenticate(self.staff)
+
+    def _drive(self, ticks=6, **overrides):
+        run = self._run(**overrides)
+        run.created_by = self.staff
+        run.save(update_fields=['created_by'])
+        driver = SimulationDriver(run)
+        driver.setup()
+        for _ in range(ticks):
+            driver.step()
+        driver.stop()
+        run.refresh_from_db()
+        return run
+
+    def _replay(self, run, query=''):
+        response = self.client_api.get(
+            f'/api/staff/sessions/{run.session_id}/replay/{query}',
+        )
+        self.assertEqual(response.status_code, 200, response.data)
+        return response.data
+
+    def test_stopped_sim_run_replays_through_the_staff_bundle(self):
+        run = self._drive()
+        bundle = self._replay(run)
+
+        # The roster the sim built, keyed the way positions are keyed.
+        sim_user_ids = set(
+            SimulatedPlayer.objects
+            .filter(run=run)
+            .values_list('profile__user_id', flat=True),
+        )
+        self.assertEqual({p['user_id'] for p in bundle['players']}, sim_user_ids)
+        self.assertEqual(
+            {t['name'] for t in bundle['towers']}, {'Tower A', 'Tower B'},
+        )
+        self.assertEqual(len(bundle['teams']), 2)
+
+        # The sim moved everyone every tick, so every player is plotted
+        # and every position belongs to a sim player.
+        self.assertTrue(bundle['positions'])
+        self.assertEqual(
+            {p['user_id'] for p in bundle['positions']}, sim_user_ids,
+        )
+        for position in bundle['positions']:
+            self.assertLess(position['frame'], bundle['frame_count'])
+
+        # The sim grants consent to every fake player, so nothing is
+        # missing for a non-recording reason.
+        availability = bundle['availability']
+        self.assertTrue(availability['location_tracking_enabled'])
+        self.assertEqual(availability['consented_players'], len(sim_user_ids))
+        self.assertEqual(availability['roster_players'], len(sim_user_ids))
+        self.assertFalse(availability['history_truncated'])
+
+    def test_replay_ownership_agrees_with_the_simulation_tape(self):
+        """The two replay sources must not disagree about who holds what.
+
+        The sim tape's last CAPTURE per tower and the bundle's latest
+        ownership interval per tower are independent records of the same
+        fact — one an event log, one an interval table.
+
+        Note the intervals are *closed*, not open: finishing a Session
+        closes its ownership records, so a stopped run has no open
+        interval to compare against. The latest one is the live one.
+        """
+        run = self._drive(ticks=8)
+        bundle = self._replay(run)
+
+        last_capture = {}
+        for event in (
+            SimulationEvent.objects
+            .filter(run=run, action=SimulationEvent.CAPTURE)
+            .order_by('tick', 'id')
+        ):
+            tower_id = event.payload.get('tower_id')
+            if tower_id is not None:
+                last_capture[tower_id] = event.payload.get('team_id')
+        self.assertTrue(last_capture, 'expected the sim to capture at least one tower')
+
+        # `ownership` arrives ordered by timestamp_start, so the last
+        # row seen per tower is its most recent interval.
+        self.assertTrue(bundle['ownership'])
+        latest_owner = {}
+        for row in bundle['ownership']:
+            latest_owner[row['tower_id']] = row['team_id']
+        for tower_id, team_id in last_capture.items():
+            self.assertEqual(
+                latest_owner.get(tower_id), team_id,
+                f'tape and bundle disagree about tower {tower_id}',
+            )
+
+    def test_ownership_mid_run_is_resolvable_from_the_bundle(self):
+        """Closed intervals must still place ownership in time, or the
+        scrubber could only ever show an empty map."""
+        run = self._drive(ticks=8)
+        bundle = self._replay(run)
+        for row in bundle['ownership']:
+            self.assertIsNotNone(row['start'])
+            if row['end'] is not None:
+                self.assertGreaterEqual(row['end'], row['start'])
+
+    def test_replay_is_staff_only_for_a_sim_session(self):
+        run = self._drive(ticks=1)
+        anonymous = APIClient()
+        response = anonymous.get(f'/api/staff/sessions/{run.session_id}/replay/')
+        self.assertIn(response.status_code, (401, 403))
+
+    def test_replay_survives_teardown_of_nothing_but_the_run(self):
+        """A replay reflects the Session, so it must not depend on the
+        simulator's own bookkeeping rows still being queryable."""
+        run = self._drive(ticks=3)
+        session_id = run.session_id
+        SimulationEvent.objects.filter(run=run).delete()
+        response = self.client_api.get(f'/api/staff/sessions/{session_id}/replay/')
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.data['positions'])

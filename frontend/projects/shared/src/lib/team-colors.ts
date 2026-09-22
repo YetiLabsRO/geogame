@@ -1,14 +1,17 @@
 /**
- * Team color resolution for the simulator map (game-simulator-backend UI).
+ * Team color resolution for any map that plots several teams at once —
+ * the simulator and session replay both use it.
  *
- * The sim's `state()`/timeline payloads carry `team_id`/`team_name` but no
- * color — real team colors only surface opportunistically, via the
- * session's realtime `scoreboard.updated` (`SessionScoreboardEntry.team_color`)
- * and `tower.ownership_changed` (`team.team_color`) events. Until one of
- * those arrives for a given team, fall back to a small deterministic
- * qualitative palette so markers are still distinguishable from the first
- * render. `--team-color` (THEME.md) isn't usable here since several teams'
- * colors are needed on screen at once.
+ * Some payloads carry a team's real color and some don't: the simulator's
+ * `state()`/timeline carry `team_id`/`team_name` only, with real colors
+ * surfacing opportunistically via the session's realtime
+ * `scoreboard.updated` (`SessionScoreboardEntry.team_color`) and
+ * `tower.ownership_changed` (`team.team_color`) events, while a recorded
+ * Session's replay bundle carries `Team.color` up front. Feed whatever
+ * you know to `learn()`; until a team's real color is known, a small
+ * deterministic qualitative palette keeps markers distinguishable from
+ * the first render. `--team-color` (THEME.md) isn't usable here since
+ * several teams' colors are needed on screen at once.
  */
 
 // Kept as plain literals (not theme tokens) — an arbitrary, a priori

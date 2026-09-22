@@ -33,12 +33,12 @@ import {
   SimulationState,
   StaffApiService,
   StatTileComponent,
+  TeamColorResolver,
   TowerOwnershipChangedPayload,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
-import { ReplayFrame, buildReplayFrames } from './replay';
-import { TeamColorResolver } from './team-colors';
+import { ReplayDisplayFrame, buildReplayFrames } from './replay';
 
 // Cluj-Napoca — mirrors simulator/driver.py's DEFAULT_CENTER, used only
 // until a run's resolved config.center_lat/lng is known.
@@ -693,14 +693,14 @@ export class SimulatorComponent {
   // ---- replay -----------------------------------------------------------
   protected readonly timeline = signal<SimulationEvent[]>([]);
   protected readonly timelineLoading = signal(false);
-  protected readonly replayFrames = signal<ReplayFrame[]>([]);
+  protected readonly replayFrames = signal<ReplayDisplayFrame[]>([]);
   protected readonly replayTick = signal(0);
   protected readonly replayPlaying = signal(false);
   protected readonly replaySpeedMs = signal<number>(500);
   private replayHandle: ReturnType<typeof setInterval> | null = null;
 
   protected readonly replayMaxTick = computed(() => Math.max(0, this.replayFrames().length - 1));
-  protected readonly currentReplayFrame = computed<ReplayFrame | null>(() => {
+  protected readonly currentReplayFrame = computed<ReplayDisplayFrame | null>(() => {
     const frames = this.replayFrames();
     if (frames.length === 0) return null;
     return frames[Math.min(this.replayTick(), frames.length - 1)];

@@ -18,7 +18,7 @@ Guidance for Claude Code when working in this repository.
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8200
 
 # Tests + coverage (matches CI)
-/home/yeti/.virtualenvs/cercetador/bin/coverage run manage.py test game organize --noinput
+/home/yeti/.virtualenvs/cercetador/bin/coverage run manage.py test game organize simulator --noinput
 /home/yeti/.virtualenvs/cercetador/bin/coverage report --fail-under=80
 
 # Lint (matches CI)

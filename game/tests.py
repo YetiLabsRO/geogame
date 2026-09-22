@@ -25,6 +25,7 @@ import math
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from channels.db import database_sync_to_async
 from channels.testing import HttpCommunicator, WebsocketCommunicator
@@ -40,7 +41,10 @@ from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from game import events
+from game import (
+    events,
+    replay,  # session-replay
+)
 from game import trail as trail_engine  # mode-trail-discovery
 from game.admin import unassign_all
 from game.badges import (
@@ -11588,4 +11592,280 @@ class ZoneOverlapClippingTest(TestCase):
         self.assertAlmostEqual(self.existing.shape.area, 1.0, places=6)
         self.assertAlmostEqual(
             self.existing.shape.intersection(other.shape).area, 0.0, places=6,
+        )
+
+
+class SessionReplayBundleTest(TestCase):
+    """session-replay — the staff replay bundle for a recorded Session."""
+
+    def setUp(self):
+        self.game = _make_game(name='Replay game')
+        self.game.location_tracking_enabled = True
+        self.game.location_retention_days = 7
+        self.game.save()
+        self.session = _default_session(self.game)
+        # A fixed, generous window so `recorded_at` offsets below stay
+        # comfortably inside it.
+        self.start = timezone.now() - timedelta(hours=2)
+        self.session.start_time = self.start
+        self.session.end_time = self.start + timedelta(hours=2)
+        self.session.save()
+
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower_a = _make_tower(self.game, name='TA', zone=self.zone)
+        self.tower_b = _make_tower(self.game, name='TB', zone=self.zone, lng=23.6)
+        self.team_a = _make_team(self.game, self.group, name='alpha')
+        self.team_b = _make_team(self.game, self.group, name='bravo', color='#aa0000')
+        self.client_a, self.user_a = _authed_client(self.team_a, username='ra')
+        self.client_b, self.user_b = _authed_client(self.team_b, username='rb')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.url = reverse('api-staff-session-replay', args=[self.session.id])
+
+    def _ping(self, user, team, offset_seconds, lng=23.5, lat=46.5):
+        return LocationPing.objects.create(
+            user=user,
+            session=self.session,
+            team=team,
+            point=Point(lng, lat),
+            recorded_at=self.start + timedelta(seconds=offset_seconds),
+        )
+
+    def _own(self, tower, team, start_offset, end_offset=None):
+        """Create an ownership interval; `timestamp_start` is auto_now_add,
+        so it is rewritten with an explicit UPDATE afterwards."""
+        row = TeamTowerOwnership.objects.create(team=team, tower=tower)
+        TeamTowerOwnership.objects.filter(pk=row.pk).update(
+            timestamp_start=self.start + timedelta(seconds=start_offset),
+            timestamp_end=(
+                self.start + timedelta(seconds=end_offset)
+                if end_offset is not None else None
+            ),
+        )
+        return row
+
+    def _consent(self, user):
+        return LocationConsent.objects.create(
+            user=user, session=self.session, agreed_at=timezone.now(),
+        )
+
+    def _windowed(self, **offset):
+        """Replay URL with a `from` bound, percent-encoded.
+
+        Encoding matters: a raw `+00:00` offset arrives as a space and
+        the bound would be rejected.
+        """
+        query = urlencode({'from': (self.start + timedelta(**offset)).isoformat()})
+        return f'{self.url}?{query}'
+
+    # -- access ---------------------------------------------------------
+
+    def test_replay_is_staff_only(self):
+        self.assertEqual(self.client_a.get(self.url).status_code, 403)
+
+    def test_unknown_session_is_404(self):
+        url = reverse('api-staff-session-replay', args=[999999])
+        self.assertEqual(self.staff_client.get(url).status_code, 404)
+
+    # -- shape ----------------------------------------------------------
+
+    def test_bundle_carries_geometry_roster_and_teams(self):
+        response = self.staff_client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertEqual(data['session']['id'], self.session.id)
+        self.assertEqual({t['name'] for t in data['towers']}, {'TA', 'TB'})
+        self.assertEqual({t['name'] for t in data['teams']}, {'alpha', 'bravo'})
+        self.assertEqual({p['username'] for p in data['players']}, {'ra', 'rb'})
+        self.assertEqual(len(data['zones']), 1)
+        self.assertIsNotNone(data['zones'][0]['shape'])
+        tower = next(t for t in data['towers'] if t['name'] == 'TA')
+        self.assertAlmostEqual(tower['lat'], 46.5)
+        self.assertAlmostEqual(tower['lng'], 23.5)
+
+    # -- downsampling ---------------------------------------------------
+
+    def test_downsamples_to_one_position_per_player_per_frame(self):
+        # Five pings inside one 60s frame; the newest must win.
+        for offset in (0, 10, 20, 30, 59):
+            self._ping(self.user_a, self.team_a, offset, lat=46.0 + offset / 1000)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frame_zero = [
+            p for p in response.data['positions']
+            if p['frame'] == 0 and p['user_id'] == self.user_a.id
+        ]
+        self.assertEqual(len(frame_zero), 1)
+        self.assertAlmostEqual(frame_zero[0]['lat'], 46.059)
+        # The raw feed still exposes every sample.
+        history = self.staff_client.get(
+            reverse('api-staff-location-history', args=[self.session.id]),
+        )
+        self.assertEqual(len(history.data['pings']), 5)
+
+    def test_separate_frames_keep_separate_positions(self):
+        self._ping(self.user_a, self.team_a, 0, lat=46.0)
+        self._ping(self.user_a, self.team_a, 120, lat=46.2)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frames = {
+            p['frame']: p['lat'] for p in response.data['positions']
+            if p['user_id'] == self.user_a.id
+        }
+        self.assertEqual(sorted(frames), [0, 2])
+        self.assertAlmostEqual(frames[0], 46.0)
+        self.assertAlmostEqual(frames[2], 46.2)
+
+    def test_frame_assignment_ignores_sub_second_window_skew(self):
+        # Regression: casting the epoch to an integer rounds in Postgres,
+        # so a window start with >0.5s of microseconds used to push every
+        # ping one frame late — intermittently, depending on the clock.
+        self.session.start_time = self.start.replace(microsecond=900000)
+        self.session.save()
+        self.start = self.session.start_time
+        self._ping(self.user_a, self.team_a, 0, lat=46.0)
+        self._ping(self.user_a, self.team_a, 59, lat=46.059)
+        self._ping(self.user_a, self.team_a, 60, lat=46.060)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frames = {
+            p['frame']: p['lat'] for p in response.data['positions']
+            if p['user_id'] == self.user_a.id
+        }
+        # 0s and 59s share frame 0 (newest wins); 60s opens frame 1.
+        self.assertEqual(sorted(frames), [0, 1])
+        self.assertAlmostEqual(frames[0], 46.059)
+        self.assertAlmostEqual(frames[1], 46.060)
+
+    # -- interval -------------------------------------------------------
+
+    def test_interval_floor_is_enforced(self):
+        response = self.staff_client.get(f'{self.url}?interval_seconds=1')
+        self.assertEqual(response.data['interval_seconds'], replay.MIN_INTERVAL_SECONDS)
+
+    def test_interval_coarsens_rather_than_truncating(self):
+        # 2h at 5s would be 1440 frames — under the cap. Shrink the cap
+        # so the coarsening path is exercised deterministically.
+        with patch.object(replay, 'MAX_FRAMES', 10):
+            response = self.staff_client.get(f'{self.url}?interval_seconds=5')
+        data = response.data
+        self.assertTrue(data['interval_coarsened'])
+        self.assertLessEqual(data['frame_count'], 11)
+        # The whole session is still covered end to end.
+        self.assertEqual(data['window']['to'], self.session.end_time)
+        span = (data['window']['to'] - data['window']['from']).total_seconds()
+        self.assertGreaterEqual(
+            data['interval_seconds'] * (data['frame_count'] - 1), span,
+        )
+
+    def test_bad_interval_falls_back_to_default(self):
+        response = self.staff_client.get(f'{self.url}?interval_seconds=abc')
+        self.assertEqual(
+            response.data['interval_seconds'], replay.DEFAULT_INTERVAL_SECONDS,
+        )
+
+    # -- ownership ------------------------------------------------------
+
+    def test_ownership_open_before_window_is_included(self):
+        # Held from before `from` and never released: frame 0 must know.
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        owned = response.data['ownership']
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(owned[0]['tower_id'], self.tower_a.id)
+        self.assertEqual(owned[0]['team_id'], self.team_a.id)
+
+    def test_ownership_closed_before_window_is_excluded(self):
+        self._own(self.tower_a, self.team_a, start_offset=0, end_offset=60)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        self.assertEqual(response.data['ownership'], [])
+
+    def test_ownership_handover_yields_both_intervals(self):
+        self._own(self.tower_a, self.team_a, start_offset=0, end_offset=600)
+        self._own(self.tower_a, self.team_b, start_offset=600)
+        response = self.staff_client.get(self.url)
+        rows = [r for r in response.data['ownership'] if r['tower_id'] == self.tower_a.id]
+        self.assertEqual([r['team_id'] for r in rows], [self.team_a.id, self.team_b.id])
+        self.assertIsNotNone(rows[0]['end'])
+        self.assertIsNone(rows[1]['end'])
+
+    # -- implausible samples --------------------------------------------
+
+    def test_samples_far_outside_the_session_window_are_excluded(self):
+        self._ping(self.user_a, self.team_a, 60)
+        # A skewed client clock, a day before the session started.
+        LocationPing.objects.create(
+            user=self.user_a,
+            session=self.session,
+            team=self.team_a,
+            point=Point(23.5, 46.5),
+            recorded_at=self.session.start_time - timedelta(days=1),
+        )
+        response = self.staff_client.get(self.url)
+        self.assertEqual(len(response.data['positions']), 1)
+        self.assertIn('received_at', response.data['positions'][0])
+
+    # -- availability ---------------------------------------------------
+
+    def test_tracking_disabled_still_replays_ownership(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        self.session.location_tracking_enabled = None
+        self.session.save()
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self.url)
+        data = response.data
+        self.assertFalse(data['availability']['location_tracking_enabled'])
+        self.assertEqual(data['positions'], [])
+        self.assertEqual(len(data['ownership']), 1)
+        self.assertEqual(len(data['teams']), 2)
+
+    def test_availability_reports_consent_coverage(self):
+        self._consent(self.user_a)
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertEqual(availability['consented_players'], 1)
+        self.assertEqual(availability['roster_players'], 2)
+
+    def test_window_reaching_past_retention_is_reported_as_truncated(self):
+        # A session older than the 7-day retention window: part of its
+        # history has been (or is about to be) purged.
+        self.session.start_time = timezone.now() - timedelta(days=10)
+        self.session.end_time = timezone.now() - timedelta(days=8)
+        self.session.save()
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertTrue(availability['history_truncated'])
+        self.assertEqual(availability['retention_days'], 7)
+        self.assertIsNotNone(availability['retention_cutoff'])
+
+    def test_a_late_first_ping_is_not_mistaken_for_purging(self):
+        # Nobody pings at the instant a session opens; that is not a
+        # purge and must not be reported as one.
+        self._ping(self.user_a, self.team_a, 3600)
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertFalse(availability['history_truncated'])
+        self.assertGreater(availability['earliest_ping_at'], self.session.start_time)
+
+    def test_untruncated_history_is_not_flagged(self):
+        self._ping(self.user_a, self.team_a, 0)
+        response = self.staff_client.get(self.url)
+        self.assertFalse(response.data['availability']['history_truncated'])
+
+    # -- window parsing -------------------------------------------------
+
+    def test_unparseable_window_bound_is_rejected(self):
+        # An unencoded '+00:00' offset arrives as a space; silently
+        # replaying the whole session would hide that from the caller.
+        raw = (self.start + timedelta(minutes=30)).isoformat()
+        response = self.staff_client.get(f'{self.url}?from={raw}')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('from', response.data['detail'])
+
+    def test_encoded_window_bound_is_honoured(self):
+        self._ping(self.user_a, self.team_a, 0)
+        self._ping(self.user_a, self.team_a, 3600)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['positions']), 1)
+        self.assertEqual(
+            response.data['window']['from'], self.start + timedelta(minutes=30),
         )

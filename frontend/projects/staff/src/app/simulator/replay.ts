@@ -1,19 +1,28 @@
-import { SimPlayer, SimTowerState, SimulationEvent } from 'shared';
+import {
+  ReplayFrame,
+  ReplayInput,
+  ReplayOwnershipSpan,
+  SimPlayer,
+  SimTowerState,
+  SimulationEvent,
+  buildReplayFrames as buildFrames,
+} from 'shared';
 
 /**
- * Client-side replay reconstruction (game-simulator-backend UI).
+ * Simulator adapter onto the shared replay projection (session-replay).
  *
- * The timeline (`SimulationEvent[]`) is the only source of truth for
- * scrubbing — no backend calls happen while dragging the slider. Events
- * don't carry a player's spawn position (SPAWN payload is just
- * `{profile_id, team_id}`), so a player's position for tick 0 is taken
- * from the `from` side of their *first* MOVE event; a player who never
- * moved (0 ticks stepped yet) has no reconstructable position and is
- * simply omitted from early frames.
+ * The tape (`SimulationEvent[]`) remains the only source of truth for
+ * scrubbing — no backend calls happen while dragging the slider. What
+ * changed is that the *semantics* of a frame (carry-forward, ownership
+ * resolution, standings) now live in `shared/replay` and are shared with
+ * recorded-Session replay, so a fix to one fixes both. This file does
+ * two jobs and nothing else: map a tick tape onto `ReplayInput`, and map
+ * the projection's output back to the snake_case shape this page's map
+ * and tables already render.
  *
- * `actor_username` is the join key from an event back to a player — it's
- * unique per sim run and present on both `SimulationEvent` and the
- * baseline `SimPlayer` snapshot fetched once when a run is opened.
+ * `actor_username` is the join key from an event back to a player — it
+ * is unique per sim run and present on both `SimulationEvent` and the
+ * baseline `SimPlayer` snapshot fetched when a run is opened.
  */
 
 export interface ReplayDisplayPlayer {
@@ -35,17 +44,10 @@ export interface ReplayDisplayTower {
   owner_team_name: string | null;
 }
 
-export interface ReplayFrame {
+export interface ReplayDisplayFrame {
   tick: number;
   players: ReplayDisplayPlayer[];
   towers: ReplayDisplayTower[];
-}
-
-interface PlayerMeta {
-  profile_id: number;
-  username: string;
-  team_id: number | null;
-  team_name: string | null;
 }
 
 /** Build one frame per tick (0..max), each a full reconstructed snapshot. */
@@ -53,125 +55,120 @@ export function buildReplayFrames(
   events: SimulationEvent[],
   baselinePlayers: SimPlayer[],
   baselineTowers: SimTowerState[],
-): ReplayFrame[] {
-  const byUsername = new Map<string, PlayerMeta>();
-  for (const p of baselinePlayers) {
-    byUsername.set(p.username, {
-      profile_id: p.profile_id,
-      username: p.username,
-      team_id: p.team_id,
-      team_name: p.team_name,
-    });
-  }
-  const teamNames = new Map<number, string>();
-  for (const p of baselinePlayers) {
-    if (p.team_id !== null && p.team_name !== null) teamNames.set(p.team_id, p.team_name);
-  }
-  const towerNames = new Map<number, string>();
-  for (const t of baselineTowers) towerNames.set(t.id, t.name);
+): ReplayDisplayFrame[] {
+  return buildFrames(toReplayInput(events, baselinePlayers, baselineTowers)).map(toDisplay);
+}
 
+function toReplayInput(
+  events: SimulationEvent[],
+  baselinePlayers: SimPlayer[],
+  baselineTowers: SimTowerState[],
+): ReplayInput {
+  const byUsername = new Map(baselinePlayers.map((p) => [p.username, p]));
   const sorted = [...events].sort((a, b) => a.tick - b.tick || a.id - b.id);
   const maxTick = sorted.reduce((max, e) => Math.max(max, e.tick), 0);
 
-  const positions = new Map<number, [number, number]>();
-  const ownership = new Map<number, number | null>();
-  const roles = new Map<number, string>();
-  const energy = new Map<number, number | null>();
+  const samples: ReplayInput['samples'] = [];
+  const attributes: ReplayInput['attributes'] = [];
+  // A capture closes the tower's previous span and opens a new one, which
+  // reproduces the tape's "latest capture wins" semantics as spans.
+  const ownership: ReplayOwnershipSpan[] = [];
+  const openSpan = new Map<number, ReplayOwnershipSpan>();
 
-  const frames: ReplayFrame[] = [];
-  let cursor = 0;
-  for (let tick = 0; tick <= maxTick; tick++) {
-    while (cursor < sorted.length && sorted[cursor].tick === tick) {
-      applyEvent(sorted[cursor], byUsername, positions, ownership, roles, energy);
-      cursor++;
+  for (const event of sorted) {
+    switch (event.action) {
+      case 'MOVE': {
+        const player = event.actor_username ? byUsername.get(event.actor_username) : undefined;
+        if (!player) break;
+        const to = event.payload['to'] as [number, number] | undefined;
+        const from = event.payload['from'] as [number, number] | undefined;
+        const at = to ?? from;
+        if (at) {
+          samples.push({ frame: event.tick, key: player.profile_id, lat: at[0], lng: at[1] });
+        }
+        break;
+      }
+      case 'CAPTURE': {
+        const towerId = event.payload['tower_id'] as number | undefined;
+        if (towerId === undefined) break;
+        const teamId = (event.payload['team_id'] as number | undefined) ?? null;
+        const previous = openSpan.get(towerId);
+        if (previous) previous.toFrame = event.tick;
+        const span: ReplayOwnershipSpan = {
+          towerId,
+          teamId,
+          fromFrame: event.tick,
+          toFrame: null,
+        };
+        ownership.push(span);
+        openSpan.set(towerId, span);
+        break;
+      }
+      case 'PROXIMITY': {
+        const roles = (event.outcome['roles'] as Record<string, string> | undefined) ?? {};
+        const energy = (event.outcome['energy'] as Record<string, number> | undefined) ?? {};
+        for (const [pid, role] of Object.entries(roles)) {
+          attributes.push({ frame: event.tick, key: Number(pid), role });
+        }
+        for (const [pid, value] of Object.entries(energy)) {
+          attributes.push({ frame: event.tick, key: Number(pid), energy: value });
+        }
+        break;
+      }
+      default:
+        break; // SPAWN / TRANSITION / TICK carry no positional data
     }
-    frames.push(
-      snapshot(tick, byUsername, teamNames, towerNames, positions, ownership, roles, energy),
-    );
   }
-  // Always return at least the empty tick-0 frame, even with zero events
-  // (a freshly-set-up run that has never been stepped).
-  if (frames.length === 0) {
-    frames.push(snapshot(0, byUsername, teamNames, towerNames, positions, ownership, roles, energy));
-  }
-  return frames;
+
+  return {
+    frameCount: maxTick + 1,
+    players: baselinePlayers.map((p) => ({
+      key: p.profile_id,
+      username: p.username,
+      teamId: p.team_id,
+      teamName: p.team_name,
+    })),
+    teams: teamsFrom(baselinePlayers),
+    // A sim tape carries no tower geometry; the page looks coordinates
+    // up separately from the run's tower list.
+    towers: baselineTowers.map((t) => ({ id: t.id, name: t.name, lat: null, lng: null })),
+    samples,
+    ownership,
+    attributes,
+    // Every simulated player moves every tick, so a carried-forward
+    // position is never stale.
+    stalenessFrames: null,
+  };
 }
 
-function applyEvent(
-  event: SimulationEvent,
-  byUsername: Map<string, PlayerMeta>,
-  positions: Map<number, [number, number]>,
-  ownership: Map<number, number | null>,
-  roles: Map<number, string>,
-  energy: Map<number, number | null>,
-): void {
-  switch (event.action) {
-    case 'MOVE': {
-      const meta = event.actor_username ? byUsername.get(event.actor_username) : undefined;
-      if (!meta) return;
-      const from = event.payload['from'] as [number, number] | undefined;
-      const to = event.payload['to'] as [number, number] | undefined;
-      if (!positions.has(meta.profile_id) && from) positions.set(meta.profile_id, from);
-      if (to) positions.set(meta.profile_id, to);
-      return;
+function teamsFrom(players: SimPlayer[]): ReplayInput['teams'] {
+  const teams = new Map<number, string>();
+  for (const player of players) {
+    if (player.team_id !== null && player.team_name !== null) {
+      teams.set(player.team_id, player.team_name);
     }
-    case 'CAPTURE': {
-      const towerId = event.payload['tower_id'] as number | undefined;
-      const teamId = event.payload['team_id'] as number | undefined;
-      if (towerId === undefined) return;
-      ownership.set(towerId, teamId ?? null);
-      return;
-    }
-    case 'PROXIMITY': {
-      const roleMap = (event.outcome['roles'] as Record<string, string> | undefined) ?? {};
-      const energyMap = (event.outcome['energy'] as Record<string, number> | undefined) ?? {};
-      for (const [pid, role] of Object.entries(roleMap)) {
-        roles.set(Number(pid), role);
-      }
-      for (const [pid, value] of Object.entries(energyMap)) {
-        energy.set(Number(pid), value);
-      }
-      return;
-    }
-    default:
-      return; // SPAWN / TRANSITION / TICK carry no positional data
   }
+  return Array.from(teams.entries()).map(([id, name]) => ({ id, name, color: null }));
 }
 
-function snapshot(
-  tick: number,
-  byUsername: Map<string, PlayerMeta>,
-  teamNames: Map<number, string>,
-  towerNames: Map<number, string>,
-  positions: Map<number, [number, number]>,
-  ownership: Map<number, number | null>,
-  roles: Map<number, string>,
-  energy: Map<number, number | null>,
-): ReplayFrame {
-  const players: ReplayDisplayPlayer[] = [];
-  for (const meta of byUsername.values()) {
-    const pos = positions.get(meta.profile_id);
-    if (!pos) continue; // no move recorded yet for this player at this tick
-    players.push({
-      profile_id: meta.profile_id,
-      username: meta.username,
-      team_id: meta.team_id,
-      team_name: meta.team_name,
-      lat: pos[0],
-      lng: pos[1],
-      role: roles.get(meta.profile_id) ?? '',
-      energy: energy.get(meta.profile_id) ?? null,
-    });
-  }
-  const towers: ReplayDisplayTower[] = [];
-  for (const [id, name] of towerNames.entries()) {
-    const ownerTeamId = ownership.get(id) ?? null;
-    towers.push({
-      id,
-      name,
-      owner_team_id: ownerTeamId,
-      owner_team_name: ownerTeamId !== null ? (teamNames.get(ownerTeamId) ?? null) : null,
-    });
-  }
-  return { tick, players, towers };
+function toDisplay(frame: ReplayFrame): ReplayDisplayFrame {
+  return {
+    tick: frame.index,
+    players: frame.players.map((p) => ({
+      profile_id: p.key,
+      username: p.username,
+      team_id: p.teamId,
+      team_name: p.teamName,
+      lat: p.lat,
+      lng: p.lng,
+      role: p.role,
+      energy: p.energy,
+    })),
+    towers: frame.towers.map((t) => ({
+      id: t.id,
+      name: t.name,
+      owner_team_id: t.ownerTeamId,
+      owner_team_name: t.ownerTeamName,
+    })),
+  };
 }

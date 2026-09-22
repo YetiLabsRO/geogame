@@ -24,3 +24,5 @@ export * from './lib/ui/confirm-dialog.component';
 export * from './lib/ui/confirm.service';
 export * from './lib/ui/page-header.component';
 export * from './lib/ui/stat-tile.component';
+export * from './lib/team-colors';
+export * from './lib/replay';

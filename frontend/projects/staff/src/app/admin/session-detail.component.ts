@@ -228,8 +228,8 @@ const TABS: TabDef[] = [
             <span actions class="badge" [class]="stateBadgeClass(s.state)">
               {{ stateLabel(s.state) }}
             </span>
-            <a actions [routerLink]="['/sessions', sessionId, 'locations']" class="btn btn-sm btn-outline-secondary">
-              <i class="bi bi-geo-alt"></i> Location history
+            <a actions [routerLink]="['/sessions', sessionId, 'replay']" class="btn btn-sm btn-outline-secondary">
+              <i class="bi bi-play-btn"></i> Replay
             </a>
             <a actions [routerLink]="['/sessions', s.id, 'discovery']" class="btn btn-sm btn-outline-secondary">
               <i class="bi bi-binoculars"></i> Discovery matrix

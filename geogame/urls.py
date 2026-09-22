@@ -75,6 +75,7 @@ from game.proximity_api import (
     ProximityReportView,
     StaffDementorTotalsView,
 )
+from game.replay_api import StaffSessionReplayView
 from game.trail_api import (
     AdminTrailEdgeViewSet,
     AdminTrailStepViewSet,
@@ -184,6 +185,12 @@ urlpatterns = [
         'api/staff/sessions/<int:pk>/location-history/',
         StaffLocationHistoryView.as_view(),
         name='api-staff-location-history',
+    ),
+    # session-replay: one bundle per Session, scrubbed client-side.
+    path(
+        'api/staff/sessions/<int:pk>/replay/',
+        StaffSessionReplayView.as_view(),
+        name='api-staff-session-replay',
     ),
     path(
         'api/towers/<int:pk>/identify/',

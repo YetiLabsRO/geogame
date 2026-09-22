@@ -1031,6 +1031,30 @@ export class StaffApiService {
   }
 
 
+  // ---- session-replay: one bundle per Session, scrubbed client-side ---------
+
+  /**
+   * Everything needed to replay a recorded Session in one request.
+   *
+   * Positions arrive already downsampled to one per player per frame, so
+   * the payload scales with roster x frames rather than with ping volume,
+   * and scrubbing never has to come back here.
+   */
+  sessionReplay(
+    id: number,
+    params: { interval_seconds?: number; from?: string; to?: string } = {},
+  ): Observable<SessionReplayBundle> {
+    const parts: string[] = [];
+    if (params.interval_seconds) parts.push(`interval_seconds=${params.interval_seconds}`);
+    // Encoding matters: an unencoded '+00:00' offset arrives as a space
+    // and the backend rejects the bound.
+    if (params.from) parts.push(`from=${encodeURIComponent(params.from)}`);
+    if (params.to) parts.push(`to=${encodeURIComponent(params.to)}`);
+    const query = parts.length ? `?${parts.join('&')}` : '';
+    return this.http.get<SessionReplayBundle>(`/api/staff/sessions/${id}/replay/${query}`);
+  }
+
+
   // ---- nfc-native-and-secure-links: tag provisioning + scan audit ----------
 
   nfcTags(params?: { tower?: number; mode?: string }): Observable<NfcTagInfo[]> {
@@ -1523,4 +1547,92 @@ export interface SimulationEvent {
   action: SimulationEventAction;
   payload: Record<string, unknown>;
   outcome: Record<string, unknown>;
+}
+
+
+// session-replay: the staff replay bundle for a recorded Session. Frame
+// indices are time buckets `interval_seconds` wide, counted from
+// `window.from`; `positions` are already one-per-player-per-frame.
+
+export interface SessionReplaySessionInfo {
+  id: number;
+  name: string;
+  state: string;
+  start_time: string;
+  end_time: string;
+}
+
+export interface SessionReplayTeam {
+  id: number;
+  name: string;
+  color: string | null;
+  group_id: number | null;
+}
+
+export interface SessionReplayPlayer {
+  /** The auth user id — the join key `positions` use. */
+  user_id: number;
+  username: string;
+  team_id: number | null;
+  team_name: string | null;
+}
+
+export interface SessionReplayTower {
+  id: number;
+  name: string;
+  lat: number;
+  lng: number;
+}
+
+export interface SessionReplayZone {
+  id: number;
+  name: string;
+  /** GeoJSON geometry as a string, or null for a zone with no shape. */
+  shape: string | null;
+}
+
+/** Tower ownership as a wall-clock interval; `end` null means still held. */
+export interface SessionReplayOwnership {
+  tower_id: number;
+  team_id: number | null;
+  start: string;
+  end: string | null;
+}
+
+export interface SessionReplayPosition {
+  user_id: number;
+  frame: number;
+  lat: number;
+  lng: number;
+  accuracy: number | null;
+  recorded_at: string;
+  received_at: string;
+}
+
+/** Why a replay may be thinner than the roster suggests. */
+export interface SessionReplayAvailability {
+  location_tracking_enabled: boolean;
+  consented_players: number;
+  roster_players: number;
+  retention_days: number | null;
+  retention_cutoff: string | null;
+  earliest_ping_at: string | null;
+  /** True when retention has purged the front of the window. */
+  history_truncated: boolean;
+}
+
+export interface SessionReplayBundle {
+  session: SessionReplaySessionInfo;
+  window: { from: string; to: string };
+  interval_seconds: number;
+  /** True when the frame cap forced a wider interval than requested. */
+  interval_coarsened: boolean;
+  frame_count: number;
+  teams: SessionReplayTeam[];
+  players: SessionReplayPlayer[];
+  towers: SessionReplayTower[];
+  zones: SessionReplayZone[];
+  ownership: SessionReplayOwnership[];
+  positions: SessionReplayPosition[];
+  availability: SessionReplayAvailability;
 }
