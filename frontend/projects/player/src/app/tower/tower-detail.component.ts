@@ -96,7 +96,11 @@ interface Position {
           }
         </ui-stat-tile>
         @if (cooloffRemaining() > 0) {
-          <ui-stat-tile icon="clock" label="Cooldown" [value]="formatCountdown(cooloffRemaining())" />
+          <ui-stat-tile
+            icon="clock"
+            label="Cooldown"
+            [value]="formatCountdown(cooloffRemaining())"
+          />
         } @else if (s.next_challenge; as statsChallenge) {
           <ui-stat-tile icon="star" label="Difficulty" [value]="statsChallenge.difficulty" />
         } @else {
@@ -131,8 +135,8 @@ interface Position {
             </ui-button>
           } @else {
             <ui-alert tone="warning" [withIcon]="true">
-              Locked by <strong>{{ lock.team_name }}</strong>. Free again in
-              {{ formatCountdown(lockRemaining()) }} unless they finish first.
+              Locked by <strong>{{ lock.team_name }}</strong
+              >. Free again in {{ formatCountdown(lockRemaining()) }} unless they finish first.
             </ui-alert>
           }
         }
@@ -374,7 +378,10 @@ interface Position {
       z-index: 1;
       align-self: flex-end;
       margin-left: auto;
-      color: var(--color-brand-deep);
+      max-width: 60%;
+      text-align: right;
+      overflow-wrap: anywhere;
+      color: var(--color-text-primary);
     }
     .tower-title {
       display: flex;

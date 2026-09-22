@@ -40,3 +40,9 @@ h6 {
 .tr-team {
   color: var(--team-color);
 }
+
+/* Bootstrap's `.text-muted` (still emitted by the utilities API) mapped onto the
+   token so the player screens never fall back to Bootstrap's gray. */
+.text-muted {
+  color: var(--color-text-muted) !important;
+}

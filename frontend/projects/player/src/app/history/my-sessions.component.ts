@@ -58,10 +58,14 @@ import { extractErrorMessage } from '../auth/form-error';
                     <span class="tr-h3 chronicle-page__name">{{ s.name }}</span>
                     <span class="tr-eyebrow chronicle-page__game">{{ s.game.name }}</span>
                     <span class="tr-meta-tiny chronicle-page__dates">
-                      {{ s.start_time | date: 'mediumDate' }} – {{ s.end_time | date: 'mediumDate' }}
+                      {{ s.start_time | date: 'mediumDate' }} –
+                      {{ s.end_time | date: 'mediumDate' }}
                     </span>
                   </div>
-                  <ui-chip class="chronicle-page__status" [tone]="s.is_active ? 'brand' : 'neutral'">
+                  <ui-chip
+                    class="chronicle-page__status"
+                    [tone]="s.is_active ? 'brand' : 'neutral'"
+                  >
                     {{ s.is_active ? 'Active' : 'Past' }}
                   </ui-chip>
                 </div>
@@ -137,10 +141,8 @@ import { extractErrorMessage } from '../auth/form-error';
       gap: 2px;
     }
     .chronicle-page__name {
-      overflow: hidden;
-      color: var(--color-text-primary);
-      text-overflow: ellipsis;
-      white-space: nowrap;
+      display: block;
+      overflow-wrap: anywhere;
     }
     .chronicle-page__game {
       color: var(--color-brand-onSurface);

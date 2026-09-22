@@ -52,10 +52,9 @@ let nextMessageId = 0;
   `,
   styles: `
     :host {
-      display: block;
-    }
-    .ui-field {
+      /* The floating label is positioned against the host, not the page. */
       position: relative;
+      display: block;
     }
     .ui-field__control {
       box-sizing: border-box;

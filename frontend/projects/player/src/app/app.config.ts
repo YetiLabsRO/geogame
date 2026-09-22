@@ -32,9 +32,15 @@ export const appConfig: ApplicationConfig = {
     // mobile-app 2.8/2.9: native only — restore a Preferences-mirrored
     // token before the router's initial navigation, then start the
     // deep-link / back-button listeners.
-    provideAppInitializer(async () => {
-      await inject(AuthService).restoreToken();
-      await inject(DeepLinkService).init();
+    provideAppInitializer(() => {
+      // Resolve both services synchronously: inject() is only valid before
+      // the first await (NG0203 otherwise).
+      const auth = inject(AuthService);
+      const deepLinks = inject(DeepLinkService);
+      return (async () => {
+        await auth.restoreToken();
+        await deepLinks.init();
+      })();
     }),
   ],
 };
