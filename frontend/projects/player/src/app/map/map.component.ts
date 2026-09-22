@@ -10,7 +10,7 @@ import {
   signal,
   viewChild,
 } from '@angular/core';
-import { ActivatedRoute, Router } from '@angular/router';
+import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { HttpErrorResponse } from '@angular/common/http';
 import { takeUntilDestroyed } from '@angular/core/rxjs-interop';
 import { forkJoin } from 'rxjs';
@@ -30,6 +30,8 @@ import {
   RevealedTower,
   TowerFeature,
   TowerOwnershipChangedPayload,
+  UiAlertComponent,
+  UiIconComponent,
   ZoneControlChangedPayload,
   ZoneFeature,
 } from 'shared';
@@ -55,103 +57,71 @@ interface DiscoveryToast {
 @Component({
   selector: 'app-map',
   standalone: true,
+  imports: [RouterLink, UiIconComponent, UiAlertComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="map-wrapper">
-      <div class="badges">
+      <div class="map-pills">
         @if (groupSlug()) {
-          <div class="map-badge">
-            <i class="bi bi-flag-fill"></i>
-            Score map · {{ groupSlug() }}
+          <div class="map-pill">
+            <ui-icon name="map" [size]="14" />
+            <span class="tr-meta-tiny">Score map · {{ groupSlug() }}</span>
           </div>
         }
         @if (realtime.connected()) {
-          <div class="map-badge text-success"><i class="bi bi-broadcast"></i> Live</div>
+          <div class="map-pill map-pill--live">
+            <ui-icon name="sparkle" [size]="14" />
+            <span class="tr-meta-tiny">Live</span>
+          </div>
         } @else if (realtime.status() === 'reconnecting') {
-          <div class="map-badge text-warning"><i class="bi bi-arrow-repeat"></i> Reconnecting…</div>
+          <div class="map-pill map-pill--warn">
+            <ui-icon name="clock" [size]="14" />
+            <span class="tr-meta-tiny">Reconnecting…</span>
+          </div>
         }
       </div>
       @if (boosts().length > 0) {
-        <div class="boost-banner">
+        <div class="map-boost-banner">
           @for (b of boosts(); track b.id) {
-            <div class="badge text-bg-warning d-block text-start mb-1">
-              <i class="bi bi-lightning-charge-fill"></i>
-              &times;{{ b.factor }} points {{ boostTarget(b) }}
+            <div class="map-pill map-pill--warn">
+              <ui-icon name="star" [size]="14" />
+              <span class="tr-meta-tiny">&times;{{ b.factor }} points {{ boostTarget(b) }}</span>
             </div>
           }
         </div>
       }
       <div class="map" #mapContainer></div>
       @if (errorMessage(); as msg) {
-        <div class="alert alert-warning map-error">{{ msg }}</div>
+        <ui-alert tone="danger" [withIcon]="true" class="map-error">{{ msg }}</ui-alert>
       }
       <!-- tower-visibility: discovery cues as HIDDEN towers pop up. -->
-      <div class="discovery-toasts">
+      <div class="map-discovery-toasts">
         @for (toast of discoveryToasts(); track toast.id) {
-          <div class="alert alert-info py-2 mb-2 shadow-sm">
-            <i class="bi bi-binoculars-fill me-1"></i>
+          <ui-alert tone="success" [withIcon]="true" class="map-discovery-toast">
             <strong>{{ toast.name }}</strong> discovered!
-            <span class="small text-body-secondary">({{ methodLabel(toast.method) }})</span>
-          </div>
+            <span class="tr-meta-tiny">({{ methodLabel(toast.method) }})</span>
+          </ui-alert>
         }
       </div>
+      <a class="map-fab" routerLink="/scan" aria-label="Scan tag">
+        <ui-icon name="target" [size]="26" />
+      </a>
     </div>
   `,
   styles: `
     :host {
       display: block;
-      height: calc(100vh - 4rem);
+      height: calc(100dvh - 56px - var(--safe-top) - 78px - var(--safe-bottom));
+      width: 100%;
     }
     .map-wrapper {
       position: relative;
       height: 100%;
+      width: 100%;
     }
     .map {
       height: 100%;
       width: 100%;
-      border-radius: 0.375rem;
-    }
-    .map-error,
-    .badges,
-    .boost-banner,
-    .discovery-toasts {
-      position: absolute;
-      z-index: 1000;
-    }
-    .boost-banner {
-      top: 0.75rem;
-      left: 3.25rem;
-      max-width: 60%;
-    }
-    .boost-banner .badge {
-      font-size: 0.85rem;
-      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
-    }
-    .discovery-toasts {
-      bottom: 0.75rem;
-      left: 0.75rem;
-      right: 0.75rem;
-      pointer-events: none;
-    }
-    .badges {
-      top: 0.75rem;
-      right: 0.75rem;
-      display: flex;
-      gap: 0.5rem;
-    }
-    .map-badge {
-      background: rgba(255, 255, 255, 0.92);
-      border: 1px solid rgba(0, 0, 0, 0.1);
-      border-radius: 999px;
-      padding: 0.25rem 0.75rem;
-      font-size: 0.875rem;
-      font-weight: 500;
-    }
-    .map-error {
-      top: 1rem;
-      left: 1rem;
-      right: 1rem;
-      margin: 0;
     }
   `,
 })
@@ -611,13 +581,21 @@ export class MapComponent {
     const name = escapeHtml(tower.name);
     const owner = tower.ownership as Partial<{ name: string; color: string }>;
     const ownerLine = owner?.name
-      ? `<div class="mt-1">Held by <strong>${escapeHtml(owner.name)}</strong></div>`
-      : '<div class="mt-1 text-body-secondary">Unclaimed</div>';
+      ? `<div style="margin-top:4px;color:var(--color-text-secondary)">Held by <strong>${escapeHtml(owner.name)}</strong></div>`
+      : '<div style="margin-top:4px;color:var(--color-text-muted)">Unclaimed</div>';
     const bonus = tower.has_initial_bonus
-      ? '<div class="small text-success">Initial bonus available</div>'
+      ? '<div style="margin-top:2px;font-size:12px;color:var(--color-success)">Initial bonus available</div>'
       : '';
-    const detailLink = `<a class="btn btn-sm btn-primary mt-2" href="/tower/${tower.id}">View details</a>`;
-    return `<div class="fw-semibold">${name}</div>${ownerLine}${bonus}${detailLink}`;
+    const detailLink =
+      `<a href="/tower/${tower.id}" style="display:inline-block;margin-top:8px;padding:6px 14px;` +
+      'border-radius:var(--radius-full);background:var(--color-brand-primary);' +
+      'color:var(--color-text-onBrand);text-decoration:none;font-size:12px;font-weight:600">' +
+      'View details</a>';
+    return (
+      `<div style="font-family:var(--font-ui);min-width:160px">` +
+      `<div style="font-family:var(--font-display);font-weight:700;color:var(--color-text-primary)">${name}</div>` +
+      `${ownerLine}${bonus}${detailLink}</div>`
+    );
   }
 }
 

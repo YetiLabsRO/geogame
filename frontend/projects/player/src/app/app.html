@@ -1,35 +1,24 @@
-<nav class="navbar navbar-expand-sm bg-body-tertiary border-bottom">
-  <div class="container-fluid">
-    <a class="navbar-brand fw-semibold" routerLink="/">Cercetador</a>
-    <a class="nav-link small" routerLink="/trail">Trail</a>
-    <a class="nav-link small" routerLink="/rules">Rules</a>
+@if (!isChromeless()) {
+  <ui-top-app-bar [title]="sessionTitle()" [back]="!isTabRoot()" (backPressed)="goBack()">
     @if (isAuthenticated()) {
-      <a class="nav-link small" routerLink="/team">Team</a>
-      <a class="nav-link small" routerLink="/history">History</a>
-      <a class="nav-link small" routerLink="/teams">Teams</a>
-      <a class="nav-link small" routerLink="/settings" title="Notification settings">
-        <i class="bi bi-bell"></i>
-      </a>
-      <a class="nav-link small" routerLink="/dementors">Dementors</a>
-      @if (captainTeamId(); as teamId) {
-        <a class="nav-link small" [routerLink]="['/team', teamId, 'requests']">My team</a>
-      }
+      <div appBarActions class="app-bar-actions">
+        <a class="app-bar-actions__icon" routerLink="/settings" aria-label="Notification settings">
+          <ui-icon name="bell" [size]="22" />
+        </a>
+        <a class="app-bar-actions__avatar" routerLink="/ledger" aria-label="Your ledger">
+          <ui-avatar [size]="32" [name]="username()" />
+        </a>
+      </div>
     }
-    <div class="ms-auto d-flex align-items-center gap-2">
-      @if (isAuthenticated()) {
-        @if (username(); as name) {
-          <span class="text-body-secondary small">{{ name }}</span>
-        }
-        <button type="button" class="btn btn-sm btn-outline-secondary" (click)="logout()">
-          Sign out
-        </button>
-      } @else {
-        <a class="btn btn-sm btn-outline-primary" routerLink="/login">Sign in</a>
-      }
-    </div>
-  </div>
-</nav>
+  </ui-top-app-bar>
+}
 
-<main class="container-fluid py-3">
+<main class="tr-main" [class.tr-main--with-nav]="showNav()" [class.tr-main--flush]="isMapRoute()">
   <router-outlet />
 </main>
+
+@if (showNav()) {
+  <ui-bottom-nav [items]="navItems" />
+}
+
+<ui-toast-outlet />

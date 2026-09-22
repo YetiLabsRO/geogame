@@ -9,7 +9,23 @@ import {
 } from '@angular/core';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 
-import { GameApiService, GeolocationService, HapticsService, TowerState } from 'shared';
+import {
+  GameApiService,
+  GeolocationService,
+  HapticsService,
+  TowerState,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiEmptyStateComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+  UiProgressMeterComponent,
+  UiSpinnerComponent,
+  UiStatTileComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -23,336 +39,404 @@ interface Position {
   selector: 'app-tower-detail',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [RouterLink],
+  imports: [
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiEmptyStateComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+    UiProgressMeterComponent,
+    UiSpinnerComponent,
+    UiStatTileComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-8 col-lg-6">
-        <a routerLink="/" class="small text-body-secondary">&larr; Back to map</a>
-
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger mt-3">{{ msg }}</div>
-        } @else if (state(); as s) {
-          <h1 class="h3 mt-2 mb-1">{{ s.name }}</h1>
+    @if (loadError(); as msg) {
+      <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+    } @else if (state(); as s) {
+      <!-- Tower hero (docs/design-system.md §6) -->
+      <div class="tower-hero">
+        <div class="tower-hero__chips">
           @if (s.ownership; as o) {
-            <div class="mb-3">
-              <span class="badge" [style.background-color]="o.team_color">
-                Held by {{ o.team_name }}
-              </span>
-              @if (s.has_initial_bonus) {
-                <span class="badge text-bg-success ms-1">Initial bonus</span>
-              }
-            </div>
+            <ui-chip [teamColor]="o.team_color">Held by {{ o.team_name }}</ui-chip>
           } @else {
-            <div class="mb-3">
-              <span class="badge text-bg-secondary">Unclaimed</span>
-              @if (s.has_initial_bonus) {
-                <span class="badge text-bg-success ms-1">Initial bonus</span>
-              }
-            </div>
+            <ui-chip tone="neutral">Unclaimed</ui-chip>
           }
-
-          <div class="card mb-3">
-            <div class="card-body">
-              <div class="d-flex justify-content-between align-items-start">
-                <div>
-                  <div class="small text-body-secondary">Your distance</div>
-                  <div class="fs-4 fw-semibold">
-                    @if (distanceMeters(); as d) {
-                      {{ formatDistance(d) }}
-                    } @else if (locationError()) {
-                      <span class="text-danger fs-6">{{ locationError() }}</span>
-                    } @else {
-                      <span class="text-body-secondary fs-6">Locating…</span>
-                    }
-                  </div>
-                </div>
-                <div class="text-end">
-                  <div class="small text-body-secondary">Required</div>
-                  <div class="fs-5">within {{ s.proximity_meters }} m</div>
-                </div>
-              </div>
-              @if (distanceMeters() !== null) {
-                @if (withinRange()) {
-                  <div class="small text-success mt-2">
-                    <i class="bi bi-check-circle"></i> In range
-                  </div>
-                } @else {
-                  <div class="small text-warning mt-2">
-                    <i class="bi bi-exclamation-triangle"></i>
-                    Move closer to submit a challenge.
-                  </div>
-                }
-              }
-            </div>
-          </div>
-
-          @if (s.tower_lock_mode === 'LOCK_ON_INITIATE') {
-            @if (activeLock(); as lock) {
-              @if (lock.held_by_us) {
-                <div
-                  class="alert alert-success d-flex justify-content-between align-items-center gap-2"
-                >
-                  <div>
-                    <div class="fw-semibold">
-                      <i class="bi bi-lock-fill"></i> Tower locked to your team
-                    </div>
-                    <div class="small">
-                      Finish within
-                      <strong>{{ formatCountdown(lockRemaining()) }}</strong
-                      >.
-                    </div>
-                  </div>
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-outline-secondary"
-                    [disabled]="releasing()"
-                    (click)="releaseLock()"
-                  >
-                    @if (releasing()) {
-                      <span class="spinner-border spinner-border-sm me-1"></span>
-                    }
-                    Give up lock
-                  </button>
-                </div>
-              } @else {
-                <div class="alert alert-warning">
-                  <div class="fw-semibold">
-                    <i class="bi bi-lock-fill"></i>
-                    Locked by
-                    <span class="badge" [style.background-color]="lock.team_color">
-                      {{ lock.team_name }}
-                    </span>
-                  </div>
-                  <div class="small">
-                    Free again in
-                    <strong>{{ formatCountdown(lockRemaining()) }}</strong>
-                    unless they finish first.
-                  </div>
-                </div>
-              }
-            }
-            @if (lockError(); as msg) {
-              <div class="alert alert-danger py-2">{{ msg }}</div>
-            }
+          @if (s.has_initial_bonus) {
+            <ui-chip tone="solid" icon="star">Bonus</ui-chip>
           }
+        </div>
+        <ui-icon class="tower-hero__watermark" name="castle" [size]="150" />
+        <h2 class="tower-hero__name tr-h2">{{ s.name }}</h2>
+      </div>
 
-          @if (cooloffRemaining() > 0) {
-            <div class="alert alert-warning">
-              <div class="fw-semibold">Cooloff in effect</div>
-              <div class="small">
-                You can try again in
-                <strong>{{ formatCountdown(cooloffRemaining()) }}</strong
-                >.
-              </div>
-            </div>
-          } @else if (s.pending_submission) {
-            <div class="alert alert-info">A submission is already pending review.</div>
-          } @else if (s.challenge_hidden) {
-            <!-- tower-visibility (challenge axis): HIDDEN_UNTIL_ARRIVAL —
-                 the server withholds the challenge until we report a
-                 position inside the activation area. -->
-            <div class="card mb-3 border-secondary">
-              <div class="card-body text-center text-body-secondary">
-                <i class="bi bi-eye-slash fs-2 d-block mb-2"></i>
-                <div class="fw-semibold">Challenge hidden until arrival</div>
-                <div class="small">
-                  Get within {{ s.proximity_meters }} m of the tower to reveal the challenge.
-                </div>
-              </div>
-            </div>
-          } @else if (s.next_challenge; as c) {
-            <div class="card mb-3">
-              <div class="card-body">
-                <div class="small text-body-secondary mb-1">
-                  Next challenge · difficulty {{ c.difficulty }}
-                  <span class="badge text-bg-light border ms-1">{{ typeLabel() }}</span>
-                  @if (isAuto()) {
-                    <span class="badge text-bg-info ms-1">Instant validation</span>
-                  }
-                </div>
-                <div class="fs-5" style="white-space: pre-line">{{ c.text }}</div>
-                @if (s.presence; as p) {
-                  <hr class="my-2" />
-                  <div class="small text-body-secondary mb-1">
-                    Presence requirement (updates as teammates arrive)
-                  </div>
-                  <div class="mb-1">
-                    @if (p.method === 'PHOTO') {
-                      <span class="badge text-bg-warning">
-                        Photo of {{ p.required_members }} member(s) required
-                      </span>
-                    } @else {
-                      <span
-                        class="badge"
-                        [class.text-bg-success]="p.present_members >= p.required_members"
-                        [class.text-bg-danger]="p.present_members < p.required_members"
-                      >
-                        {{ p.present_members }} / {{ p.required_members }} members present
-                      </span>
-                      @if (p.window_seconds > 0) {
-                        <span class="badge text-bg-info ms-1">
-                          hold {{ p.window_seconds }}s inside {{ p.geofence_radius_meters }} m
-                        </span>
-                      }
-                    }
-                  </div>
-                  @if (p.method !== 'PHOTO' && p.present_members < p.required_members) {
-                    <div class="small text-danger">
-                      <i class="bi bi-exclamation-triangle"></i>
-                      Gather {{ p.required_members - p.present_members }} more teammate(s) within
-                      {{ p.geofence_radius_meters }} m of the tower (live location must be on).
-                    </div>
-                  }
-                  @if (p.photo_fallback_offered) {
-                    <div class="small text-body-secondary">
-                      <i class="bi bi-camera"></i>
-                      Alternatively, attach a photo showing the
-                      {{ p.required_members }} required member(s) — staff will review it manually.
-                    </div>
-                  }
-                }
-                @if (c.role_requirement; as req) {
-                  <hr class="my-2" />
-                  <div class="small text-body-secondary mb-1">
-                    @if (req.mode === 'ALL') {
-                      Requires one holder for <strong>each</strong> role:
-                    } @else {
-                      Requires <strong>at least one</strong> of the roles:
-                    }
-                  </div>
-                  <div class="mb-1">
-                    @for (role of req.required_roles; track role.slug) {
-                      <span
-                        class="badge me-1"
-                        [class.text-bg-success]="!req.missing_roles.includes(role.slug)"
-                        [class.text-bg-danger]="req.missing_roles.includes(role.slug)"
-                      >
-                        {{ role.name }}
-                      </span>
-                    }
-                  </div>
-                  @if (req.team_satisfies) {
-                    <div class="small text-success">
-                      <i class="bi bi-check-circle"></i>
-                      Your team covers the required roles.
-                    </div>
-                  } @else {
-                    <div class="small text-danger">
-                      <i class="bi bi-exclamation-triangle"></i>
-                      Your team is missing: {{ req.missing_roles.join(', ') }}. Ask staff to assign
-                      the role, then try again.
-                    </div>
-                  }
-                }
-              </div>
-            </div>
+      <!-- Title block -->
+      <div class="tower-title">
+        <span class="tr-eyebrow">
+          DIFFICULTY {{ s.next_challenge?.difficulty ?? '—' }} · {{ typeLabel() }}
+          @if (isAuto()) {
+            · INSTANT VALIDATION
+          }
+        </span>
+        <h1 class="tr-h1">{{ typeLabel() }} Challenge</h1>
+      </div>
 
-            @if (mustInitiate()) {
-              <!-- tower-locking: LOCK_ON_INITIATE — claim the tower before submitting -->
-              <button
-                type="button"
-                class="btn btn-primary w-100"
-                [disabled]="initiating() || activeLock() !== null"
-                (click)="initiate()"
-              >
-                @if (initiating()) {
-                  <span class="spinner-border spinner-border-sm me-2"></span>
-                }
-                <i class="bi bi-lock"></i> Start challenge (lock this tower)
-              </button>
-              @if (activeLock() !== null) {
-                <div class="small text-body-secondary text-center mt-1">
-                  Wait for the current lock to expire or be released.
-                </div>
-              }
-            } @else {
-              <!-- challenge-type-system: per-type submission inputs -->
-              @if (needsCode()) {
-                <div class="mb-3">
-                  <label class="form-label" for="scan-code">
-                    <i class="bi bi-qr-code-scan"></i>
-                    Code from the venue / tag
-                  </label>
-                  <input
-                    id="scan-code"
-                    type="text"
-                    class="form-control"
-                    placeholder="Scan or paste the code"
-                    autocomplete="off"
-                    [value]="codeValue()"
-                    (input)="onCodeInput($event)"
-                  />
-                  <div class="form-text">
-                    Get the code at the location (QR / NFC handout), then paste or type it here. It
-                    is checked instantly.
-                  </div>
-                </div>
-              } @else {
-                <div class="mb-3">
-                  <label class="form-label" for="photo">
-                    Photo {{ needsPhoto() ? '(required)' : '(optional)' }}
-                  </label>
-                  <input
-                    id="photo"
-                    type="file"
-                    class="form-control"
-                    accept="image/*"
-                    capture="environment"
-                    (change)="onPhotoSelected($event)"
-                  />
-                  @if (photoName(); as n) {
-                    <div class="small text-body-secondary mt-1">Selected: {{ n }}</div>
-                  }
-                  @if (needsPhoto() && !photoName()) {
-                    <div class="form-text">
-                      This challenge is validated with a photo — take one to submit.
-                    </div>
-                  }
-                </div>
-              }
-
-              @if (submitError(); as msg) {
-                <div class="alert alert-danger py-2">{{ msg }}</div>
-              }
-              @if (submitOutcome() === 1) {
-                <div class="alert alert-success py-2">
-                  <i class="bi bi-check-circle"></i>
-                  Code accepted — tower captured!
-                </div>
-              } @else if (submitOutcome() === 2) {
-                <div class="alert alert-danger py-2">
-                  <i class="bi bi-x-circle"></i>
-                  Code rejected. Check the code and try again after the cooloff.
-                </div>
-              } @else if (submitOutcome() === 0) {
-                <div class="alert alert-success py-2">
-                  Submission received. Staff will review it shortly.
-                </div>
-              }
-
-              <button
-                type="button"
-                class="btn btn-primary w-100"
-                [disabled]="!canSubmit()"
-                (click)="submit()"
-              >
-                @if (submitting()) {
-                  <span class="spinner-border spinner-border-sm me-2"></span>
-                }
-                {{ needsCode() ? 'Validate code' : 'Submit challenge' }}
-              </button>
-            }
+      <!-- Meta stats -->
+      <div class="tower-stats">
+        <ui-stat-tile icon="target" label="Distance">
+          @if (distanceMeters(); as d) {
+            {{ formatDistance(d) }}
+          } @else if (locationError()) {
+            {{ locationError() }}
           } @else {
-            <div class="alert alert-secondary">No challenges available for this tower.</div>
+            Locating…
           }
+        </ui-stat-tile>
+        @if (cooloffRemaining() > 0) {
+          <ui-stat-tile icon="clock" label="Cooldown" [value]="formatCountdown(cooloffRemaining())" />
+        } @else if (s.next_challenge; as statsChallenge) {
+          <ui-stat-tile icon="star" label="Difficulty" [value]="statsChallenge.difficulty" />
         } @else {
-          <div class="d-flex align-items-center text-body-secondary mt-4">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading tower…
-          </div>
+          <ui-stat-tile icon="star" label="Required range" [value]="s.proximity_meters + ' m'" />
         }
       </div>
-    </div>
+
+      @if (distanceMeters(); as d) {
+        <ui-progress-meter
+          label="Distance"
+          [valueLabel]="formatDistance(d) + ' / ' + s.proximity_meters + ' m'"
+          [value]="s.proximity_meters"
+          [max]="proximityMeterMax(d, s.proximity_meters)"
+          [tone]="withinRange() ? 'success' : 'danger'"
+        />
+      }
+
+      @if (s.tower_lock_mode === 'LOCK_ON_INITIATE') {
+        @if (activeLock(); as lock) {
+          @if (lock.held_by_us) {
+            <ui-alert tone="success" [withIcon]="true">
+              <strong>Tower locked to your team.</strong>
+              Finish within {{ formatCountdown(lockRemaining()) }}.
+            </ui-alert>
+            <ui-button
+              variant="secondary"
+              size="sm"
+              [loading]="releasing()"
+              (pressed)="releaseLock()"
+            >
+              Give up lock
+            </ui-button>
+          } @else {
+            <ui-alert tone="warning" [withIcon]="true">
+              Locked by <strong>{{ lock.team_name }}</strong>. Free again in
+              {{ formatCountdown(lockRemaining()) }} unless they finish first.
+            </ui-alert>
+          }
+        }
+        @if (lockError(); as msg) {
+          <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+        }
+      }
+
+      @if (cooloffRemaining() > 0) {
+        <ui-alert tone="warning" [withIcon]="true">
+          <strong>Cooloff in effect.</strong> You can try again in
+          {{ formatCountdown(cooloffRemaining()) }}.
+        </ui-alert>
+      } @else if (s.pending_submission) {
+        <ui-alert tone="info" [withIcon]="true">A submission is already pending review.</ui-alert>
+      } @else if (s.challenge_hidden) {
+        <!-- tower-visibility (challenge axis): HIDDEN_UNTIL_ARRIVAL — the
+             server withholds the challenge until we report a position
+             inside the activation area. -->
+        <ui-empty-state
+          icon="target"
+          title="Challenge hidden until arrival"
+          [description]="'Get within ' + s.proximity_meters + ' m of the tower to reveal it.'"
+        />
+      } @else if (s.next_challenge; as c) {
+        <ui-card>
+          <div class="tower-task-row">
+            <span class="tr-eyebrow">YOUR TASK</span>
+            <ui-icon name="sparkle" [size]="18" />
+          </div>
+          <p class="tr-body-italic">&ldquo;{{ c.text }}&rdquo;</p>
+
+          @if (s.presence; as p) {
+            <div class="tower-divider"></div>
+            <span class="tr-field-label">Presence requirement</span>
+            <div class="tower-chip-row">
+              @if (p.method === 'PHOTO') {
+                <ui-chip tone="brand">Photo of {{ p.required_members }} member(s) required</ui-chip>
+              } @else {
+                <ui-chip [tone]="p.present_members >= p.required_members ? 'brand' : 'neutral'">
+                  {{ p.present_members }} / {{ p.required_members }} members present
+                </ui-chip>
+                @if (p.window_seconds > 0) {
+                  <ui-chip tone="slate">
+                    hold {{ p.window_seconds }}s inside {{ p.geofence_radius_meters }} m
+                  </ui-chip>
+                }
+              }
+            </div>
+            @if (p.method !== 'PHOTO' && p.present_members < p.required_members) {
+              <ui-alert tone="danger" [withIcon]="true">
+                Gather {{ p.required_members - p.present_members }} more teammate(s) within
+                {{ p.geofence_radius_meters }} m of the tower (live location must be on).
+              </ui-alert>
+            }
+            @if (p.photo_fallback_offered) {
+              <p class="tr-body tower-muted">
+                Alternatively, attach a photo showing the {{ p.required_members }} required
+                member(s) — staff will review it manually.
+              </p>
+            }
+          }
+
+          @if (c.role_requirement; as req) {
+            <div class="tower-divider"></div>
+            <span class="tr-field-label">
+              @if (req.mode === 'ALL') {
+                Required roles (all)
+              } @else {
+                Required roles (any)
+              }
+            </span>
+            <div class="tower-chip-row">
+              @for (role of req.required_roles; track role.slug) {
+                <ui-chip [tone]="req.missing_roles.includes(role.slug) ? 'neutral' : 'brand'">
+                  {{ role.name }}
+                </ui-chip>
+              }
+            </div>
+            @if (req.team_satisfies) {
+              <p class="tr-body tower-success">Your team covers the required roles.</p>
+            } @else {
+              <ui-alert tone="danger" [withIcon]="true">
+                Your team is missing: {{ req.missing_roles.join(', ') }}. Ask staff to assign the
+                role, then try again.
+              </ui-alert>
+            }
+          }
+        </ui-card>
+
+        @if (mustInitiate()) {
+          <!-- tower-locking: LOCK_ON_INITIATE — claim the tower before submitting -->
+          <ui-button
+            variant="primary"
+            [block]="true"
+            icon="key"
+            [disabled]="initiating() || activeLock() !== null"
+            [loading]="initiating()"
+            (pressed)="initiate()"
+          >
+            Start challenge (lock this tower)
+          </ui-button>
+          @if (activeLock() !== null) {
+            <p class="tr-body tower-muted tower-centered">
+              Wait for the current lock to expire or be released.
+            </p>
+          }
+        } @else {
+          <!-- challenge-type-system: per-type submission inputs -->
+          @if (needsCode()) {
+            <ui-field
+              label="YOUR ANSWER"
+              icon="key"
+              help="Get the code at the location (QR / NFC handout), then paste or type it here. It is checked instantly."
+            >
+              <input
+                uiInput
+                type="text"
+                placeholder="Scan or paste the code"
+                autocomplete="off"
+                [value]="codeValue()"
+                (input)="onCodeInput($event)"
+              />
+            </ui-field>
+            <ui-button variant="secondary" [block]="true" icon="target" routerLink="/scan">
+              Scan tag
+            </ui-button>
+          } @else {
+            <div class="tower-photo-field">
+              <label class="tower-photo-trigger" for="photo">
+                <ui-icon name="camera" [size]="20" />
+                <span class="tr-button-label">
+                  @if (photoName()) {
+                    Change photo
+                  } @else if (needsPhoto()) {
+                    Take photo (required)
+                  } @else {
+                    Take photo (optional)
+                  }
+                </span>
+              </label>
+              <input
+                id="photo"
+                type="file"
+                accept="image/*"
+                capture="environment"
+                (change)="onPhotoSelected($event)"
+                hidden
+              />
+              @if (photoDataUrl(); as url) {
+                <img class="tower-photo-preview" [src]="url" alt="Selected photo preview" />
+              }
+            </div>
+          }
+
+          @if (submitError(); as msg) {
+            <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+          }
+          @if (submitOutcome() === 1) {
+            <ui-alert tone="success" [withIcon]="true">Code accepted — tower captured!</ui-alert>
+          } @else if (submitOutcome() === 2) {
+            <ui-alert tone="danger" [withIcon]="true">
+              Code rejected. Check the code and try again after the cooloff.
+            </ui-alert>
+          } @else if (submitOutcome() === 0) {
+            <ui-alert tone="success" [withIcon]="true">
+              Submission received. Staff will review it shortly.
+            </ui-alert>
+          }
+
+          <ui-button
+            variant="primary"
+            [block]="true"
+            icon="arrow-right"
+            [disabled]="!canSubmit()"
+            [loading]="submitting()"
+            (pressed)="submit()"
+          >
+            {{ needsCode() ? 'Validate code' : 'Submit Trial' }}
+          </ui-button>
+        }
+      } @else {
+        <ui-empty-state
+          icon="castle"
+          title="No challenges available"
+          description="There is nothing to solve at this tower right now."
+        />
+      }
+    } @else {
+      <div class="tower-loading">
+        <ui-spinner />
+        <span class="tr-body">Loading tower…</span>
+      </div>
+    }
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .tower-loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      color: var(--color-text-secondary);
+    }
+    .tower-hero {
+      position: relative;
+      display: flex;
+      height: 180px;
+      overflow: hidden;
+      border-radius: var(--radius-lg);
+      padding: var(--spacing-md);
+      background: linear-gradient(142deg, #f3ece0 0%, #e7cca3 37%, #c99e73 67%);
+    }
+    :host-context(:root[data-theme='dark']) .tower-hero {
+      background: linear-gradient(142deg, var(--color-bg-inset) 0%, #3a2a20 100%);
+    }
+    @media (prefers-color-scheme: dark) {
+      :host-context(:root:not([data-theme='light'])) .tower-hero {
+        background: linear-gradient(142deg, var(--color-bg-inset) 0%, #3a2a20 100%);
+      }
+    }
+    .tower-hero__chips {
+      position: relative;
+      z-index: 1;
+      display: flex;
+      align-self: flex-start;
+      gap: var(--spacing-2xs);
+    }
+    .tower-hero__watermark {
+      position: absolute;
+      right: -20px;
+      bottom: -20px;
+      color: var(--color-brand-deep);
+      opacity: 0.18;
+    }
+    .tower-hero__name {
+      position: relative;
+      z-index: 1;
+      align-self: flex-end;
+      margin-left: auto;
+      color: var(--color-brand-deep);
+    }
+    .tower-title {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2xs);
+    }
+    .tower-title .tr-eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .tower-stats {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: var(--spacing-sm);
+    }
+    .tower-task-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      color: var(--color-brand-onSurface);
+    }
+    .tower-divider {
+      height: 1px;
+      margin: var(--spacing-2xs) 0;
+      background: var(--color-border-subtle);
+    }
+    .tower-chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-2xs);
+    }
+    .tower-muted {
+      color: var(--color-text-secondary);
+    }
+    .tower-success {
+      color: var(--color-success);
+    }
+    .tower-centered {
+      text-align: center;
+    }
+    .tower-photo-field {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .tower-photo-trigger {
+      display: flex;
+      min-height: var(--tap-min);
+      align-items: center;
+      justify-content: center;
+      gap: var(--spacing-xs);
+      border-radius: var(--radius-xl);
+      background: var(--color-brand-tint);
+      border: 1px solid var(--color-border-brand);
+      color: var(--color-brand-onSurface);
+      cursor: pointer;
+    }
+    .tower-photo-preview {
+      width: 100%;
+      max-height: 220px;
+      border-radius: var(--radius-lg);
+      object-fit: cover;
+    }
   `,
 })
 export class TowerDetailComponent implements OnInit {
@@ -650,6 +734,12 @@ export class TowerDetailComponent implements OnInit {
     const m = Math.floor(seconds / 60);
     const s = seconds % 60;
     return `${m}:${String(s).padStart(2, '0')}`;
+  }
+
+  /** Presentation-only: keeps the distance `ui-progress-meter` fill between
+   *  0 (far away) and 100% (at or inside the proximity threshold). */
+  protected proximityMeterMax(distance: number, proximity: number): number {
+    return Math.max(distance, proximity);
   }
 }
 

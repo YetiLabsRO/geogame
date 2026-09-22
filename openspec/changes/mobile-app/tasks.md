@@ -31,9 +31,9 @@
 ## 4. Player shell and screens
 
 - [x] 4.1 Player `styles.scss`: import tokens + fonts, Bootstrap grid and utilities SCSS only, global resets, safe-area variables; remove `bootstrap.bundle.min.js` and the full Bootstrap CSS from `angular.json` for the player; `index.html` title "Tower Rush", `viewport-fit=cover`, theme-color meta.
-- [ ] 4.2 Shell: `app.html` → `ui-top-app-bar` (session name, avatar → Ledger) + `<main>` + `ui-bottom-nav` (Journey `/`, Society `/team`, Chronicle `/history`, Ledger `/ledger`), hidden on auth/session-picker routes; routes add `/ledger` and `/journey`, `/society`, `/chronicle` redirects; all existing paths preserved.
-- [ ] 4.3 Ledger screen: live scoreboard (per-TeamGroup standings from `RealtimeService`/API), my team's locked + floating score as stat tiles, Dementors status row, links to Trail, Rules, notification + location settings, theme setting, sign out.
-- [ ] 4.4 Journey: full-bleed map under the app bar with a floating Scan action; tower detail rebuilt after the Figma Tower Challenge (Trial) screen (hero, distance + `ui-progress-meter`, challenge card, photo capture, disabled-out-of-range submit, cooldown ring); NFC scan and trail screens restyled.
+- [x] 4.2 Shell: `app.html` → `ui-top-app-bar` (session name, avatar → Ledger) + `<main>` + `ui-bottom-nav` (Journey `/`, Society `/team`, Chronicle `/history`, Ledger `/ledger`), hidden on auth/session-picker routes; routes add `/ledger` and `/journey`, `/society`, `/chronicle` redirects; all existing paths preserved.
+- [x] 4.3 Ledger screen: live scoreboard (per-TeamGroup standings from `RealtimeService`/API), my team's locked + floating score as stat tiles, Dementors status row, links to Trail, Rules, notification + location settings, theme setting, sign out.
+- [x] 4.4 Journey: full-bleed map under the app bar with a floating Scan action; tower detail rebuilt after the Figma Tower Challenge (Trial) screen (hero, distance + `ui-progress-meter`, challenge card, photo capture, disabled-out-of-range submit, cooldown ring); NFC scan and trail screens restyled.
 - [x] 4.5 Society: my team, browse teams, create team, join by code, join requests, share (QR) restyled with cards, chips (team colour), avatars and buttons.
 - [x] 4.6 Chronicle: my sessions list and session detail restyled.
 - [x] 4.7 Auth (login/register/reset/invite), session picker, location consent, notification settings, Dementors, rules screens restyled; toasts replace `alert` boxes.

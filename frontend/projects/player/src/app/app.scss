@@ -1,4 +1,39 @@
 :host {
   display: block;
-  min-height: 100vh;
+  min-height: 100dvh;
+  background: var(--color-bg-canvas);
+}
+
+.tr-main {
+  display: block;
+  box-sizing: border-box;
+  padding: var(--spacing-xl);
+}
+
+// Space for the fixed ui-bottom-nav so content never sits under it.
+.tr-main--with-nav {
+  padding-bottom: calc(78px + var(--safe-bottom) + var(--spacing-md));
+}
+
+// Full-bleed map route: no shell padding, the map fills the remaining space.
+.tr-main--flush {
+  padding: 0;
+}
+
+.app-bar-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-2xs);
+}
+
+.app-bar-actions__icon,
+.app-bar-actions__avatar {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  width: var(--tap-min);
+  height: var(--tap-min);
+  color: var(--color-brand-onSurface);
+  text-decoration: none;
 }

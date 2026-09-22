@@ -1,7 +1,21 @@
-import { CommonModule } from '@angular/common';
+import { DatePipe } from '@angular/common';
 import { ChangeDetectionStrategy, Component, OnInit, inject, signal } from '@angular/core';
 import { RouterLink } from '@angular/router';
-import { GameApiService, TrailState, TrailStepInfo } from 'shared';
+
+import {
+  GameApiService,
+  TrailState,
+  TrailStepInfo,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiChipTone,
+  UiEmptyStateComponent,
+  UiIconComponent,
+  UiProgressMeterComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 /**
  * mode-trail-discovery: player trail screen (wireframe).
@@ -14,117 +28,224 @@ import { GameApiService, TrailState, TrailStepInfo } from 'shared';
 @Component({
   selector: 'app-trail',
   standalone: true,
-  imports: [CommonModule, RouterLink],
+  imports: [
+    DatePipe,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiEmptyStateComponent,
+    UiIconComponent,
+    UiProgressMeterComponent,
+    UiSpinnerComponent,
+  ],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
-    <div class="container py-3" style="max-width: 640px">
-      <h1 class="h4 mb-3"><i class="bi bi-signpost-split me-2"></i>Trail</h1>
+    <div class="trail-screen">
+      <header class="trail-header">
+        <span class="tr-eyebrow">MODE · TRAIL</span>
+        <h1 class="tr-h1">Trail</h1>
+      </header>
 
       @if (notTrail()) {
-        <div class="alert alert-secondary">This session is not a trail run.</div>
+        <ui-alert tone="info" [withIcon]="true">This session is not a trail run.</ui-alert>
       } @else if (state(); as s) {
         @if (s.finished) {
-          <div class="alert alert-success">
-            <i class="bi bi-flag-fill me-2"></i>
+          <ui-alert tone="success" [withIcon]="true">
             <strong>Finished!</strong> Completed at {{ s.finished_at | date: 'HH:mm:ss' }}.
-          </div>
+          </ui-alert>
         }
 
         @if (s.route === null) {
-          <div class="alert alert-warning">No route has been assigned to your party yet.</div>
+          <ui-alert tone="warning" [withIcon]="true">
+            No route has been assigned to your party yet.
+          </ui-alert>
         } @else {
-          @if (s.progress) {
-            <div class="mb-3">
-              <div class="d-flex justify-content-between small text-muted mb-1">
-                <span>Progress</span>
-                <span>{{ s.progress.unlocked }} / {{ s.progress.total }} points</span>
-              </div>
-              <div class="progress" style="height: 8px">
-                <div
-                  class="progress-bar bg-success"
-                  [style.width.%]="(100 * s.progress.unlocked) / (s.progress.total || 1)"
-                ></div>
-              </div>
-            </div>
+          @if (s.progress; as progress) {
+            <ui-progress-meter
+              label="Progress"
+              [valueLabel]="progress.unlocked + ' / ' + progress.total + ' points'"
+              [value]="progress.unlocked"
+              [max]="progress.total || 1"
+              tone="success"
+            />
           }
 
           @if (s.start_hint) {
-            <div class="card border-info mb-3">
-              <div class="card-body">
-                <h2 class="h6 text-info"><i class="bi bi-eye-slash me-1"></i>Find the start</h2>
-                <p class="mb-0">{{ s.start_hint }}</p>
-              </div>
-            </div>
+            <ui-card eyebrow="Find the start">
+              <p class="tr-body">{{ s.start_hint }}</p>
+            </ui-card>
           }
 
           @if (!s.finished && s.next_steps.length > 0) {
-            <div class="card border-primary mb-3">
-              <div class="card-body">
-                <h2 class="h6 text-primary mb-2">
-                  <i class="bi bi-compass me-1"></i>
-                  @if (s.next_steps.length > 1) {
-                    Choose your next point
-                  } @else {
-                    Your next clue
-                  }
-                </h2>
-                @for (step of s.next_steps; track step.id) {
-                  <div class="border rounded p-2 mb-2">
-                    <div class="d-flex justify-content-between align-items-start">
-                      <div>
-                        <p class="mb-1">{{ step.clue || 'No clue — find the point!' }}</p>
-                        <span class="badge text-bg-light border me-1">
-                          @if (step.state) {
-                            {{ step.state }}
-                          } @else {
-                            HIDDEN
-                          }
-                        </span>
+            <section class="trail-section">
+              <h2 class="tr-h3">
+                @if (s.next_steps.length > 1) {
+                  Choose your next point
+                } @else {
+                  Your next clue
+                }
+              </h2>
+              @for (step of s.next_steps; track step.id) {
+                <ui-card class="trail-step-panel">
+                  <div class="trail-step-panel__row">
+                    <span class="trail-step-panel__icon"><ui-icon name="compass" [size]="20" /></span>
+                    <div class="trail-step-panel__body">
+                      <p class="tr-body">{{ step.clue || 'No clue — find the point!' }}</p>
+                      <div class="trail-step-panel__chips">
+                        <ui-chip tone="neutral">{{ step.state || 'HIDDEN' }}</ui-chip>
                         @if (step.has_gate) {
-                          <span class="badge text-bg-secondary">gate at the point</span>
+                          <ui-chip tone="slate">gate at the point</ui-chip>
                         } @else {
-                          <span class="badge text-bg-info">arrive to unlock</span>
+                          <ui-chip tone="brand">arrive to unlock</ui-chip>
                         }
                       </div>
-                      @if (step.state) {
-                        <a class="btn btn-sm btn-outline-primary" [routerLink]="['/tower', step.tower.id]">
-                          {{ step.tower.name }}
-                        </a>
-                      }
                     </div>
+                  </div>
+                  @if (step.state) {
+                    <ui-button
+                      variant="primary"
+                      size="sm"
+                      icon="arrow-right"
+                      [routerLink]="['/tower', step.tower.id]"
+                    >
+                      {{ step.tower.name }}
+                    </ui-button>
+                  }
+                </ui-card>
+              }
+            </section>
+          }
+
+          <section class="trail-section">
+            <h2 class="tr-h3">My revealed points</h2>
+            @if (s.steps.length > 0) {
+              <div class="trail-list">
+                @for (step of s.steps; track step.id) {
+                  <div class="trail-list-row">
+                    <div class="trail-list-row__main">
+                      <div class="trail-list-row__title">
+                        <span class="tr-body">{{ step.tower.name }}</span>
+                        @if (step.is_start) {
+                          <ui-chip tone="slate">start</ui-chip>
+                        }
+                        @if (step.is_finish) {
+                          <ui-chip tone="slate">finish</ui-chip>
+                        }
+                      </div>
+                      <span class="tr-meta-tiny trail-list-row__clue">{{ step.clue }}</span>
+                    </div>
+                    <ui-chip [tone]="stateTone(step)">{{ step.state }}</ui-chip>
                   </div>
                 }
               </div>
-            </div>
-          }
-
-          <div class="card">
-            <div class="card-header py-2 small text-muted">My revealed points</div>
-            <ul class="list-group list-group-flush">
-              @for (step of s.steps; track step.id) {
-                <li class="list-group-item d-flex justify-content-between align-items-center">
-                  <div>
-                    <span class="fw-semibold me-2">{{ step.tower.name }}</span>
-                    @if (step.is_start) {
-                      <span class="badge text-bg-light border">start</span>
-                    }
-                    @if (step.is_finish) {
-                      <span class="badge text-bg-light border">finish</span>
-                    }
-                    <div class="small text-muted">{{ step.clue }}</div>
-                  </div>
-                  <span class="badge" [class]="stateBadge(step)">{{ step.state }}</span>
-                </li>
-              } @empty {
-                <li class="list-group-item text-muted small">Nothing revealed yet.</li>
-              }
-            </ul>
-          </div>
+            } @else {
+              <ui-empty-state
+                icon="compass"
+                title="Nothing revealed yet"
+                description="Keep exploring to reveal your first point."
+              />
+            }
+          </section>
         }
       } @else {
-        <div class="text-muted">Loading trail…</div>
+        <div class="trail-loading">
+          <ui-spinner />
+          <span class="tr-body">Loading trail…</span>
+        </div>
       }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .trail-screen {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-xl);
+    }
+    .trail-header {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2xs);
+    }
+    .trail-header .tr-eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .trail-loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      color: var(--color-text-secondary);
+    }
+    .trail-section {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .trail-step-panel {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .trail-step-panel__row {
+      display: flex;
+      gap: var(--spacing-sm);
+    }
+    .trail-step-panel__icon {
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      background: var(--color-brand-tint);
+      color: var(--color-brand-onSurface);
+    }
+    .trail-step-panel__body {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      flex-direction: column;
+      gap: var(--spacing-xs);
+    }
+    .trail-step-panel__chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-2xs);
+    }
+    .trail-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-xs);
+    }
+    .trail-list-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+      padding: var(--spacing-sm) var(--spacing-md);
+      border-radius: var(--radius-lg);
+      background: var(--color-bg-raised);
+      border: 1px solid var(--color-border-subtle);
+    }
+    .trail-list-row__main {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .trail-list-row__title {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-2xs);
+    }
+    .trail-list-row__clue {
+      color: var(--color-text-muted);
+    }
   `,
 })
 export class TrailComponent implements OnInit {
@@ -140,14 +261,14 @@ export class TrailComponent implements OnInit {
     });
   }
 
-  stateBadge(step: TrailStepInfo): string {
+  stateTone(step: TrailStepInfo): UiChipTone {
     switch (step.state) {
       case 'UNLOCKED':
-        return 'badge text-bg-success';
+        return 'brand';
       case 'ARRIVED':
-        return 'badge text-bg-warning';
+        return 'slate';
       default:
-        return 'badge text-bg-secondary';
+        return 'neutral';
     }
   }
 }

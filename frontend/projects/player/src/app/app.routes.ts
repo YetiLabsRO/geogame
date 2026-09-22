@@ -164,5 +164,14 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./team/join-code.component').then((m) => m.JoinCodeComponent),
   },
+  {
+    path: 'ledger',
+    canActivate: [authGuard],
+    loadComponent: () => import('./ledger/ledger.component').then((m) => m.LedgerComponent),
+  },
+  // mobile-app D9: tab-name aliases for the Journey/Society/Chronicle roots.
+  { path: 'journey', redirectTo: '' },
+  { path: 'society', redirectTo: 'team' },
+  { path: 'chronicle', redirectTo: 'history' },
   { path: '**', redirectTo: '' },
 ];
