@@ -20,6 +20,8 @@ import {
   ActiveMultiplier,
   CurrentSession,
   GameApiService,
+  GeolocationService,
+  HapticsService,
   LivePlayer,
   REALTIME_EVENTS,
   RealtimeEnvelope,
@@ -64,13 +66,9 @@ interface DiscoveryToast {
           </div>
         }
         @if (realtime.connected()) {
-          <div class="map-badge text-success">
-            <i class="bi bi-broadcast"></i> Live
-          </div>
+          <div class="map-badge text-success"><i class="bi bi-broadcast"></i> Live</div>
         } @else if (realtime.status() === 'reconnecting') {
-          <div class="map-badge text-warning">
-            <i class="bi bi-arrow-repeat"></i> Reconnecting…
-          </div>
+          <div class="map-badge text-warning"><i class="bi bi-arrow-repeat"></i> Reconnecting…</div>
         }
       </div>
       @if (boosts().length > 0) {
@@ -160,6 +158,8 @@ interface DiscoveryToast {
 export class MapComponent {
   private readonly api = inject(GameApiService);
   private readonly stream = inject(LocationStreamService);
+  private readonly geolocation = inject(GeolocationService);
+  private readonly haptics = inject(HapticsService);
   private readonly destroyRef = inject(DestroyRef);
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
@@ -169,9 +169,7 @@ export class MapComponent {
   protected readonly errorMessage = signal<string | null>(null);
   /** Multipliers in effect right now — "Double points" banner (5.3). */
   protected readonly boosts = signal<ActiveMultiplier[]>([]);
-  protected readonly groupSlug = computed(
-    () => this.route.snapshot.paramMap.get('slug') ?? null,
-  );
+  protected readonly groupSlug = computed(() => this.route.snapshot.paramMap.get('slug') ?? null);
 
   protected readonly discoveryToasts = signal<DiscoveryToast[]>([]);
 
@@ -188,9 +186,16 @@ export class MapComponent {
   private readonly zoneLayers = new Map<string, L.GeoJSON>();
   private seenConnections = 0;
   private toastSeq = 0;
+  /** Cached for the haptics "stolen from us" check (D4/2.7). */
+  private myTeamName: string | null = null;
 
   constructor() {
     afterNextRender(() => this.init());
+
+    this.api.myTeam().subscribe({
+      next: (team) => (this.myTeamName = team.name),
+      error: () => {}, // no team yet (e.g. between sessions) — steal haptics simply won't fire
+    });
 
     // 4.2 — after every RE-connect, reconcile from a fresh REST snapshot
     // (events may have been missed while the socket was down).
@@ -267,10 +272,7 @@ export class MapComponent {
       error: (err) => {
         // 404 (no session) and 409 (multiple candidates) mean the
         // player needs to land on /pick-session before we can render.
-        if (
-          err instanceof HttpErrorResponse &&
-          (err.status === 404 || err.status === 409)
-        ) {
+        if (err instanceof HttpErrorResponse && (err.status === 404 || err.status === 409)) {
           this.router.navigateByUrl('/pick-session');
           return;
         }
@@ -356,10 +358,10 @@ export class MapComponent {
    */
   private setupDiscovery(session: CurrentSession): void {
     if (!session.visibility?.uses_discovery) return;
-    if (!('geolocation' in navigator)) return;
     const sendPing = () => {
-      navigator.geolocation.getCurrentPosition(
-        (position) => {
+      this.geolocation
+        .current({ enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 })
+        .then((position) => {
           this.api
             .discoveryPing({
               lat: position.coords.latitude,
@@ -369,10 +371,8 @@ export class MapComponent {
               next: (result) => this.onRevealed(result.newly_revealed),
               error: () => {},
             });
-        },
-        () => undefined,
-        { enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 },
-      );
+        })
+        .catch(() => undefined);
     };
     sendPing();
     this.discoveryHandle = setInterval(sendPing, DISCOVERY_PING_SECONDS * 1000);
@@ -424,12 +424,30 @@ export class MapComponent {
         // Lifecycle flips can change what the REST snapshot exposes.
         this.refreshData();
         break;
+      case REALTIME_EVENTS.bonusAppeared:
+        // Haptics only here — the boost banner is driven by watchBoosts().
+        this.haptics.notify('warning');
+        break;
       default:
-        break; // scoreboard/bonus events are handled by other screens
+        break; // scoreboard events are handled by other screens
     }
   }
 
   private applyTowerOwnership(payload: TowerOwnershipChangedPayload): void {
+    const feature = this.towerData.get(payload.tower_id);
+    const previousOwnerName =
+      feature?.ownership && 'name' in feature.ownership ? feature.ownership.name : null;
+    // A steal targeting OUR team: haptics fire regardless of which map
+    // mode is rendered (default or per-group score map).
+    if (
+      payload.kind === 'stolen' &&
+      previousOwnerName !== null &&
+      this.myTeamName !== null &&
+      previousOwnerName === this.myTeamName
+    ) {
+      this.haptics.impact('heavy');
+    }
+
     const marker = this.towerMarkers.get(payload.tower_id);
     if (!marker) return;
     const slug = this.groupSlug();
@@ -445,7 +463,6 @@ export class MapComponent {
       fillColor: owner?.team_color || '#fff',
       fillOpacity: owner ? 0.9 : 0.3,
     });
-    const feature = this.towerData.get(payload.tower_id);
     if (feature) {
       feature.ownership = owner
         ? { name: owner.team_name, color: owner.team_color, current_score: 0 }
@@ -542,12 +559,7 @@ export class MapComponent {
     ];
     const holes = zones
       .filter((z) => !!z.shape)
-      .map(
-        (z) =>
-          z.shape.coordinates[0].map(
-            ([lng, lat]) => [lat, lng] as L.LatLngExpression,
-          ),
-      );
+      .map((z) => z.shape.coordinates[0].map(([lng, lat]) => [lat, lng] as L.LatLngExpression));
     this.fogLayer = L.polygon([world, ...holes], {
       stroke: false,
       fillColor: '#1f2937',
@@ -604,8 +616,7 @@ export class MapComponent {
     const bonus = tower.has_initial_bonus
       ? '<div class="small text-success">Initial bonus available</div>'
       : '';
-    const detailLink =
-      `<a class="btn btn-sm btn-primary mt-2" href="/tower/${tower.id}">View details</a>`;
+    const detailLink = `<a class="btn btn-sm btn-primary mt-2" href="/tower/${tower.id}">View details</a>`;
     return `<div class="fw-semibold">${name}</div>${ownerLine}${bonus}${detailLink}`;
   }
 }

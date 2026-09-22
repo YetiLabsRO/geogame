@@ -2,13 +2,22 @@ import { ChangeDetectionStrategy, Component, OnInit, inject, input, signal } fro
 import { FormsModule } from '@angular/forms';
 import { RouterLink } from '@angular/router';
 
-import { GameApiService, NfcCaptureResponse } from 'shared';
+import {
+  extractNfcToken,
+  GameApiService,
+  GeolocationService,
+  HapticsService,
+  NfcCaptureResponse,
+  NfcService,
+} from 'shared';
 
 /**
  * nfc-native-and-secure-links: player scan flow (wireframe).
  *
  * Transports, all resolving to the same token capture call:
- * - Web NFC `NDEFReader` where the platform supports it (Android Chrome);
+ * - `NfcService` — Web NFC `NDEFReader` where the platform supports it
+ *   (Android Chrome), the native `@exxili/capacitor-nfc` bridge inside
+ *   the Capacitor shell (iOS + Android);
  * - the app-link deep link (`/nfc/:token`) when the native shell / OS
  *   routes a tag tap straight into the SPA with the token in the URL;
  * - manual code entry as the universal fallback (iOS browsers etc.).
@@ -30,8 +39,8 @@ import { GameApiService, NfcCaptureResponse } from 'shared';
         </button>
       } @else {
         <div class="alert alert-secondary py-2">
-          NFC nu este disponibil în acest browser — folosește camera (QR) sau
-          introdu codul de pe tag.
+          NFC nu este disponibil în acest browser — folosește camera (QR) sau introdu codul de pe
+          tag.
         </div>
       }
 
@@ -68,8 +77,8 @@ import { GameApiService, NfcCaptureResponse } from 'shared';
       }
 
       <p class="text-muted small">
-        Scanarea funcționează doar din aplicație, de la locul unde este ascuns
-        tagul (verificăm distanța prin GPS).
+        Scanarea funcționează doar din aplicație, de la locul unde este ascuns tagul (verificăm
+        distanța prin GPS).
       </p>
       <a routerLink="/" class="btn btn-sm btn-outline-secondary">Înapoi la hartă</a>
     </div>
@@ -80,11 +89,16 @@ export class NfcScanComponent implements OnInit {
   readonly token = input<string>('');
 
   private readonly api = inject(GameApiService);
+  private readonly nfc = inject(NfcService);
+  private readonly geolocation = inject(GeolocationService);
+  private readonly haptics = inject(HapticsService);
 
   readonly scanning = signal(false);
   readonly result = signal<NfcCaptureResponse | null>(null);
   readonly error = signal<string | null>(null);
   manualToken = '';
+
+  private abortController: AbortController | null = null;
 
   ngOnInit(): void {
     // Deep-linked from an app-link / QR scan: capture immediately.
@@ -94,22 +108,17 @@ export class NfcScanComponent implements OnInit {
   }
 
   nfcSupported(): boolean {
-    return typeof window !== 'undefined' && 'NDEFReader' in window;
+    return this.nfc.supported;
   }
 
   async startNfc(): Promise<void> {
     this.error.set(null);
     this.scanning.set(true);
+    this.abortController = new AbortController();
     try {
-      const reader = new (window as unknown as { NDEFReader: new () => NdefReaderLike }).NDEFReader();
-      await reader.scan();
-      reader.onreading = (event) => {
-        const token = extractToken(event);
-        if (token) {
-          this.scanning.set(false);
-          this.capture(token);
-        }
-      };
+      const token = await this.nfc.scan(this.abortController.signal);
+      this.scanning.set(false);
+      this.capture(token);
     } catch {
       this.scanning.set(false);
       this.error.set('Scanarea NFC a eșuat — folosește codul manual sau camera.');
@@ -117,12 +126,13 @@ export class NfcScanComponent implements OnInit {
   }
 
   capture(rawToken: string): void {
-    const token = normalizeToken(rawToken);
+    const token = extractNfcToken([{ payload: rawToken }]) ?? rawToken.trim();
     if (!token) return;
     this.error.set(null);
     this.result.set(null);
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
+    this.geolocation
+      .current({ enableHighAccuracy: true, maximumAge: 5000, timeout: 15000 })
+      .then((pos) => {
         this.api
           .nfcCapture({
             token,
@@ -131,37 +141,15 @@ export class NfcScanComponent implements OnInit {
             accuracy: pos.coords.accuracy,
           })
           .subscribe({
-            next: (res) => this.result.set(res),
-            error: (err) =>
-              this.error.set(err?.error?.detail ?? 'Scanarea a fost respinsă.'),
+            next: (res) => {
+              this.result.set(res);
+              if (res.outcome === 'CONFIRMED') {
+                this.haptics.notify('success');
+              }
+            },
+            error: (err) => this.error.set(err?.error?.detail ?? 'Scanarea a fost respinsă.'),
           });
-      },
-      () => this.error.set('Nu am putut obține locația — activează GPS-ul.'),
-    );
+      })
+      .catch(() => this.error.set('Nu am putut obține locația — activează GPS-ul.'));
   }
-}
-
-interface NdefReaderLike {
-  scan(): Promise<void>;
-  onreading: ((event: NdefReadingEventLike) => void) | null;
-}
-
-interface NdefReadingEventLike {
-  message: { records: { recordType: string; data?: BufferSource }[] };
-}
-
-/** Pull the token out of an NDEF URI record or accept a raw token/URL string. */
-function extractToken(event: NdefReadingEventLike): string | null {
-  for (const record of event.message.records) {
-    if (record.recordType === 'url' && record.data) {
-      const url = new TextDecoder().decode(record.data as ArrayBuffer);
-      return normalizeToken(url);
-    }
-  }
-  return null;
-}
-
-function normalizeToken(value: string): string {
-  const match = /\/nfc\/([^/?#]+)/.exec(value);
-  return (match ? match[1] : value).trim();
 }

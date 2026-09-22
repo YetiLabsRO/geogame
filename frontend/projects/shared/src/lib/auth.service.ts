@@ -1,8 +1,12 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, inject, signal } from '@angular/core';
+import { Capacitor } from '@capacitor/core';
+import { Preferences } from '@capacitor/preferences';
 import { Observable, tap } from 'rxjs';
 
 const STORAGE_KEY = 'cercetador.auth.token';
+/** `@capacitor/preferences` mirror (mobile-app 2.9): survives an evicted WebView `localStorage`. */
+const PREFERENCES_KEY = 'tr.token';
 
 export interface AuthResponse {
   token: string;
@@ -35,6 +39,7 @@ export interface UserProfile {
 @Injectable({ providedIn: 'root' })
 export class AuthService {
   private readonly http = inject(HttpClient);
+  private readonly isNative = Capacitor.isNativePlatform();
 
   private readonly _token = signal<string | null>(this.readToken());
   private readonly _profile = signal<UserProfile | null>(null);
@@ -45,9 +50,9 @@ export class AuthService {
   readonly isStaff = computed(() => this._profile()?.is_staff ?? false);
 
   login(login: string, password: string): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>('/api/auth/login/', { login, password }).pipe(
-      tap((res) => this.storeToken(res.token)),
-    );
+    return this.http
+      .post<AuthResponse>('/api/auth/login/', { login, password })
+      .pipe(tap((res) => this.storeToken(res.token)));
   }
 
   register(payload: {
@@ -57,21 +62,19 @@ export class AuthService {
     first_name?: string;
     last_name?: string;
   }): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>('/api/auth/register/', payload).pipe(
-      tap((res) => this.storeToken(res.token)),
-    );
+    return this.http
+      .post<AuthResponse>('/api/auth/register/', payload)
+      .pipe(tap((res) => this.storeToken(res.token)));
   }
 
   logout(): Observable<void> {
-    return this.http.post<void>('/api/auth/logout/', {}).pipe(
-      tap(() => this.clearToken()),
-    );
+    return this.http.post<void>('/api/auth/logout/', {}).pipe(tap(() => this.clearToken()));
   }
 
   fetchProfile(): Observable<UserProfile> {
-    return this.http.get<UserProfile>('/api/me/').pipe(
-      tap((profile) => this._profile.set(profile)),
-    );
+    return this.http
+      .get<UserProfile>('/api/me/')
+      .pipe(tap((profile) => this._profile.set(profile)));
   }
 
   requestPasswordReset(email: string): Observable<void> {
@@ -90,15 +93,35 @@ export class AuthService {
     this.storeToken(token);
   }
 
+  /**
+   * Native only (mobile-app 2.9): copy a token persisted in Preferences
+   * into `localStorage` when it's empty — an evicted WebView storage
+   * partition would otherwise log the player out. Call once, before
+   * routing, from the app initializer.
+   */
+  async restoreToken(): Promise<void> {
+    if (!this.isNative || this.readToken()) return;
+    const { value } = await Preferences.get({ key: PREFERENCES_KEY });
+    if (value) {
+      this.storeToken(value);
+    }
+  }
+
   private storeToken(token: string): void {
     localStorage.setItem(STORAGE_KEY, token);
     this._token.set(token);
+    if (this.isNative) {
+      void Preferences.set({ key: PREFERENCES_KEY, value: token });
+    }
   }
 
   private clearToken(): void {
     localStorage.removeItem(STORAGE_KEY);
     this._token.set(null);
     this._profile.set(null);
+    if (this.isNative) {
+      void Preferences.remove({ key: PREFERENCES_KEY });
+    }
   }
 
   private readToken(): string | null {

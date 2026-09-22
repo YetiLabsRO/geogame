@@ -3,6 +3,7 @@ import { Observable, Subject, filter, map } from 'rxjs';
 
 import { AuthService } from './auth.service';
 import { SessionScoreboardEntry } from './game-api.service';
+import { PlatformService } from './platform';
 
 /**
  * Realtime websocket client (realtime-and-notifications).
@@ -17,11 +18,11 @@ import { SessionScoreboardEntry } from './game-api.service';
  */
 
 export type RealtimeStatus =
-  | 'idle'          // no connect() yet, or explicitly disconnected
+  | 'idle' // no connect() yet, or explicitly disconnected
   | 'connecting'
   | 'connected'
-  | 'reconnecting'  // socket lost, backoff timer running
-  | 'disabled';     // realtime off for the session / rejected by server
+  | 'reconnecting' // socket lost, backoff timer running
+  | 'disabled'; // realtime off for the session / rejected by server
 
 export interface RealtimeEnvelope<T = unknown> {
   type: string;
@@ -88,6 +89,7 @@ const HEARTBEAT_INTERVAL_MS = 25_000;
 export class RealtimeService {
   private readonly auth = inject(AuthService);
   private readonly zone = inject(NgZone);
+  private readonly platform = inject(PlatformService);
 
   private socket: WebSocket | null = null;
   private sessionId: number | null = null;
@@ -162,10 +164,9 @@ export class RealtimeService {
       return;
     }
     this._status.set(this.attempts === 0 ? 'connecting' : 'reconnecting');
-    const scheme = location.protocol === 'https:' ? 'wss' : 'ws';
+    const { scheme, host } = this.wsOrigin();
     const url =
-      `${scheme}://${location.host}/ws/session/${this.sessionId}/` +
-      `?token=${encodeURIComponent(token)}`;
+      `${scheme}://${host}/ws/session/${this.sessionId}/` + `?token=${encodeURIComponent(token)}`;
     // Run the socket outside Angular so heartbeats/reconnect timers do
     // not hold change detection; re-enter the zone per message.
     this.zone.runOutsideAngular(() => {
@@ -178,6 +179,22 @@ export class RealtimeService {
         // onclose always follows; nothing to do here.
       };
     });
+  }
+
+  /**
+   * mobile-app D3: on native (and whenever a debug origin override is
+   * set) derive `ws(s)://host` from the configured API origin instead of
+   * `location`, which is the opaque Capacitor WebView origin and not the
+   * Django host. Falls back to `location` when no origin is configured
+   * (the ordinary same-origin web deployment / dev proxy).
+   */
+  private wsOrigin(): { scheme: string; host: string } {
+    const base = this.platform.apiBaseUrl();
+    if (base) {
+      const url = new URL(base);
+      return { scheme: url.protocol === 'https:' ? 'wss' : 'ws', host: url.host };
+    }
+    return { scheme: location.protocol === 'https:' ? 'wss' : 'ws', host: location.host };
   }
 
   private onOpen(): void {
@@ -222,10 +239,7 @@ export class RealtimeService {
     }
     // Exponential backoff with jitter, capped.
     this._status.set('reconnecting');
-    const delay = Math.min(
-      MAX_RECONNECT_DELAY_MS,
-      BASE_RECONNECT_DELAY_MS * 2 ** this.attempts,
-    );
+    const delay = Math.min(MAX_RECONNECT_DELAY_MS, BASE_RECONNECT_DELAY_MS * 2 ** this.attempts);
     this.attempts += 1;
     this.reconnectHandle = setTimeout(
       () => {

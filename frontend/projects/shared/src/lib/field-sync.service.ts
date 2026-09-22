@@ -1,6 +1,7 @@
-import { Injectable, computed, inject, signal } from '@angular/core';
+import { Injectable, computed, effect, inject, signal } from '@angular/core';
 import { firstValueFrom } from 'rxjs';
 
+import { NetworkService } from './platform';
 import {
   AttachChallengePayload,
   CreateTowerPayload,
@@ -52,25 +53,26 @@ const STORAGE_KEY = 'cercetador.field-queue.v1';
 @Injectable({ providedIn: 'root' })
 export class FieldSyncService {
   private readonly api = inject(StaffApiService);
+  private readonly network = inject(NetworkService);
 
   readonly items = signal<FieldEdit[]>(this.load());
-  readonly pendingCount = computed(
-    () => this.items().filter((i) => i.status === 'pending').length,
-  );
-  readonly failedCount = computed(
-    () => this.items().filter((i) => i.status === 'failed').length,
-  );
-  readonly online = signal(typeof navigator === 'undefined' || navigator.onLine);
+  readonly pendingCount = computed(() => this.items().filter((i) => i.status === 'pending').length);
+  readonly failedCount = computed(() => this.items().filter((i) => i.status === 'failed').length);
+  /** mobile-app 2.7: sourced from NetworkService (native Network plugin / browser events). */
+  readonly online = this.network.online;
   readonly syncing = signal(false);
 
+  private wasOnline = this.network.online();
+
   constructor() {
-    if (typeof window !== 'undefined') {
-      window.addEventListener('online', () => {
-        this.online.set(true);
-        void this.sync(); // sync-on-reconnect
-      });
-      window.addEventListener('offline', () => this.online.set(false));
-    }
+    // sync-on-reconnect, on both native (Network plugin) and the web.
+    effect(() => {
+      const isOnline = this.network.online();
+      if (isOnline && !this.wasOnline) {
+        void this.sync();
+      }
+      this.wasOnline = isOnline;
+    });
   }
 
   enqueue(
@@ -127,9 +129,7 @@ export class FieldSyncService {
         if (!item) break;
         try {
           await this.replay(item);
-          this.items.update((items) =>
-            items.filter((i) => i.localId !== item.localId),
-          );
+          this.items.update((items) => items.filter((i) => i.localId !== item.localId));
         } catch (err) {
           this.items.update((items) =>
             items.map((i) =>
@@ -154,16 +154,12 @@ export class FieldSyncService {
         );
         // Local-id → server-id remap for queued photos / challenge links.
         this.items.update((items) =>
-          items.map((i) =>
-            i.towerRef === item.localId ? { ...i, towerRef: tower.id } : i,
-          ),
+          items.map((i) => (i.towerRef === item.localId ? { ...i, towerRef: tower.id } : i)),
         );
         break;
       }
       case 'create-zone':
-        await firstValueFrom(
-          this.api.createZone(item.payload as unknown as CreateZonePayload),
-        );
+        await firstValueFrom(this.api.createZone(item.payload as unknown as CreateZonePayload));
         break;
       case 'adjust-zone': {
         const { id, vertices } = item.payload as {
@@ -220,9 +216,7 @@ function describeError(err: unknown): string {
     if (httpError.error) {
       try {
         const body =
-          typeof httpError.error === 'string'
-            ? httpError.error
-            : JSON.stringify(httpError.error);
+          typeof httpError.error === 'string' ? httpError.error : JSON.stringify(httpError.error);
         return body.slice(0, 300);
       } catch {
         // fall through

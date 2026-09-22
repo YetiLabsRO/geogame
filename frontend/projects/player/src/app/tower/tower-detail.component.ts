@@ -9,7 +9,7 @@ import {
 } from '@angular/core';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 
-import { GameApiService, TowerState } from 'shared';
+import { GameApiService, GeolocationService, HapticsService, TowerState } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -89,14 +89,17 @@ interface Position {
           @if (s.tower_lock_mode === 'LOCK_ON_INITIATE') {
             @if (activeLock(); as lock) {
               @if (lock.held_by_us) {
-                <div class="alert alert-success d-flex justify-content-between align-items-center gap-2">
+                <div
+                  class="alert alert-success d-flex justify-content-between align-items-center gap-2"
+                >
                   <div>
                     <div class="fw-semibold">
                       <i class="bi bi-lock-fill"></i> Tower locked to your team
                     </div>
                     <div class="small">
                       Finish within
-                      <strong>{{ formatCountdown(lockRemaining()) }}</strong>.
+                      <strong>{{ formatCountdown(lockRemaining()) }}</strong
+                      >.
                     </div>
                   </div>
                   <button
@@ -138,13 +141,12 @@ interface Position {
               <div class="fw-semibold">Cooloff in effect</div>
               <div class="small">
                 You can try again in
-                <strong>{{ formatCountdown(cooloffRemaining()) }}</strong>.
+                <strong>{{ formatCountdown(cooloffRemaining()) }}</strong
+                >.
               </div>
             </div>
           } @else if (s.pending_submission) {
-            <div class="alert alert-info">
-              A submission is already pending review.
-            </div>
+            <div class="alert alert-info">A submission is already pending review.</div>
           } @else if (s.challenge_hidden) {
             <!-- tower-visibility (challenge axis): HIDDEN_UNTIL_ARRIVAL —
                  the server withholds the challenge until we report a
@@ -154,8 +156,7 @@ interface Position {
                 <i class="bi bi-eye-slash fs-2 d-block mb-2"></i>
                 <div class="fw-semibold">Challenge hidden until arrival</div>
                 <div class="small">
-                  Get within {{ s.proximity_meters }} m of the tower to reveal
-                  the challenge.
+                  Get within {{ s.proximity_meters }} m of the tower to reveal the challenge.
                 </div>
               </div>
             </div>
@@ -198,17 +199,15 @@ interface Position {
                   @if (p.method !== 'PHOTO' && p.present_members < p.required_members) {
                     <div class="small text-danger">
                       <i class="bi bi-exclamation-triangle"></i>
-                      Gather {{ p.required_members - p.present_members }} more
-                      teammate(s) within {{ p.geofence_radius_meters }} m of the
-                      tower (live location must be on).
+                      Gather {{ p.required_members - p.present_members }} more teammate(s) within
+                      {{ p.geofence_radius_meters }} m of the tower (live location must be on).
                     </div>
                   }
                   @if (p.photo_fallback_offered) {
                     <div class="small text-body-secondary">
                       <i class="bi bi-camera"></i>
                       Alternatively, attach a photo showing the
-                      {{ p.required_members }} required member(s) — staff will
-                      review it manually.
+                      {{ p.required_members }} required member(s) — staff will review it manually.
                     </div>
                   }
                 }
@@ -240,8 +239,8 @@ interface Position {
                   } @else {
                     <div class="small text-danger">
                       <i class="bi bi-exclamation-triangle"></i>
-                      Your team is missing: {{ req.missing_roles.join(', ') }}.
-                      Ask staff to assign the role, then try again.
+                      Your team is missing: {{ req.missing_roles.join(', ') }}. Ask staff to assign
+                      the role, then try again.
                     </div>
                   }
                 }
@@ -284,8 +283,8 @@ interface Position {
                     (input)="onCodeInput($event)"
                   />
                   <div class="form-text">
-                    Get the code at the location (QR / NFC handout), then paste
-                    or type it here. It is checked instantly.
+                    Get the code at the location (QR / NFC handout), then paste or type it here. It
+                    is checked instantly.
                   </div>
                 </div>
               } @else {
@@ -360,6 +359,8 @@ export class TowerDetailComponent implements OnInit {
   private readonly route = inject(ActivatedRoute);
   private readonly router = inject(Router);
   private readonly api = inject(GameApiService);
+  private readonly geolocation = inject(GeolocationService);
+  private readonly haptics = inject(HapticsService);
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly state = signal<TowerState | null>(null);
@@ -379,12 +380,8 @@ export class TowerDetailComponent implements OnInit {
   protected readonly requiredPayload = computed(
     () => this.state()?.next_challenge?.required_payload ?? [],
   );
-  protected readonly needsCode = computed(() =>
-    this.requiredPayload().includes('submitted_code'),
-  );
-  protected readonly needsPhoto = computed(() =>
-    this.requiredPayload().includes('photo'),
-  );
+  protected readonly needsCode = computed(() => this.requiredPayload().includes('submitted_code'));
+  protected readonly needsPhoto = computed(() => this.requiredPayload().includes('photo'));
   protected readonly isAuto = computed(
     () => this.state()?.next_challenge?.effective_review_mode === 'AUTO',
   );
@@ -452,9 +449,7 @@ export class TowerDetailComponent implements OnInit {
   protected readonly mustInitiate = computed(() => {
     const s = this.state();
     return (
-      !!s &&
-      s.tower_lock_mode === 'LOCK_ON_INITIATE' &&
-      !(this.activeLock()?.held_by_us ?? false)
+      !!s && s.tower_lock_mode === 'LOCK_ON_INITIATE' && !(this.activeLock()?.held_by_us ?? false)
     );
   });
 
@@ -474,7 +469,7 @@ export class TowerDetailComponent implements OnInit {
     );
   });
 
-  private watchId: number | null = null;
+  private watchId: string | null = null;
   private tickHandle: ReturnType<typeof setInterval> | null = null;
   private presenceHandle: ReturnType<typeof setInterval> | null = null;
 
@@ -497,7 +492,7 @@ export class TowerDetailComponent implements OnInit {
     }, 10_000);
     this.destroyRef.onDestroy(() => {
       if (this.watchId !== null) {
-        navigator.geolocation.clearWatch(this.watchId);
+        this.geolocation.clearWatch(this.watchId);
       }
       if (this.tickHandle) {
         clearInterval(this.tickHandle);
@@ -520,11 +515,7 @@ export class TowerDetailComponent implements OnInit {
   }
 
   private startGeolocation(): void {
-    if (!('geolocation' in navigator)) {
-      this.locationError.set('Geolocation is not available.');
-      return;
-    }
-    this.watchId = navigator.geolocation.watchPosition(
+    this.watchId = this.geolocation.watch(
       (pos) => {
         this.locationError.set(null);
         this.position.set({
@@ -540,7 +531,8 @@ export class TowerDetailComponent implements OnInit {
         }
       },
       (err) => {
-        this.locationError.set(err.message || 'Could not determine your location.');
+        const message = err instanceof Error ? err.message : undefined;
+        this.locationError.set(message || 'Could not determine your location.');
       },
       { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 },
     );
@@ -626,9 +618,7 @@ export class TowerDetailComponent implements OnInit {
         lat: pos.lat,
         lng: pos.lng,
         photo: this.photoDataUrl() ?? undefined,
-        submitted_code: this.needsCode()
-          ? this.codeValue().trim()
-          : undefined,
+        submitted_code: this.needsCode() ? this.codeValue().trim() : undefined,
       })
       .subscribe({
         next: (created) => {
@@ -636,6 +626,9 @@ export class TowerDetailComponent implements OnInit {
           // AUTO types resolve immediately — surface the outcome now;
           // MANUAL types come back PENDING (0) as before.
           this.submitOutcome.set(created.outcome);
+          if (created.outcome === 1) {
+            this.haptics.notify('success');
+          }
           this.photoDataUrl.set(null);
           this.photoName.set(null);
           this.codeValue.set('');
@@ -660,12 +653,7 @@ export class TowerDetailComponent implements OnInit {
   }
 }
 
-function haversineMeters(
-  lat1: number,
-  lng1: number,
-  lat2: number,
-  lng2: number,
-): number {
+function haversineMeters(lat1: number, lng1: number, lat2: number, lng2: number): number {
   const R = 6_371_000;
   const toRad = (d: number) => (d * Math.PI) / 180;
   const dLat = toRad(lat2 - lat1);
