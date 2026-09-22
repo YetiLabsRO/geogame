@@ -1,0 +1,81 @@
+## Context
+
+The player app (`frontend/projects/player`) is an Angular 21 standalone-component SPA that talks to the Django/DRF backend with relative URLs and a `Token` header, opens a session-scoped websocket, and reaches device features straight through browser APIs: `navigator.geolocation` (map, tower detail, location stream, NFC scan), `NDEFReader` (NFC), `PushManager` + `push-sw.js` (Web Push), `navigator.wakeLock` (Dementors). The UI is stock Bootstrap 5 (`navbar`, `btn`, `card`, `progress`…). The `shared` library holds services (`AuthService`, `tokenInterceptor`, `GameApiService`, `RealtimeService`, `FieldSyncService`, …) and one component (`QrCodeComponent`).
+
+Several accepted changes assume a native shell without building one: `nfc-capture` ("a native-shell NFC bridge otherwise"), `live-location` (streaming that survives the screen turning off), `ble-proximity`/`mode-dementors` ("the real advertise/scan loop lives in the native app"), and `push-notifications` (stores `FCM` subscriptions but only Web Push is sent). The Figma file `H3Q06F3tcrCNKO2MPYzrpC` holds the "old-world explorer" design system (variable collections `Primitives`/`Scale`/`Color` with Light + Dark modes, 13 text styles, 5 effect styles, components Button/Chip/Input/Card/StatTile/ProgressMeter/Avatar/TopAppBar/BottomNav + a 16-icon set) and the Tower Challenge screen in both themes; all variables carry WEB code syntax (`var(--color-brand-primary)` etc.), so they translate 1:1 into CSS custom properties.
+
+Constraints: one Angular codebase must keep serving the web app (dev proxy on :4500 → Django :8200) and the native builds; iOS cannot be built from the WSL dev box (Android SDK is available there and on Windows); Firebase credentials and signing keys are not in the repo; backend contracts (`/api/…`, `/ws/session/<id>/`, `/api/push/subscriptions/`, `/api/nfc/capture/`, `/api/proximity/*`) do not change.
+
+## Goals / Non-Goals
+
+**Goals:**
+- Ship the player app as an Android and iOS app from the existing Angular code with Capacitor 8, keeping the web build fully working.
+- Put every device capability behind a small platform layer in `shared` so screens never branch on `Capacitor` themselves and the web path stays the fallback.
+- Make native push (FCM), native NFC (iOS + Android), background location, haptics and keep-awake work end to end, including the backend FCM sender and app-link verification files.
+- Port the Figma design system to `shared` as CSS custom properties + Angular components, and rebuild the player app around the Journey / Society / Chronicle / Ledger shell in light and dark themes.
+- Leave an Android debug APK build verified from this repo, and a runbook for the pieces that need external accounts (Firebase, Play/App Store, Apple signing).
+
+**Non-Goals:**
+- Restyling the staff app (it may adopt the shared components later; nothing here forces it).
+- Over-the-air/live updates (Capgo etc.), store listing assets, or CI jobs that build native artifacts.
+- Changing any backend gameplay contract, model, or migration.
+- iOS BLE advertising verification (Swift is written but cannot be compiled here) and the real-park BLE pilot, which belong to `mode-dementors-ble`.
+
+## Decisions
+
+**D1 — Capacitor 8 around the existing Angular project, not Ionic and not a rewrite.** Capacitor wraps the built `dist/player/browser` in a WebView with a typed plugin bridge; we keep Angular routing, signals and our own components. Ionic Framework was rejected because the design system is bespoke and Ionic's components would fight it; React Native/Flutter were rejected because they discard the working SPA. Native projects (`frontend/android`, `frontend/ios`) are generated once and committed, as Capacitor recommends, so manifest/entitlement edits are reviewable.
+
+**D2 — App identity and origins.** `appId: 'ro.yetilabs.geogame'`, `appName: 'Tower Rush'`, `webDir: 'dist/player/browser'`. Android serves the app from `https://localhost` (Capacitor default scheme), iOS from `capacitor://localhost` (iOS forbids http(s) custom schemes). These two origins are what CORS and the websocket must accept.
+
+**D3 — Runtime API origin instead of relative URLs.** Add `APP_CONFIG` (`InjectionToken<AppConfig>`) in `shared` with `apiBaseUrl` (web: `''`, i.e. same-origin/proxy) and `nativeApiBaseUrl` (dev: `http://10.0.2.2:8200` for the Android emulator, prod: `https://cercetador.albascout.ro`, via Angular `fileReplacements` on `environment.ts`/`environment.prod.ts`). `PlatformService.apiBaseUrl()` resolves the effective origin: `nativeApiBaseUrl` when `Capacitor.isNativePlatform()`, else `apiBaseUrl`; a debug-only override persisted in `@capacitor/preferences` lets a tester point a dev build at a LAN server without rebuilding. A new `apiBaseInterceptor` (registered before `tokenInterceptor`) prefixes requests whose URL starts with `/`; `RealtimeService` derives `ws(s)://` from the same origin instead of `location.host`; a `mediaUrl()` helper prefixes relative `/media/` paths in templates. Alternative considered: baking absolute URLs into every service — rejected, it touches every call site and breaks the dev proxy.
+
+**D4 — Platform layer in `shared/src/lib/platform/`.** One service per concern, each exposing the same API on web and native, choosing the implementation with `Capacitor.isNativePlatform()`/`getPlatform()`:
+- `PlatformService`: `isNative`, `platform` (`'web' | 'android' | 'ios'`), `apiBaseUrl()`, `mediaUrl()`.
+- `GeolocationService`: `current()` / `watch()` returning the browser `GeolocationPosition` shape from `@capacitor/geolocation` on native and `navigator.geolocation` on the web; handles permission prompts.
+- `BackgroundLocationService`: native only, wraps `@capacitor-community/background-geolocation` (`addWatcher` with `backgroundTitle/backgroundMessage`, `distanceFilter`, `stale` filtering); `LocationStreamService` uses it when native and tracking is on, throttling watcher fixes to the Session's `ping_interval_seconds`; the web path keeps the foreground timer.
+- `PushBridge`: `supported`, `permission`, `enable()`, `disable()`; the web strategy is today's `PushService` logic (service worker + VAPID), the native strategy calls `PushNotifications.requestPermissions()/register()` and posts `{ fcm_token }` on `registration`, listens for `pushNotificationReceived` (in-app toast) and `pushNotificationActionPerformed` (route to the payload's `url`). The player `PushService` becomes a thin facade over the bridge.
+- `NfcService`: `supported`, `scan(): Promise<string>` resolving to the tag token — web via `NDEFReader`, native via `@exxili/capacitor-nfc` (maintained, Capacitor 6–8, iOS + Android NDEF read); token extraction (URI record `…/nfc/<token>` or custom-scheme record) is shared so the backend sees the same token from every transport.
+- `HapticsService`: `impact(style)`, `notify(type)` — `@capacitor/haptics` native, `navigator.vibrate` web.
+- `KeepAwakeService`: `@capacitor-community/keep-awake` native, `navigator.wakeLock` web.
+- `NetworkService`: `online` signal from `@capacitor/network` or `navigator.onLine`; `FieldSyncService` flushes its queue on reconnect.
+- `DeepLinkService`: `App.addListener('appUrlOpen')` → strips the origin/custom scheme and `router.navigateByUrl(path)` (`/nfc/<token>`, `/join/<code>`, `/invite/<token>`); Android hardware back → `Location.back()` or `App.exitApp()` at a tab root.
+- `TokenStorage`: `AuthService` keeps the synchronous `localStorage` cache and mirrors the token into `@capacitor/preferences` on native; an `APP_INITIALIZER` restores it before routing so an evicted WebView store does not log the player out.
+- `BleProximityService` (`BleProximityBridge` interface): `capable()`, `startAdvertising(token)`, `stopAdvertising()`, `startScan(onSeen)`, `stopScan()`. Scanning uses `@capacitor-community/bluetooth-le` (`requestLEScan` filtered on a fixed 128-bit service UUID, token carried in service data). No maintained Capacitor plugin advertises, so a small local plugin `BleAdvertiser` (Android `BluetoothLeAdvertiser`, iOS `CBPeripheralManager`) lives in the native projects; Android is compile-verified here, iOS is written but unverified. The web implementation reports `capable() === false` and the Dementors screen keeps its simulator panel.
+
+**D5 — FCM on the backend through Firebase Admin.** Add `FcmPushSender` (`firebase-admin`, HTTP v1) that maps the existing payload dict to `messaging.Message(token, notification, data{str→str}, android priority high, apns content-available)`; `UnregisteredError`/`SenderIdMismatchError` raise `SubscriptionGone` (subscription pruned, mirroring 404/410 for Web Push), everything else `PushSendError`. A `DispatchingPushSender` routes by `subscription.kind`; `get_sender()` builds it from what is configured: VAPID → `WebPushSender`, `FCM_CREDENTIALS_FILE` (or `GOOGLE_APPLICATION_CREDENTIALS`) → `FcmPushSender`, otherwise `LoggingPushSender` per kind. Tests patch `firebase_admin.messaging.send`; no network in CI. Raw HTTP v1 with `google-auth` was considered to avoid the SDK's weight — rejected, the SDK's typed error classes are exactly what subscription hygiene needs.
+
+**D6 — CORS and websocket origins.** Add `django-cors-headers` with `CORS_ALLOWED_ORIGINS` = the two native origins plus anything in the `CORS_EXTRA_ORIGINS` env var; credentials are not needed (header token auth). The Channels stack already runs `TokenAuthMiddleware(URLRouter(...))` without an origin validator, so native websocket connections work unchanged; this is recorded, not altered.
+
+**D7 — App links served by Django.** `GET /.well-known/assetlinks.json` and `GET /.well-known/apple-app-site-association` (JSON, no extension, `application/json`) are rendered from `settings.MOBILE_APP_LINKS` (`android_package`, `android_sha256_fingerprints`, `apple_app_id`, `paths = ['/nfc/*', '/join/*', '/invite/*']`), defaulting to the package id with empty fingerprints so the endpoints exist before signing keys do. The Android manifest gets an `autoVerify` intent filter for `https://cercetador.albascout.ro` on those paths plus the existing `cercetador://` custom scheme; iOS gets the Associated Domains entitlement in the runbook. Existing behaviour of `/nfc/<token>/` (inert web page, no capture) is unchanged.
+
+**D8 — Design system as CSS custom properties + standalone components.** `shared/src/lib/theme/`: `tokens.scss` defines the Light palette on `:root`, the Dark palette under `@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) }` and `:root[data-theme="dark"]` (manual override stored in `localStorage`, default "system"), spacing (`--spacing-2xs..xl`), radii (`--radius-md/lg/xl/full`), elevation (`--elevation-card`, `--elevation-brand-glow`), type styles (`--font-display: 'Playfair Display Variable'`, `--font-ui: 'Plus Jakarta Sans Variable'`, size/line-height/letter-spacing tokens for H1–H3, Body/Large, Body/Italic, Label/Eyebrow, Label/Field, Button/Label, Button/Serif, Meta/Tiny) and the runtime `--team-color` slot. Fonts are self-hosted via `@fontsource-variable/*` (no CDN, works offline in the WebView). Components live in `shared/src/lib/ui/` with the `ui-` selector prefix, `OnPush`, `input()`/`output()`, host-class variants, and only token-driven SCSS: `ui-button` (primary/secondary/tinted, sm/md/lg, icon slot, loading, block), `ui-chip` (brand/solid/slate/neutral + `[teamColor]`), `ui-field` + `uiInput` directive (label, help, error), `ui-card`, `ui-stat-tile`, `ui-progress-meter`, `ui-avatar`, `ui-top-app-bar`, `ui-bottom-nav` (items with icon/label/route, active state, safe-area padding), `ui-icon` (inline SVG sprite of the 16 Figma icons), plus `ui-toast` and `ui-empty-state` which the screens need. Bootstrap is reduced to `bootstrap-grid` + utilities SCSS in the player; `bootstrap.bundle.min.js` and all component classes are removed from the player build. The staff app keeps full Bootstrap. The reference palette in `docs/design-prompts.md` (brass/gold) is superseded by the Figma tokens (sienna) — the Figma file is the source of truth.
+
+**D9 — Player shell and routes.** `app.html` becomes `<ui-top-app-bar>` (current session name, avatar → Ledger) + `<main>` + `<ui-bottom-nav>` with Journey (`/`), Society (`/team`), Chronicle (`/history`), Ledger (`/ledger`, new: live scoreboard from `RealtimeService`, my team's locked + floating score, quick links to Dementors, Trail, Rules, notification/location settings, sign out). The nav hides on auth routes and the session picker. Existing paths stay valid (QR codes, invites and app links point at them); `/journey`, `/society`, `/chronicle` are added as redirects. The map is full-bleed under the app bar with a floating "Scan tag" action; tower detail follows the Figma Tower Challenge (Trial) screen (distance readout + `ui-progress-meter`, out-of-range disabled submit, photo capture, cooldown ring). Safe areas use `env(safe-area-inset-*)` with `viewport-fit=cover`; the native status bar colour follows the theme through `@capacitor/status-bar`.
+
+**D10 — Build pipeline.** npm scripts: `build:player` (web), `cap:sync` (`ng build player --configuration production && cap sync`), `cap:android` / `cap:ios` (open), `android:debug` (`gradlew assembleDebug`). `frontend/android/local.properties` and `google-services.json` are gitignored; `google-services.json.example` and `docs/mobile.md` explain Firebase, signing, App Links verification (`adb shell pm verify-app-links`) and the macOS steps for iOS (`pod install`, Associated Domains, APNs key upload to Firebase). App icon and splash are generated from an SVG castle mark on the sienna brand colour with `@capacitor/assets`.
+
+## Risks / Trade-offs
+
+- [Web Push and FCM diverge in payload handling] → one payload dict on the backend; the native strategy reads `data.url` for routing, the service worker keeps reading the same keys.
+- [Background location drains battery and needs an Android foreground service + iOS "Always" permission] → the watcher only runs while the Session has tracking on and consent is granted, honours `ping_interval_seconds`, and the runbook lists the Play/App Store declarations required.
+- [`@exxili/capacitor-nfc` is young (0.0.x)] → the NFC bridge is an interface; Web NFC and the QR/manual fallback remain, and swapping the plugin touches one file.
+- [No maintained BLE advertising plugin] → local plugin with Android verified; iOS advertising is explicitly unverified and the Dementors pilot in `mode-dementors-ble` gates general availability.
+- [Design port changes every player screen at once] → tokens and components land first with a visual gallery route in dev; screens migrate tab by tab and the web build is checked at each step; old routes never break.
+- [iOS cannot be built or signed here] → scaffold committed, all iOS-only steps in the runbook; Android is the verified target for this change.
+- [Firebase credentials absent in dev/CI] → the sender is chosen at runtime; without credentials FCM subscriptions log instead of send, exactly as today.
+- [Capacitor `https://localhost` origin collides with a developer's local https server] → CORS list is explicit and the debug API override lets testers point at any host.
+
+## Migration Plan
+
+1. Backend first (additive, safe to deploy alone): CORS, `.well-known` views, FCM sender, new settings with safe defaults; run tests + ruff.
+2. Shared platform layer + `APP_CONFIG` + interceptors; web build verified unchanged.
+3. Design tokens + components (gallery route in dev builds); then shell + tab migration screen by screen; web build and Playwright smoke at each step.
+4. Capacitor init, plugins, Android project, manifest/permissions, local BLE advertiser; `cap sync`; `gradlew assembleDebug` verified.
+5. iOS scaffold + runbook.
+Rollback: the web build is unaffected by the native projects; reverting the shell branch restores the Bootstrap UI; backend pieces are settings-gated and default off.
+
+## Open Questions
+
+- Display name "Tower Rush" vs "Cercetador" for the store listing (one line in `capacitor.config.ts`).
+- Whether Android should keep Web Push for the PWA case or always use FCM (design uses FCM on native, Web Push on web).
+- Signing key custody and the Apple Team ID — needed before App Links verification and any store upload; not blocking this change.
