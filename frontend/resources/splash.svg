@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="2732" height="2732" viewBox="0 0 2732 2732">
+  <!--
+    Tower Rush splash screen (light theme): parchment background, sienna castle mark
+    centred at ~400px tall. See icon.svg for the source of the castle path; render.mjs
+    reproduces it for the dark-theme variant (splash-dark.png).
+  -->
+  <rect width="2732" height="2732" fill="#fcf9f2" />
+  <g transform="translate(1181.4,1166) scale(3.0769)">
+    <path
+      fill="#974400"
+      fill-rule="evenodd"
+      d="M0,130 L0,30 L9,30 L9,0 L37,0 L37,30 L46,30 L46,0 L74,0 L74,30 L83,30 L83,0 L111,0 L111,30 L120,30 L120,130 Z
+         M42,130 L42,70 A18,18 0 0 1 78,70 L78,130 Z"
+    />
+  </g>
+</svg>

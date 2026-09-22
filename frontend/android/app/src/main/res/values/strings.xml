@@ -1,0 +1,10 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">Tower Rush</string>
+    <string name="title_activity_main">Tower Rush</string>
+    <string name="package_name">ro.yetilabs.geogame</string>
+    <string name="custom_url_scheme">ro.yetilabs.geogame</string>
+
+    <!-- @capacitor-community/background-geolocation: foreground-service notification -->
+    <string name="capacitor_background_geolocation_notification_channel_name">Tower Rush location</string>
+</resources>

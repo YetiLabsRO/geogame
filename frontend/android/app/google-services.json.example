@@ -1,0 +1,30 @@
+{
+  "_comment": "Placeholder only. Download the real google-services.json from the Firebase console (Project settings > Your apps > Android app ro.yetilabs.geogame) and save it as android/app/google-services.json (gitignored). See docs/mobile.md.",
+  "project_info": {
+    "project_number": "000000000000",
+    "project_id": "REPLACE_ME",
+    "storage_bucket": "REPLACE_ME.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:000000000000:android:0000000000000000000000",
+        "android_client_info": {
+          "package_name": "ro.yetilabs.geogame"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "REPLACE_ME"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!--
+    Tower Rush app icon: sienna background, white castle mark (keep + three merlons,
+    arched doorway) centred. Rendered to PNG sources for @capacitor/assets by
+    resources/render.mjs, which reproduces this same castle path at other sizes/colors
+    (icon-foreground.png, icon-background.png, splash.png, splash-dark.png) — keep the
+    path data in sync if this shape changes.
+  -->
+  <rect width="1024" height="1024" rx="180" ry="180" fill="#974400" />
+  <g transform="translate(253.5,232) scale(4.31)">
+    <path
+      fill="#ffffff"
+      fill-rule="evenodd"
+      d="M0,130 L0,30 L9,30 L9,0 L37,0 L37,30 L46,30 L46,0 L74,0 L74,30 L83,30 L83,0 L111,0 L111,30 L120,30 L120,130 Z
+         M42,130 L42,70 A18,18 0 0 1 78,70 L78,130 Z"
+    />
+  </g>
+</svg>

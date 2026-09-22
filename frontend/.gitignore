@@ -42,3 +42,23 @@ __screenshots__/
 # System files
 .DS_Store
 Thumbs.db
+
+# Capacitor native projects (mobile-app): machine-local config, build output and
+# secrets that must never be committed. android/.gitignore and ios/.gitignore (generated
+# by `cap add`) cover most build output within their own subtree already; these are listed
+# here too per Capacitor's own recommendation to keep them explicit at the project root.
+android/local.properties
+android/app/google-services.json
+android/.gradle/
+android/build/
+android/app/build/
+android/capacitor-cordova-android-plugins/build/
+ios/App/Pods/
+ios/App/App/public/
+ios/App/App/capacitor.config.json
+ios/App/App/config.xml
+ios/App/App/GoogleService-Info.plist
+android/app/src/main/assets/public/
+android/app/src/main/assets/capacitor.config.json
+android/app/src/main/assets/capacitor.plugins.json
+android/app/src/main/res/xml/config.xml
