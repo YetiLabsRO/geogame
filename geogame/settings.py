@@ -125,7 +125,6 @@ WEBPUSH_VAPID_PRIVATE_KEY = os.environ.get('WEBPUSH_VAPID_PRIVATE_KEY', '')
 WEBPUSH_VAPID_CLAIMS_EMAIL = os.environ.get(
     'WEBPUSH_VAPID_CLAIMS_EMAIL', 'noreply@cercetador.albascout.ro',
 )
-FCM_SERVER_KEY = os.environ.get('FCM_SERVER_KEY', '')
 # Path to a Firebase service-account JSON file (HTTP v1 credentials for
 # FcmPushSender, organize/push.py). Falls back to GOOGLE_APPLICATION_CREDENTIALS
 # (the firebase-admin SDK default) when unset.
