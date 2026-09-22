@@ -2,7 +2,15 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 
-import { AuthService } from 'shared';
+import {
+  AuthService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+} from 'shared';
 
 import { extractErrorMessage } from './form-error';
 
@@ -10,55 +18,112 @@ import { extractErrorMessage } from './form-error';
   selector: 'app-login',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, RouterLink],
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-6 col-lg-5">
-        <h1 class="h3 mb-4">Sign in</h1>
-        <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
-          <div class="mb-3">
-            <label class="form-label" for="login">Username or email</label>
-            <input
-              id="login"
-              type="text"
-              class="form-control"
-              formControlName="login"
-              autocomplete="username"
-            />
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              class="form-control"
-              formControlName="password"
-              autocomplete="current-password"
-            />
-          </div>
+    <div class="auth-page">
+      <div class="auth-page__brand">
+        <span class="auth-page__mark"><ui-icon name="compass" [size]="17" /></span>
+        <span class="tr-eyebrow auth-page__eyebrow">Tower Rush</span>
+      </div>
+      <h1 class="tr-h1 auth-page__title">Begin your journey</h1>
+
+      <ui-card class="auth-page__card">
+        <form [formGroup]="form" (ngSubmit)="submit()" novalidate class="auth-page__form">
+          <ui-field label="Username or email" icon="key">
+            <input uiInput type="text" formControlName="login" autocomplete="username" />
+          </ui-field>
+          <ui-field label="Password">
+            <input uiInput type="password" formControlName="password" autocomplete="current-password" />
+          </ui-field>
 
           @if (errorMessage(); as msg) {
-            <div class="alert alert-danger py-2">{{ msg }}</div>
+            <ui-alert tone="danger">{{ msg }}</ui-alert>
           }
 
-          <button
+          <ui-button
             type="submit"
-            class="btn btn-primary w-100"
+            [block]="true"
+            [loading]="pending()"
             [disabled]="form.invalid || pending()"
           >
-            @if (pending()) {
-              <span class="spinner-border spinner-border-sm me-2"></span>
-            }
             Sign in
-          </button>
+          </ui-button>
         </form>
+      </ui-card>
 
-        <div class="mt-3 d-flex justify-content-between small">
-          <a routerLink="/reset">Forgot your password?</a>
-          <a routerLink="/register">Create an account</a>
-        </div>
+      <div class="auth-page__links">
+        <a routerLink="/reset" class="tr-button-label auth-page__link">Forgot password?</a>
+        <a routerLink="/register" class="tr-button-label auth-page__link">Create an account</a>
       </div>
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .auth-page {
+      box-sizing: border-box;
+      display: flex;
+      min-height: 100dvh;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-md);
+      padding: var(--spacing-3xl) var(--spacing-xl) var(--spacing-xl);
+      background: var(--color-bg-canvas);
+    }
+    .auth-page__brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .auth-page__mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: var(--radius-full);
+      background: var(--color-brand-primary);
+      color: var(--color-text-onBrand);
+    }
+    .auth-page__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .auth-page__title {
+      color: var(--color-text-primary);
+      text-align: center;
+    }
+    .auth-page__card {
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 400px;
+    }
+    .auth-page__form {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+    .auth-page__links {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-sm);
+      margin-top: var(--spacing-sm);
+    }
+    .auth-page__link {
+      color: var(--color-brand-onSurface);
+      text-decoration: none;
+    }
   `,
 })
 export class LoginComponent {

@@ -18,6 +18,12 @@ import {
   ScoreboardUpdatedPayload,
   SessionScoreboard,
   SessionTimeline,
+  UiAlertComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiIconComponent,
+  UiSpinnerComponent,
+  UiStatTileComponent,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -31,128 +37,273 @@ const FALLBACK_POLL_MS = 30_000;
   selector: 'app-session-detail',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, RouterLink],
+  imports: [
+    DatePipe,
+    RouterLink,
+    UiAlertComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiIconComponent,
+    UiSpinnerComponent,
+    UiStatTileComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-9">
-        <a routerLink="/history" class="small text-body-secondary">
-          &larr; Back to my sessions
-        </a>
+    <div class="session-detail">
+      <a routerLink="/history" class="tr-button-label session-detail__back">&larr; Back to Chronicle</a>
 
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger mt-3">{{ msg }}</div>
-        } @else if (scoreboard(); as sb) {
-          <h1 class="h3 mt-2 mb-1">{{ sb.session.name }}</h1>
-          <div class="text-body-secondary small mb-3">
-            {{ sb.session.game.name }} · <code>{{ sb.session.slug }}</code>
-            @if (!sb.session.is_active) {
-              <span class="badge text-bg-secondary ms-2">Past</span>
-            } @else {
-              <span class="badge text-bg-success ms-2">Active</span>
-              @if (realtime.connected()) {
-                <span class="text-success ms-2">
-                  <i class="bi bi-broadcast"></i> Live
-                </span>
-              }
+      @if (loadError(); as msg) {
+        <ui-alert tone="danger">{{ msg }}</ui-alert>
+      } @else if (scoreboard(); as sb) {
+        <span class="tr-eyebrow session-detail__eyebrow">{{ sb.session.game.name }}</span>
+        <h1 class="tr-h1 session-detail__title">{{ sb.session.name }}</h1>
+        <div class="session-detail__meta">
+          <span class="tr-meta-tiny session-detail__dates">
+            {{ sb.session.start_time | date: 'medium' }} – {{ sb.session.end_time | date: 'medium' }}
+          </span>
+          <ui-chip [tone]="sb.session.is_active ? 'brand' : 'neutral'">
+            {{ sb.session.is_active ? 'Active' : 'Past' }}
+          </ui-chip>
+          @if (sb.session.is_active && realtime.connected()) {
+            <ui-chip tone="solid" icon="sparkle">Live</ui-chip>
+          }
+        </div>
+
+        <div class="session-detail__stats">
+          <ui-stat-tile icon="users" label="Teams" [value]="sb.entries.length" />
+          <ui-stat-tile
+            icon="star"
+            label="Top score"
+            [value]="sb.entries.length > 0 ? sb.entries[0].current_score : 0"
+          />
+          <ui-stat-tile icon="target" label="Captures" [value]="timeline() ? timeline()!.events.length : 0" />
+        </div>
+
+        @if (sb.active_multipliers.length > 0) {
+          <div class="session-detail__boosts">
+            @for (b of sb.active_multipliers; track b.id) {
+              <ui-chip tone="brand" icon="sparkle">×{{ b.factor }} {{ boostTarget(b) }}</ui-chip>
             }
           </div>
+        }
 
-          <h2 class="h5 mt-4 mb-2">Scoreboard</h2>
-          @if (sb.active_multipliers.length > 0) {
-            <div class="mb-2">
-              @for (b of sb.active_multipliers; track b.id) {
-                <span class="badge text-bg-warning me-1">
-                  <i class="bi bi-lightning-charge-fill"></i>
-                  &times;{{ b.factor }} points {{ boostTarget(b) }}
-                </span>
-              }
+        <h2 class="tr-h3 session-detail__section">Standings</h2>
+        <div class="session-detail__standings">
+          @for (e of sb.entries; track e.team_id; let i = $index) {
+            <div class="standings-row" [class.standings-row--highlight]="movedUp().has(e.team_id)">
+              <ui-card class="standings-row__card">
+                <div class="standings-row__content">
+                  <span class="standings-row__rank tr-h3">{{ i + 1 }}</span>
+                  <div class="standings-row__info">
+                    <div class="standings-row__name-line">
+                      <span class="standings-row__dot" [style.background]="e.team_color"></span>
+                      <span class="tr-h3 standings-row__name">{{ e.team_name }}</span>
+                      @if (movedUp().has(e.team_id)) {
+                        <ui-icon name="arrow-right" [size]="16" class="standings-row__up" />
+                      }
+                    </div>
+                    @if (e.group_name) {
+                      <ui-chip tone="slate">{{ e.group_name }}</ui-chip>
+                    }
+                  </div>
+                  <div class="standings-row__score">
+                    <span class="tr-h3">{{ e.current_score }}</span>
+                    <span class="tr-eyebrow">points</span>
+                  </div>
+                </div>
+              </ui-card>
             </div>
           }
-          <div class="table-responsive">
-            <table class="table">
-              <thead>
-                <tr>
-                  <th style="width: 3rem">#</th>
-                  <th>Team</th>
-                  <th class="text-end">Score</th>
-                </tr>
-              </thead>
-              <tbody>
-                @for (e of sb.entries; track e.team_id; let i = $index) {
-                  <tr [class.table-success]="movedUp().has(e.team_id)">
-                    <td class="fw-semibold">
-                      {{ i + 1 }}
-                      @if (movedUp().has(e.team_id)) {
-                        <i class="bi bi-arrow-up-short text-success"></i>
-                      }
-                    </td>
-                    <td>
-                      <span
-                        class="d-inline-block me-2"
-                        style="width: 0.9rem; height: 0.9rem; border-radius: 50%; vertical-align: middle"
-                        [style.background-color]="e.team_color"
-                      ></span>
-                      <span class="fw-semibold">{{ e.team_name }}</span>
-                    </td>
-                    <td class="text-end fw-semibold">{{ e.current_score }}</td>
-                  </tr>
-                }
-              </tbody>
-            </table>
-          </div>
+        </div>
 
-          <h2 class="h5 mt-4 mb-2">Ownership timeline</h2>
+        <ui-card eyebrow="Ownership" title="Latest log" class="session-detail__log">
           @if (timeline(); as tl) {
             @if (tl.events.length === 0) {
-              <div class="alert alert-info">No tower captures recorded.</div>
+              <p class="tr-body">No tower captures recorded.</p>
             } @else {
-              <div class="table-responsive">
-                <table class="table">
-                  <thead>
-                    <tr>
-                      <th>Team</th>
-                      <th>Tower</th>
-                      <th>Captured</th>
-                      <th>Released</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    @for (ev of tl.events; track ev.id) {
-                      <tr>
-                        <td>
-                          <span
-                            class="d-inline-block me-2"
-                            style="width: 0.8rem; height: 0.8rem; border-radius: 50%; vertical-align: middle"
-                            [style.background-color]="ev.team_color"
-                          ></span>
-                          {{ ev.team_name }}
-                        </td>
-                        <td>{{ ev.tower_name }}</td>
-                        <td class="small text-body-secondary">
-                          {{ ev.timestamp_start | date: 'medium' }}
-                        </td>
-                        <td class="small text-body-secondary">
-                          @if (ev.timestamp_end; as ended) {
-                            {{ ended | date: 'medium' }}
-                          } @else {
-                            <em>still held</em>
-                          }
-                        </td>
-                      </tr>
-                    }
-                  </tbody>
-                </table>
+              <div class="timeline-list">
+                @for (ev of tl.events; track ev.id) {
+                  <div class="timeline-list__item">
+                    <span class="timeline-list__dot" [style.background]="ev.team_color"></span>
+                    <div class="timeline-list__body">
+                      <span class="tr-meta-tiny timeline-list__time">
+                        {{ ev.timestamp_start | date: 'short' }}
+                      </span>
+                      <p class="tr-body-italic timeline-list__text">
+                        {{ ev.team_name }} captured {{ ev.tower_name }}
+                        @if (ev.timestamp_end; as ended) {
+                          — released {{ ended | date: 'short' }}
+                        } @else {
+                          — still held
+                        }
+                      </p>
+                    </div>
+                  </div>
+                }
               </div>
             }
           }
-        } @else {
-          <div class="d-flex align-items-center text-body-secondary mt-4">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading session…
-          </div>
-        }
-      </div>
+        </ui-card>
+      } @else {
+        <div class="session-detail__loading">
+          <ui-spinner [size]="20" />
+          <span class="tr-body">Loading session…</span>
+        </div>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .session-detail {
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+      padding: var(--spacing-xl) var(--spacing-xl) var(--spacing-2xl);
+      max-width: 640px;
+      margin: 0 auto;
+    }
+    .session-detail__back {
+      align-self: flex-start;
+      color: var(--color-brand-onSurface);
+      text-decoration: none;
+      margin-bottom: var(--spacing-xs);
+    }
+    .session-detail__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .session-detail__title {
+      color: var(--color-text-primary);
+    }
+    .session-detail__meta {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--spacing-xs);
+      margin-bottom: var(--spacing-xs);
+    }
+    .session-detail__dates {
+      color: var(--color-text-muted);
+    }
+    .session-detail__stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(96px, 1fr));
+      gap: var(--spacing-sm);
+      margin-top: var(--spacing-xs);
+    }
+    .session-detail__boosts {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-xs);
+    }
+    .session-detail__section {
+      margin-top: var(--spacing-sm);
+      color: var(--color-text-primary);
+    }
+    .session-detail__standings {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .standings-row {
+      border-radius: var(--radius-lg);
+      transition: box-shadow 0.3s ease;
+    }
+    .standings-row--highlight {
+      box-shadow: 0 0 0 2px var(--color-success);
+    }
+    .standings-row__content {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+    .standings-row__rank {
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+      justify-content: center;
+      width: 40px;
+      height: 40px;
+      border-radius: var(--radius-md);
+      background: var(--color-bg-inset);
+      color: var(--color-text-primary);
+    }
+    .standings-row__info {
+      display: flex;
+      min-width: 0;
+      flex: 1;
+      flex-direction: column;
+      gap: var(--spacing-2xs);
+    }
+    .standings-row__name-line {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-2xs);
+    }
+    .standings-row__dot {
+      flex-shrink: 0;
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+    }
+    .standings-row__name {
+      overflow: hidden;
+      color: var(--color-text-primary);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .standings-row__up {
+      flex-shrink: 0;
+      color: var(--color-success);
+      transform: rotate(-90deg);
+    }
+    .standings-row__score {
+      display: flex;
+      flex-shrink: 0;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 2px;
+      color: var(--color-text-primary);
+    }
+    .session-detail__log {
+      margin-top: var(--spacing-xs);
+    }
+    .timeline-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .timeline-list__item {
+      display: flex;
+      gap: var(--spacing-sm);
+    }
+    .timeline-list__dot {
+      flex-shrink: 0;
+      width: 8px;
+      height: 8px;
+      margin-top: 6px;
+      border-radius: 50%;
+    }
+    .timeline-list__body {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .timeline-list__time {
+      color: var(--color-text-muted);
+    }
+    .timeline-list__text {
+      color: var(--color-text-secondary);
+    }
+    .session-detail__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      margin-top: var(--spacing-xl);
+      color: var(--color-text-secondary);
+    }
   `,
 })
 export class SessionDetailComponent {

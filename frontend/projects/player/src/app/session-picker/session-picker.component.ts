@@ -5,9 +5,18 @@ import {
   signal,
 } from '@angular/core';
 import { HttpErrorResponse } from '@angular/common/http';
+import { DatePipe } from '@angular/common';
 import { Router } from '@angular/router';
 
-import { CurrentSession, GameApiService } from 'shared';
+import {
+  CurrentSession,
+  GameApiService,
+  UiAlertComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiEmptyStateComponent,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -22,59 +31,142 @@ type State =
   selector: 'app-session-picker',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
+  imports: [DatePipe, UiAlertComponent, UiCardComponent, UiChipComponent, UiEmptyStateComponent, UiSpinnerComponent],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-7">
-        <h1 class="h3 mb-3">Choose your session</h1>
+    <div class="session-picker">
+      <h1 class="tr-h1 session-picker__title">Choose your run</h1>
 
-        @switch (state().kind) {
-          @case ('loading') {
-            <div class="d-flex align-items-center text-body-secondary">
-              <span class="spinner-border spinner-border-sm me-2"></span>
-              Resolving your sessions…
-            </div>
-          }
-          @case ('none') {
-            <div class="alert alert-warning">
-              {{ stateMessage() }}
-            </div>
-            <p class="text-body-secondary small">
-              Ask a staff member to send you an invite, then come back.
-            </p>
-          }
-          @case ('choose') {
-            <p class="text-body-secondary">
-              You belong to more than one active session. Pick the one you
-              want to play right now — you can switch later from the
-              staff UI or by asking staff to update you.
-            </p>
-            <div class="list-group">
-              @for (c of candidates(); track c.id) {
-                <button
-                  type="button"
-                  class="list-group-item list-group-item-action d-flex justify-content-between align-items-start"
-                  [disabled]="submittingId() !== null"
-                  (click)="pick(c)"
-                >
-                  <div>
-                    <div class="fw-semibold">{{ c.name }}</div>
-                    <div class="small text-body-secondary">
-                      {{ c.game.name }} · <code>{{ c.slug }}</code>
+      @switch (state().kind) {
+        @case ('loading') {
+          <div class="session-picker__loading">
+            <ui-spinner [size]="20" />
+            <span class="tr-body">Resolving your sessions…</span>
+          </div>
+        }
+        @case ('none') {
+          <ui-empty-state icon="compass" title="No sessions yet" [description]="stateMessage()">
+            <p class="tr-body">Ask a staff member to send you an invite, then come back.</p>
+          </ui-empty-state>
+        }
+        @case ('choose') {
+          <p class="tr-body session-picker__intro">
+            You belong to more than one active session. Pick the one you want to play right now
+            — you can switch later from the staff UI or by asking staff to update you.
+          </p>
+          <div class="session-picker__list">
+            @for (c of candidates(); track c.id) {
+              <button
+                type="button"
+                class="session-picker__card-tap"
+                [disabled]="submittingId() !== null"
+                (click)="pick(c)"
+              >
+                <ui-card class="session-picker__card">
+                  <div class="session-picker__row">
+                    <div class="session-picker__info">
+                      <span class="tr-eyebrow session-picker__eyebrow">{{ c.game.name }}</span>
+                      <span class="tr-h3 session-picker__name">{{ c.name }}</span>
+                      <span class="tr-meta-tiny session-picker__dates">
+                        {{ c.start_time | date: 'mediumDate' }} – {{ c.end_time | date: 'mediumDate' }}
+                      </span>
+                    </div>
+                    <div class="session-picker__trailing">
+                      @if (submittingId() === c.id) {
+                        <ui-spinner [size]="18" />
+                      } @else {
+                        <ui-chip [tone]="c.is_active ? 'brand' : 'neutral'">
+                          {{ c.is_active ? 'Active' : 'Past' }}
+                        </ui-chip>
+                      }
                     </div>
                   </div>
-                  @if (submittingId() === c.id) {
-                    <span class="spinner-border spinner-border-sm ms-2"></span>
-                  }
-                </button>
-              }
-            </div>
-          }
-          @case ('error') {
-            <div class="alert alert-danger">{{ stateMessage() }}</div>
-          }
+                </ui-card>
+              </button>
+            }
+          </div>
         }
-      </div>
+        @case ('error') {
+          <ui-alert tone="danger">{{ stateMessage() }}</ui-alert>
+        }
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .session-picker {
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+      padding: var(--spacing-xl) var(--spacing-xl) var(--spacing-2xl);
+      max-width: 560px;
+      margin: 0 auto;
+    }
+    .session-picker__title {
+      color: var(--color-text-primary);
+    }
+    .session-picker__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      color: var(--color-text-secondary);
+    }
+    .session-picker__intro {
+      color: var(--color-text-secondary);
+    }
+    .session-picker__list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .session-picker__card-tap {
+      all: unset;
+      display: block;
+      box-sizing: border-box;
+      width: 100%;
+      min-height: var(--tap-min);
+      cursor: pointer;
+    }
+    .session-picker__card-tap:disabled {
+      cursor: not-allowed;
+      opacity: 0.6;
+    }
+    .session-picker__card-tap:focus-visible {
+      outline: 2px solid var(--color-brand-primary);
+      outline-offset: 2px;
+      border-radius: var(--radius-lg);
+    }
+    .session-picker__row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+    }
+    .session-picker__info {
+      display: flex;
+      min-width: 0;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .session-picker__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .session-picker__name {
+      overflow: hidden;
+      color: var(--color-text-primary);
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .session-picker__dates {
+      color: var(--color-text-muted);
+    }
+    .session-picker__trailing {
+      display: flex;
+      flex-shrink: 0;
+      align-items: center;
+    }
   `,
 })
 export class SessionPickerComponent {

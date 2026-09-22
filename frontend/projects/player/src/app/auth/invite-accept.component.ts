@@ -3,7 +3,18 @@ import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ActivatedRoute, Router, RouterLink } from '@angular/router';
 import { DatePipe } from '@angular/common';
 
-import { AuthService, InvitePreview, InvitesService } from 'shared';
+import {
+  AuthService,
+  InvitePreview,
+  InvitesService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+  UiSpinnerComponent,
+} from 'shared';
 
 import { extractErrorMessage } from './form-error';
 
@@ -11,128 +22,178 @@ import { extractErrorMessage } from './form-error';
   selector: 'app-invite-accept',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, RouterLink, DatePipe],
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    DatePipe,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+    UiSpinnerComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-7 col-lg-6">
-        <h1 class="h3 mb-4">Team invite</h1>
+    <div class="auth-page">
+      <div class="auth-page__brand">
+        <span class="auth-page__mark"><ui-icon name="compass" [size]="17" /></span>
+        <span class="tr-eyebrow auth-page__eyebrow">Tower Rush</span>
+      </div>
+      <h1 class="tr-h1 auth-page__title">You've been invited</h1>
 
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
-          <a routerLink="/login" class="btn btn-outline-secondary">Back to sign in</a>
-        } @else if (preview(); as p) {
-          <div class="card mb-3">
-            <div class="card-body">
-              <div class="text-body-secondary small">You've been invited to join</div>
-              <div class="fs-4 fw-semibold">{{ p.team_name }}</div>
-              @if (p.team_group) {
-                <div class="text-body-secondary">{{ p.team_group }}</div>
-              }
-              <div class="small text-body-secondary mt-2">
-                Expires {{ p.expires_at | date: 'medium' }}
-              </div>
-            </div>
-          </div>
+      @if (loadError(); as msg) {
+        <ui-alert tone="danger" class="auth-page__card">{{ msg }}</ui-alert>
+        <div class="auth-page__links">
+          <a routerLink="/login" class="tr-button-label auth-page__link">Back to sign in</a>
+        </div>
+      } @else if (preview(); as p) {
+        <ui-card eyebrow="Active invitation" [title]="p.team_name" class="auth-page__card">
+          @if (p.team_group) {
+            <p class="tr-body">{{ p.team_group }}</p>
+          }
+          <p class="tr-meta-tiny auth-page__expiry">Expires {{ p.expires_at | date: 'medium' }}</p>
+        </ui-card>
 
-          @if (isAuthenticated()) {
+        @if (isAuthenticated()) {
+          <ui-card class="auth-page__card">
             @if (errorMessage(); as msg) {
-              <div class="alert alert-danger py-2">{{ msg }}</div>
+              <ui-alert tone="danger">{{ msg }}</ui-alert>
             }
-            <button
-              type="button"
-              class="btn btn-primary w-100"
+            <ui-button
+              [block]="true"
+              [loading]="pending()"
               [disabled]="pending()"
-              (click)="acceptAsExistingUser()"
+              (pressed)="acceptAsExistingUser()"
             >
-              @if (pending()) {
-                <span class="spinner-border spinner-border-sm me-2"></span>
-              }
               Accept invite
-            </button>
-          } @else {
-            <p class="text-body-secondary">
+            </ui-button>
+          </ui-card>
+        } @else {
+          <ui-card class="auth-page__card">
+            <p class="tr-body">
               Create an account to accept this invite. Already have one?
-              <a routerLink="/login" [queryParams]="{ next: currentUrl }">Sign in</a> first.
+              <a [routerLink]="['/login']" [queryParams]="{ next: currentUrl }" class="auth-page__inline-link"
+                >Sign in</a
+              >
+              first.
             </p>
-            <form [formGroup]="form" (ngSubmit)="acceptAsNewUser()" novalidate>
-              <div class="mb-3">
-                <label class="form-label" for="username">Username</label>
-                <input
-                  id="username"
-                  type="text"
-                  class="form-control"
-                  formControlName="username"
-                  autocomplete="username"
-                />
-              </div>
-              <div class="mb-3">
-                <label class="form-label" for="email">Email</label>
-                <input
-                  id="email"
-                  type="email"
-                  class="form-control"
-                  formControlName="email"
-                  autocomplete="email"
-                />
-              </div>
-              <div class="row">
-                <div class="col mb-3">
-                  <label class="form-label" for="first_name">First name</label>
-                  <input
-                    id="first_name"
-                    type="text"
-                    class="form-control"
-                    formControlName="first_name"
-                    autocomplete="given-name"
-                  />
+            <form [formGroup]="form" (ngSubmit)="acceptAsNewUser()" novalidate class="auth-page__form">
+              <ui-field label="Username">
+                <input uiInput type="text" formControlName="username" autocomplete="username" />
+              </ui-field>
+              <ui-field label="Email" icon="key">
+                <input uiInput type="email" formControlName="email" autocomplete="email" />
+              </ui-field>
+              <div class="row g-2">
+                <div class="col-6">
+                  <ui-field label="First name">
+                    <input uiInput type="text" formControlName="first_name" autocomplete="given-name" />
+                  </ui-field>
                 </div>
-                <div class="col mb-3">
-                  <label class="form-label" for="last_name">Last name</label>
-                  <input
-                    id="last_name"
-                    type="text"
-                    class="form-control"
-                    formControlName="last_name"
-                    autocomplete="family-name"
-                  />
+                <div class="col-6">
+                  <ui-field label="Last name">
+                    <input uiInput type="text" formControlName="last_name" autocomplete="family-name" />
+                  </ui-field>
                 </div>
               </div>
-              <div class="mb-3">
-                <label class="form-label" for="password">Password</label>
-                <input
-                  id="password"
-                  type="password"
-                  class="form-control"
-                  formControlName="password"
-                  autocomplete="new-password"
-                />
-                <div class="form-text">Minimum 8 characters.</div>
-              </div>
+              <ui-field label="Password" help="Minimum 8 characters.">
+                <input uiInput type="password" formControlName="password" autocomplete="new-password" />
+              </ui-field>
 
               @if (errorMessage(); as msg) {
-                <div class="alert alert-danger py-2">{{ msg }}</div>
+                <ui-alert tone="danger">{{ msg }}</ui-alert>
               }
 
-              <button
+              <ui-button
                 type="submit"
-                class="btn btn-primary w-100"
+                [block]="true"
+                [loading]="pending()"
                 [disabled]="form.invalid || pending()"
               >
-                @if (pending()) {
-                  <span class="spinner-border spinner-border-sm me-2"></span>
-                }
                 Create account & accept
-              </button>
+              </ui-button>
             </form>
-          }
-        } @else {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading invite…
-          </div>
+          </ui-card>
         }
-      </div>
+      } @else {
+        <div class="auth-page__loading">
+          <ui-spinner [size]="20" />
+          <span class="tr-body">Loading invite…</span>
+        </div>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .auth-page {
+      box-sizing: border-box;
+      display: flex;
+      min-height: 100dvh;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-md);
+      padding: var(--spacing-3xl) var(--spacing-xl) var(--spacing-xl);
+      background: var(--color-bg-canvas);
+    }
+    .auth-page__brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .auth-page__mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: var(--radius-full);
+      background: var(--color-brand-primary);
+      color: var(--color-text-onBrand);
+    }
+    .auth-page__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .auth-page__title {
+      color: var(--color-text-primary);
+      text-align: center;
+    }
+    .auth-page__card {
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 420px;
+    }
+    .auth-page__expiry {
+      color: var(--color-text-muted);
+    }
+    .auth-page__form {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+    .auth-page__inline-link {
+      color: var(--color-brand-onSurface);
+    }
+    .auth-page__links {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-sm);
+      margin-top: var(--spacing-sm);
+    }
+    .auth-page__link {
+      color: var(--color-brand-onSurface);
+      text-decoration: none;
+    }
+    .auth-page__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      color: var(--color-text-secondary);
+    }
   `,
 })
 export class InviteAcceptComponent {

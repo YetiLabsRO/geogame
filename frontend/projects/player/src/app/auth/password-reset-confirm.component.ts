@@ -2,7 +2,15 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 
-import { AuthService } from 'shared';
+import {
+  AuthService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+} from 'shared';
 
 import { extractErrorMessage } from './form-error';
 
@@ -10,49 +18,118 @@ import { extractErrorMessage } from './form-error';
   selector: 'app-password-reset-confirm',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, RouterLink],
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-6 col-lg-5">
-        <h1 class="h3 mb-4">Choose a new password</h1>
+    <div class="auth-page">
+      <div class="auth-page__brand">
+        <span class="auth-page__mark"><ui-icon name="compass" [size]="17" /></span>
+        <span class="tr-eyebrow auth-page__eyebrow">Tower Rush</span>
+      </div>
+      <h1 class="tr-h1 auth-page__title">Choose a new passphrase</h1>
 
-        @if (done()) {
-          <div class="alert alert-success">
+      @if (done()) {
+        <ui-card class="auth-page__card">
+          <ui-alert tone="success">
             Your password has been updated. Please sign in with your new password.
-          </div>
-          <a class="btn btn-primary" routerLink="/login">Sign in</a>
-        } @else {
-          <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
-            <div class="mb-3">
-              <label class="form-label" for="new_password">New password</label>
-              <input
-                id="new_password"
-                type="password"
-                class="form-control"
-                formControlName="new_password"
-                autocomplete="new-password"
-              />
-              <div class="form-text">Minimum 8 characters.</div>
-            </div>
+          </ui-alert>
+          <a routerLink="/login" class="auth-page__cta tr-button-serif">Sign in</a>
+        </ui-card>
+      } @else {
+        <ui-card class="auth-page__card">
+          <form [formGroup]="form" (ngSubmit)="submit()" novalidate class="auth-page__form">
+            <ui-field label="New password" help="Minimum 8 characters.">
+              <input uiInput type="password" formControlName="new_password" autocomplete="new-password" />
+            </ui-field>
 
             @if (errorMessage(); as msg) {
-              <div class="alert alert-danger py-2">{{ msg }}</div>
+              <ui-alert tone="danger">{{ msg }}</ui-alert>
             }
 
-            <button
+            <ui-button
               type="submit"
-              class="btn btn-primary w-100"
+              [block]="true"
+              [loading]="pending()"
               [disabled]="form.invalid || pending()"
             >
-              @if (pending()) {
-                <span class="spinner-border spinner-border-sm me-2"></span>
-              }
-              Save new password
-            </button>
+              Set new password
+            </ui-button>
           </form>
-        }
-      </div>
+        </ui-card>
+      }
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .auth-page {
+      box-sizing: border-box;
+      display: flex;
+      min-height: 100dvh;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-md);
+      padding: var(--spacing-3xl) var(--spacing-xl) var(--spacing-xl);
+      background: var(--color-bg-canvas);
+    }
+    .auth-page__brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .auth-page__mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: var(--radius-full);
+      background: var(--color-brand-primary);
+      color: var(--color-text-onBrand);
+    }
+    .auth-page__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .auth-page__title {
+      color: var(--color-text-primary);
+      text-align: center;
+    }
+    .auth-page__card {
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+      width: 100%;
+      max-width: 400px;
+    }
+    .auth-page__form {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+    .auth-page__cta {
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 56px;
+      padding-inline: var(--spacing-xl);
+      border-radius: var(--radius-xl);
+      background: var(--color-brand-primary);
+      color: var(--color-text-onBrand);
+      text-decoration: none;
+      box-shadow: var(--elevation-brand-glow);
+    }
   `,
 })
 export class PasswordResetConfirmComponent {

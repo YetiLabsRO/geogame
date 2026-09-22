@@ -22,6 +22,15 @@ import {
   ProximityObservation,
   REALTIME_EVENTS,
   RealtimeService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiChipComponent,
+  UiFieldComponent,
+  UiInputDirective,
+  UiProgressMeterComponent,
+  UiSpinnerComponent,
+  UiStatTileComponent,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -42,233 +51,314 @@ const POLL_INTERVAL_MS = 3_000;
   selector: 'app-dementors',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, FormsModule],
+  imports: [
+    DatePipe,
+    FormsModule,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiChipComponent,
+    UiFieldComponent,
+    UiInputDirective,
+    UiProgressMeterComponent,
+    UiSpinnerComponent,
+    UiStatTileComponent,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-lg-7">
-        <h1 class="h3 mb-3">Dementors</h1>
+    <div class="dementors-page">
+      <span class="tr-eyebrow dementors-page__eyebrow">Live role mode</span>
+      <h1 class="tr-h1 dementors-page__title">Dementors</h1>
 
-        @if (loadError(); as msg) {
-          <div class="alert alert-danger">{{ msg }}</div>
+      @if (loadError(); as msg) {
+        <ui-alert tone="danger" [withIcon]="true">{{ msg }}</ui-alert>
+      }
+
+      @if (me(); as m) {
+        @if (!m.alive) {
+          <ui-alert tone="danger" [withIcon]="true">
+            You have been drained completely and are out of play.
+          </ui-alert>
         }
 
-        @if (me(); as m) {
-          @if (!m.alive) {
-            <div class="alert alert-dark">
-              <i class="bi bi-emoji-dizzy me-1"></i>
-              You have been drained completely and are out of play.
-            </div>
-          }
-
-          <div class="card mb-3">
-            <div class="card-body">
-              <div class="d-flex justify-content-between align-items-center mb-2">
-                <span
-                  class="badge fs-6"
-                  [class]="m.role === 'WIZARD' ? 'text-bg-primary' : 'text-bg-dark'"
-                >
-                  <i class="bi me-1" [class]="m.role === 'WIZARD' ? 'bi-stars' : 'bi-tornado'"></i>
-                  {{ m.role === 'WIZARD' ? 'Wizard' : 'Dementor' }}
-                </span>
-                @switch (m.trend) {
-                  @case ('DRAINING') {
-                    <span class="text-danger fw-semibold">
-                      <span class="spinner-grow spinner-grow-sm me-1"></span>
-                      <i class="bi bi-arrow-down"></i>
-                      Being drained! ({{ m.last_delta }})
-                    </span>
-                  }
-                  @case ('GAINING') {
-                    <span class="text-success fw-semibold">
-                      <i class="bi bi-arrow-up"></i>
-                      Gaining energy (+{{ m.last_delta }})
-                    </span>
-                  }
-                  @default {
-                    <span class="text-body-secondary"> <i class="bi bi-dash-lg"></i> Stable </span>
-                  }
-                }
-              </div>
-
-              <div
-                class="progress"
-                style="height: 1.75rem"
-                role="progressbar"
-                [attr.aria-valuenow]="m.energy"
-                aria-valuemin="0"
-                [attr.aria-valuemax]="energyScale()"
-              >
-                <div
-                  class="progress-bar"
-                  [class]="energyBarClass()"
-                  [class.progress-bar-striped]="m.trend !== 'STABLE'"
-                  [class.progress-bar-animated]="m.trend !== 'STABLE'"
-                  [style.width.%]="energyPercent()"
-                >
-                  {{ m.energy }} / {{ energyScale() }}
-                </div>
-              </div>
-              <div class="small text-body-secondary mt-1">
-                @if (m.role === 'DEMENTOR') {
-                  Regain {{ m.conversion_threshold }} energy near groups of wizards to turn back
-                  into a wizard.
-                } @else {
-                  If your energy reaches zero, the dementors take you.
-                }
-                Last update:
-                @if (m.last_tick_at) {
-                  {{ m.last_tick_at | date: 'HH:mm:ss' }}
-                } @else {
-                  —
-                }
-              </div>
-            </div>
-          </div>
-
-          @if (m.reports_stale) {
-            <div class="alert alert-warning d-flex align-items-center">
-              <i class="bi bi-phone-vibrate fs-4 me-2"></i>
-              <div>
-                <strong>Keep your phone out and active!</strong>
-                Bluetooth sensing only works while the app is open with the screen on. Your reports
-                have gone stale — you are invisible to the game right now.
-              </div>
-            </div>
-          } @else {
-            <div class="alert alert-light border small mb-3">
-              <i class="bi bi-broadcast me-1"></i>
-              Keep your phone out with the screen on — that is how the magic senses who is around
-              you, even through trees.
-            </div>
-          }
-        } @else if (!loadError()) {
-          <div class="d-flex align-items-center text-body-secondary">
-            <span class="spinner-border spinner-border-sm me-2"></span>
-            Loading your fate…
-          </div>
-        }
-
-        <div class="card border-secondary-subtle mb-3">
-          <div class="card-header d-flex justify-content-between align-items-center">
-            <span>
-              <i class="bi bi-bug me-1"></i>
-              BLE simulator (debug)
-            </span>
-            <button
-              type="button"
-              class="btn btn-sm btn-outline-secondary"
-              (click)="simulatorOpen.set(!simulatorOpen())"
-            >
-              {{ simulatorOpen() ? 'Hide' : 'Show' }}
-            </button>
-          </div>
-          @if (simulatorOpen()) {
-            <div class="card-body">
-              <p class="small text-body-secondary">
-                Web browsers cannot advertise over BLE, so the real advertise/scan loop lives in the
-                native app. This panel exercises the same server contract with synthetic reports.
-              </p>
-
-              @if (simulatorError(); as msg) {
-                <div class="alert alert-danger py-2 small">{{ msg }}</div>
-              }
-
-              <div class="mb-3">
-                <button
-                  type="button"
-                  class="btn btn-sm btn-outline-primary me-2"
-                  (click)="requestIdentity(false)"
-                >
-                  Get advertising ID
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-sm btn-outline-secondary"
-                  [disabled]="!identity()"
-                  (click)="requestIdentity(true)"
-                >
-                  Rotate
-                </button>
-                @if (identity(); as id) {
-                  <div class="small mt-2">
-                    Advertising as <code>{{ id.token }}</code> · report every
-                    {{ id.report_interval_seconds }}s · freshness window
-                    {{ id.freshness_window_seconds }}s
-                  </div>
-                }
-              </div>
-
-              <div class="row g-2 align-items-end mb-2">
-                <div class="col-6">
-                  <label class="form-label small mb-0" for="sim-token">Seen token</label>
-                  <input
-                    id="sim-token"
-                    class="form-control form-control-sm"
-                    placeholder="e.g. a1b2c3d4"
-                    [(ngModel)]="observedToken"
-                  />
-                </div>
-                <div class="col-3">
-                  <label class="form-label small mb-0" for="sim-rssi">RSSI (dBm)</label>
-                  <input
-                    id="sim-rssi"
-                    type="number"
-                    class="form-control form-control-sm"
-                    [(ngModel)]="observedRssi"
-                  />
-                </div>
-                <div class="col-3">
-                  <button
-                    type="button"
-                    class="btn btn-sm btn-outline-secondary w-100"
-                    (click)="addObservation()"
-                  >
-                    Add
-                  </button>
-                </div>
-              </div>
-
-              @if (observations().length > 0) {
-                <ul class="list-group list-group-flush mb-2">
-                  @for (obs of observations(); track $index) {
-                    <li class="list-group-item d-flex justify-content-between py-1 small">
-                      <span
-                        ><code>{{ obs.token }}</code> @ {{ obs.rssi }} dBm</span
-                      >
-                      <button
-                        type="button"
-                        class="btn btn-sm btn-link text-danger py-0"
-                        (click)="removeObservation($index)"
-                      >
-                        remove
-                      </button>
-                    </li>
-                  }
-                </ul>
-              }
-
-              <button
-                type="button"
-                class="btn btn-sm btn-primary"
-                [disabled]="!identity() || sending()"
-                (click)="sendReport()"
-              >
-                @if (sending()) {
-                  <span class="spinner-border spinner-border-sm me-1"></span>
-                }
-                Send report ({{ observations().length }} seen)
-              </button>
-              @if (lastReport(); as r) {
-                <span class="small text-body-secondary ms-2">
-                  recorded {{ r.recorded }}, discarded {{ r.discarded }},
-                  {{ r.events_derived }} pair(s) derived
-                </span>
-              }
-            </div>
+        <div class="dementors-page__role-row">
+          <ui-chip
+            [tone]="m.role === 'WIZARD' ? 'solid' : 'neutral'"
+            [class.dementors-page__role-chip--dark]="m.role === 'DEMENTOR'"
+            class="dementors-page__role-chip"
+          >
+            {{ m.role === 'WIZARD' ? 'Wizard' : 'Dementor' }}
+          </ui-chip>
+          @switch (m.trend) {
+            @case ('DRAINING') {
+              <span class="dementors-page__trend dementors-page__trend--drain">
+                Being drained! ({{ m.last_delta }})
+              </span>
+            }
+            @case ('GAINING') {
+              <span class="dementors-page__trend dementors-page__trend--gain">
+                Gaining energy (+{{ m.last_delta }})
+              </span>
+            }
+            @default {
+              <span class="dementors-page__trend">Stable</span>
+            }
           }
         </div>
-      </div>
+
+        <ui-progress-meter
+          label="Energy"
+          [valueLabel]="m.energy + ' / ' + energyScale()"
+          [value]="m.energy"
+          [max]="energyScale()"
+          [tone]="energyPercent() > 50 ? 'success' : energyPercent() <= 25 ? 'danger' : 'brand'"
+        />
+
+        <div class="dementors-page__stats">
+          <ui-stat-tile
+            [icon]="m.trend === 'DRAINING' ? 'target' : m.trend === 'GAINING' ? 'sparkle' : 'compass'"
+            label="Trend"
+            [value]="
+              m.trend === 'DRAINING'
+                ? 'Draining (' + m.last_delta + ')'
+                : m.trend === 'GAINING'
+                  ? 'Gaining (+' + m.last_delta + ')'
+                  : 'Stable'
+            "
+          />
+          <ui-stat-tile
+            icon="clock"
+            label="Last update"
+            [value]="(m.last_tick_at | date: 'HH:mm:ss') ?? '—'"
+          />
+        </div>
+
+        @if (m.role === 'DEMENTOR') {
+          <p class="tr-body dementors-page__hint">
+            Regain {{ m.conversion_threshold }} energy near groups of wizards to turn back into a
+            wizard.
+          </p>
+        } @else {
+          <p class="tr-body dementors-page__hint">
+            If your energy reaches zero, the dementors take you.
+          </p>
+        }
+
+        @if (m.reports_stale) {
+          <ui-alert tone="warning" [withIcon]="true">
+            <strong>Keep your phone out and active!</strong>
+            Bluetooth sensing only works while the app is open with the screen on. Your reports have
+            gone stale — you are invisible to the game right now.
+          </ui-alert>
+        } @else {
+          <ui-alert tone="info">
+            Keep your phone out with the screen on — that is how the magic senses who is around you,
+            even through trees.
+          </ui-alert>
+        }
+      } @else if (!loadError()) {
+        <div class="dementors-page__loading">
+          <ui-spinner [size]="20" />
+          <span class="tr-body">Loading your fate…</span>
+        </div>
+      }
+
+      <ui-card variant="flat" class="dementors-page__simulator">
+        <div class="dementors-page__simulator-header">
+          <span class="tr-eyebrow">BLE simulator (debug)</span>
+          <ui-button variant="secondary" size="sm" (pressed)="simulatorOpen.set(!simulatorOpen())">
+            {{ simulatorOpen() ? 'Hide' : 'Show' }}
+          </ui-button>
+        </div>
+
+        @if (simulatorOpen()) {
+          <p class="tr-body">
+            Web browsers cannot advertise over BLE, so the real advertise/scan loop lives in the
+            native app. This panel exercises the same server contract with synthetic reports.
+          </p>
+
+          @if (simulatorError(); as msg) {
+            <ui-alert tone="danger">{{ msg }}</ui-alert>
+          }
+
+          <div class="dementors-page__simulator-actions">
+            <ui-button variant="secondary" size="sm" (pressed)="requestIdentity(false)">
+              Get advertising ID
+            </ui-button>
+            <ui-button
+              variant="secondary"
+              size="sm"
+              [disabled]="!identity()"
+              (pressed)="requestIdentity(true)"
+            >
+              Rotate
+            </ui-button>
+          </div>
+          @if (identity(); as id) {
+            <p class="tr-meta-tiny dementors-page__identity">
+              Advertising as {{ id.token }} · report every {{ id.report_interval_seconds }}s ·
+              freshness window {{ id.freshness_window_seconds }}s
+            </p>
+          }
+
+          <div class="dementors-page__simulator-fields">
+            <ui-field label="Seen token">
+              <input uiInput type="text" placeholder="e.g. a1b2c3d4" [(ngModel)]="observedToken" />
+            </ui-field>
+            <ui-field label="RSSI (dBm)">
+              <input uiInput type="number" [(ngModel)]="observedRssi" />
+            </ui-field>
+            <ui-button variant="secondary" size="sm" (pressed)="addObservation()">Add</ui-button>
+          </div>
+
+          @if (observations().length > 0) {
+            <div class="dementors-page__obs-list">
+              @for (obs of observations(); track $index) {
+                <div class="dementors-page__obs-row">
+                  <span class="tr-body">{{ obs.token }} @ {{ obs.rssi }} dBm</span>
+                  <button
+                    type="button"
+                    class="dementors-page__obs-remove tr-button-label"
+                    (click)="removeObservation($index)"
+                  >
+                    Remove
+                  </button>
+                </div>
+              }
+            </div>
+          }
+
+          <ui-button
+            variant="primary"
+            size="sm"
+            [loading]="sending()"
+            [disabled]="!identity() || sending()"
+            (pressed)="sendReport()"
+          >
+            Send report ({{ observations().length }} seen)
+          </ui-button>
+          @if (lastReport(); as r) {
+            <p class="tr-meta-tiny dementors-page__report">
+              recorded {{ r.recorded }}, discarded {{ r.discarded }}, {{ r.events_derived }} pair(s)
+              derived
+            </p>
+          }
+        }
+      </ui-card>
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .dementors-page {
+      box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+      padding: var(--spacing-xl) var(--spacing-xl) var(--spacing-2xl);
+      max-width: 560px;
+      margin: 0 auto;
+    }
+    .dementors-page__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .dementors-page__title {
+      color: var(--color-text-primary);
+    }
+    .dementors-page__role-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: var(--spacing-sm);
+    }
+    .dementors-page__role-chip {
+      padding: 10px 24px;
+      font-size: 14px;
+      line-height: 20px;
+    }
+    .dementors-page__role-chip--dark {
+      background: var(--color-brand-deep);
+      border-color: var(--color-brand-deep);
+      color: #fff;
+    }
+    .dementors-page__trend {
+      color: var(--color-text-secondary);
+    }
+    .dementors-page__trend--drain {
+      color: var(--color-danger);
+      font-weight: 600;
+    }
+    .dementors-page__trend--gain {
+      color: var(--color-success);
+      font-weight: 600;
+    }
+    .dementors-page__stats {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: var(--spacing-sm);
+    }
+    .dementors-page__hint {
+      color: var(--color-text-secondary);
+    }
+    .dementors-page__loading {
+      display: flex;
+      align-items: center;
+      gap: var(--spacing-sm);
+      color: var(--color-text-secondary);
+    }
+    .dementors-page__simulator {
+      margin-top: var(--spacing-sm);
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-sm);
+    }
+    .dementors-page__simulator-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+    }
+    .dementors-page__simulator-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: var(--spacing-xs);
+    }
+    .dementors-page__identity,
+    .dementors-page__report {
+      color: var(--color-text-muted);
+    }
+    .dementors-page__simulator-fields {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: flex-end;
+      gap: var(--spacing-xs);
+    }
+    .dementors-page__simulator-fields ui-field {
+      flex: 1;
+      min-width: 120px;
+    }
+    .dementors-page__obs-list {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-2xs);
+    }
+    .dementors-page__obs-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: var(--spacing-sm);
+      padding: var(--spacing-xs) var(--spacing-sm);
+      border-radius: var(--radius-md);
+      background: var(--color-bg-raised);
+      border: 1px solid var(--color-border-subtle);
+    }
+    .dementors-page__obs-remove {
+      border: none;
+      background: transparent;
+      padding: 0;
+      color: var(--color-danger);
+      cursor: pointer;
+    }
   `,
 })
 export class DementorsComponent {

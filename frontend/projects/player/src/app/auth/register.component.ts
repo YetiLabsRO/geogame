@@ -2,7 +2,15 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import { Router, RouterLink } from '@angular/router';
 
-import { AuthService } from 'shared';
+import {
+  AuthService,
+  UiAlertComponent,
+  UiButtonComponent,
+  UiCardComponent,
+  UiFieldComponent,
+  UiIconComponent,
+  UiInputDirective,
+} from 'shared';
 
 import { extractErrorMessage } from './form-error';
 
@@ -10,87 +18,126 @@ import { extractErrorMessage } from './form-error';
   selector: 'app-register',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, RouterLink],
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    UiAlertComponent,
+    UiButtonComponent,
+    UiCardComponent,
+    UiFieldComponent,
+    UiIconComponent,
+    UiInputDirective,
+  ],
   template: `
-    <div class="row justify-content-center">
-      <div class="col-md-6 col-lg-5">
-        <h1 class="h3 mb-4">Create an account</h1>
-        <form [formGroup]="form" (ngSubmit)="submit()" novalidate>
-          <div class="mb-3">
-            <label class="form-label" for="username">Username</label>
-            <input
-              id="username"
-              type="text"
-              class="form-control"
-              formControlName="username"
-              autocomplete="username"
-            />
-          </div>
-          <div class="mb-3">
-            <label class="form-label" for="email">Email</label>
-            <input
-              id="email"
-              type="email"
-              class="form-control"
-              formControlName="email"
-              autocomplete="email"
-            />
-          </div>
-          <div class="row">
-            <div class="col mb-3">
-              <label class="form-label" for="first_name">First name</label>
-              <input
-                id="first_name"
-                type="text"
-                class="form-control"
-                formControlName="first_name"
-                autocomplete="given-name"
-              />
+    <div class="auth-page">
+      <div class="auth-page__brand">
+        <span class="auth-page__mark"><ui-icon name="compass" [size]="17" /></span>
+        <span class="tr-eyebrow auth-page__eyebrow">Tower Rush</span>
+      </div>
+      <h1 class="tr-h1 auth-page__title">Join the expedition</h1>
+
+      <ui-card class="auth-page__card">
+        <form [formGroup]="form" (ngSubmit)="submit()" novalidate class="auth-page__form">
+          <ui-field label="Username">
+            <input uiInput type="text" formControlName="username" autocomplete="username" />
+          </ui-field>
+          <ui-field label="Email" icon="key">
+            <input uiInput type="email" formControlName="email" autocomplete="email" />
+          </ui-field>
+          <div class="row g-2">
+            <div class="col-6">
+              <ui-field label="First name">
+                <input uiInput type="text" formControlName="first_name" autocomplete="given-name" />
+              </ui-field>
             </div>
-            <div class="col mb-3">
-              <label class="form-label" for="last_name">Last name</label>
-              <input
-                id="last_name"
-                type="text"
-                class="form-control"
-                formControlName="last_name"
-                autocomplete="family-name"
-              />
+            <div class="col-6">
+              <ui-field label="Last name">
+                <input uiInput type="text" formControlName="last_name" autocomplete="family-name" />
+              </ui-field>
             </div>
           </div>
-          <div class="mb-3">
-            <label class="form-label" for="password">Password</label>
-            <input
-              id="password"
-              type="password"
-              class="form-control"
-              formControlName="password"
-              autocomplete="new-password"
-            />
-            <div class="form-text">Minimum 8 characters.</div>
-          </div>
+          <ui-field label="Password" help="Minimum 8 characters.">
+            <input uiInput type="password" formControlName="password" autocomplete="new-password" />
+          </ui-field>
 
           @if (errorMessage(); as msg) {
-            <div class="alert alert-danger py-2">{{ msg }}</div>
+            <ui-alert tone="danger">{{ msg }}</ui-alert>
           }
 
-          <button
+          <ui-button
             type="submit"
-            class="btn btn-primary w-100"
+            [block]="true"
+            [loading]="pending()"
             [disabled]="form.invalid || pending()"
           >
-            @if (pending()) {
-              <span class="spinner-border spinner-border-sm me-2"></span>
-            }
             Create account
-          </button>
+          </ui-button>
         </form>
+      </ui-card>
 
-        <div class="mt-3 small">
-          Already have an account? <a routerLink="/login">Sign in</a>
-        </div>
+      <div class="auth-page__links">
+        <a routerLink="/login" class="tr-button-label auth-page__link">Already have an account? Sign in</a>
       </div>
     </div>
+  `,
+  styles: `
+    :host {
+      display: block;
+    }
+    .auth-page {
+      box-sizing: border-box;
+      display: flex;
+      min-height: 100dvh;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-md);
+      padding: var(--spacing-3xl) var(--spacing-xl) var(--spacing-xl);
+      background: var(--color-bg-canvas);
+    }
+    .auth-page__brand {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-xs);
+    }
+    .auth-page__mark {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      width: 30px;
+      height: 30px;
+      border-radius: var(--radius-full);
+      background: var(--color-brand-primary);
+      color: var(--color-text-onBrand);
+    }
+    .auth-page__eyebrow {
+      color: var(--color-brand-onSurface);
+    }
+    .auth-page__title {
+      color: var(--color-text-primary);
+      text-align: center;
+    }
+    .auth-page__card {
+      box-sizing: border-box;
+      width: 100%;
+      max-width: 400px;
+    }
+    .auth-page__form {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+    }
+    .auth-page__links {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: var(--spacing-sm);
+      margin-top: var(--spacing-sm);
+    }
+    .auth-page__link {
+      color: var(--color-brand-onSurface);
+      text-decoration: none;
+    }
   `,
 })
 export class RegisterComponent {
