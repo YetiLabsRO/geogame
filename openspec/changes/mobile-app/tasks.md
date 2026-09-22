@@ -37,7 +37,7 @@
 - [x] 4.5 Society: my team, browse teams, create team, join by code, join requests, share (QR) restyled with cards, chips (team colour), avatars and buttons.
 - [x] 4.6 Chronicle: my sessions list and session detail restyled.
 - [x] 4.7 Auth (login/register/reset/invite), session picker, location consent, notification settings, Dementors, rules screens restyled; toasts replace `alert` boxes.
-- [ ] 4.8 Gate: `grep` shows no Bootstrap component classes left in player templates; `ng build player` passes budgets; `ng build staff` still passes; Playwright smoke (login → map) runs against the dev stack.
+- [x] 4.8 Gate: `grep` shows no Bootstrap component classes left in player templates; `ng build player` passes budgets; `ng build staff` still passes; Playwright smoke (login → map) runs against the dev stack.
 
 ## 5. Capacitor native projects
 
@@ -51,6 +51,6 @@
 
 ## 6. Verification and wrap-up
 
-- [ ] 6.1 Backend: `coverage run manage.py test game organize --noinput && coverage report --fail-under=80`, `ruff check .`.
-- [ ] 6.2 Frontend: `npx vitest run`, `npm run build:all`, `npx cap sync android`, Android debug build.
-- [ ] 6.3 Update `CLAUDE.md` / `.claude/guidelines.md` with the mobile commands and the platform-layer rule ("screens use the platform services, never `navigator.*` or `Capacitor` directly"); commit per milestone on `feature/mobile-app`.
+- [x] 6.1 Backend: `coverage run manage.py test game organize --noinput && coverage report --fail-under=80`, `ruff check .`.
+- [x] 6.2 Frontend: `npx vitest run`, `npm run build:all`, `npx cap sync android`, Android debug build.
+- [x] 6.3 Update `CLAUDE.md` / `.claude/guidelines.md` with the mobile commands and the platform-layer rule ("screens use the platform services, never `navigator.*` or `Capacitor` directly"); commit per milestone on `feature/mobile-app`.
