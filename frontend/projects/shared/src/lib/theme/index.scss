@@ -1,0 +1,23 @@
+// Tower Rush theme — global entry point.
+//
+// `@use`/`@import` this file exactly once, from the app's top-level global
+// stylesheet (see `projects/player/src/styles.scss`). It forwards the token
+// and typography partials for anyone downstream who wants the mixins
+// (e.g. individual `ui-*` components reach for `theme/typography` directly),
+// pulls in the self-hosted fonts, and emits the base resets plus the `.tr-*`
+// typography utility classes exactly once.
+
+@forward './tokens';
+@forward './typography';
+@forward './base';
+
+@use './typography' as typography;
+
+// Self-hosted fonts — no CDN, so the app works offline in the Capacitor
+// WebView. `@fontsource-variable/*` ships an `index.css` with `@font-face`
+// rules for every weight in the variable font; resolved via the
+// `stylePreprocessorOptions.includePaths: ['node_modules']` build option.
+@import '@fontsource-variable/playfair-display';
+@import '@fontsource-variable/plus-jakarta-sans';
+
+@include typography.utility-classes;

@@ -1,0 +1,42 @@
+// Global element resets — see docs/design-system.md.
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  background: var(--color-bg-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-ui);
+  -webkit-tap-highlight-color: transparent;
+  color-scheme: light dark;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-family: var(--font-display);
+}
+
+:focus-visible {
+  outline: 2px solid var(--color-brand-primary);
+  outline-offset: 2px;
+}
+
+// Safe-area helpers (notch / home-indicator insets under viewport-fit=cover).
+.tr-safe-top {
+  padding-top: var(--safe-top);
+}
+
+.tr-safe-bottom {
+  padding-bottom: var(--safe-bottom);
+}
+
+// Tint an element (and anything under it reading --team-color) from a
+// TeamGroup colour set at runtime, e.g. <div class="tr-team" style="--team-color: #446279">.
+.tr-team {
+  color: var(--team-color);
+}

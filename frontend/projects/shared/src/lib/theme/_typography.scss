@@ -1,0 +1,149 @@
+// Tower Rush type scale — see docs/design-system.md §3.
+// Mixins only (no top-level selectors) so this partial can be `@use`d from
+// anywhere — including individual `ui-*` components — without emitting any
+// CSS of its own. The `.tr-*` utility classes built from these mixins are
+// emitted exactly once, from theme/index.scss.
+
+@mixin text-h1 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 36px;
+  line-height: 40px;
+  letter-spacing: -0.9px;
+}
+
+@mixin text-h2 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 28px;
+  line-height: 34px;
+  letter-spacing: -0.5px;
+}
+
+@mixin text-card-title {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 24px;
+  line-height: 32px;
+  letter-spacing: 0;
+}
+
+@mixin text-h3 {
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: 18px;
+  line-height: 28px;
+  letter-spacing: 0;
+}
+
+@mixin text-button-serif {
+  font-family: var(--font-display);
+  font-weight: 400;
+  font-size: 20px;
+  line-height: 28px;
+  letter-spacing: 0;
+}
+
+@mixin text-body-lg {
+  font-family: var(--font-ui);
+  font-weight: 400;
+  font-size: 16px;
+  line-height: 24px;
+  letter-spacing: 0;
+}
+
+@mixin text-body {
+  font-family: var(--font-ui);
+  font-weight: 400;
+  font-size: 14px;
+  line-height: 20px;
+  letter-spacing: 0;
+}
+
+@mixin text-body-italic {
+  font-family: var(--font-ui);
+  font-weight: 400;
+  font-style: italic;
+  font-size: 14px;
+  line-height: 20px;
+  letter-spacing: 0.2px;
+}
+
+@mixin text-button-label {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 14px;
+  line-height: 20px;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+@mixin text-eyebrow {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 11px;
+  line-height: 16.5px;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+}
+
+@mixin text-field-label {
+  font-family: var(--font-ui);
+  font-weight: 700;
+  font-size: 11px;
+  line-height: 16.5px;
+  letter-spacing: 0.55px;
+  text-transform: uppercase;
+}
+
+@mixin text-meta-tiny {
+  font-family: var(--font-ui);
+  font-weight: 600;
+  font-size: 10px;
+  line-height: 15px;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}
+
+// Emits the `.tr-*` utility classes for every mixin above. Called exactly
+// once, from theme/index.scss, so the classes appear once in the compiled
+// global stylesheet no matter how many components `@use` this partial for
+// its mixins alone.
+@mixin utility-classes {
+  .tr-h1 {
+    @include text-h1;
+  }
+  .tr-h2 {
+    @include text-h2;
+  }
+  .tr-card-title {
+    @include text-card-title;
+  }
+  .tr-h3 {
+    @include text-h3;
+  }
+  .tr-button-serif {
+    @include text-button-serif;
+  }
+  .tr-body-lg {
+    @include text-body-lg;
+  }
+  .tr-body {
+    @include text-body;
+  }
+  .tr-body-italic {
+    @include text-body-italic;
+  }
+  .tr-button-label {
+    @include text-button-label;
+  }
+  .tr-eyebrow {
+    @include text-eyebrow;
+  }
+  .tr-field-label {
+    @include text-field-label;
+  }
+  .tr-meta-tiny {
+    @include text-meta-tiny;
+  }
+}

@@ -21,16 +21,16 @@
 
 ## 3. Design system in `shared`
 
-- [ ] 3.1 Add `@fontsource-variable/playfair-display` and `@fontsource-variable/plus-jakarta-sans`; write `shared/src/lib/theme/tokens.scss` (Light on `:root`, Dark under `prefers-color-scheme` guard and `[data-theme="dark"]`, spacing/radius/elevation/typography tokens, `--team-color` slot) and `ThemeService` (system/light/dark, persisted, sets `data-theme`, syncs `@capacitor/status-bar` on native).
-- [ ] 3.2 Download the 16 icon SVGs from the Figma Icon Set into `shared/src/lib/ui/icons/` and build `ui-icon` (name input, `currentColor`, size input).
-- [ ] 3.3 `ui-button` (primary/secondary/tinted, sm/md/lg, icon slot, loading, block, `type`), `ui-chip` (brand/solid/slate/neutral, `teamColor`), `ui-field` + `uiInput` directive (label, help, error, id wiring).
-- [ ] 3.4 `ui-card`, `ui-stat-tile`, `ui-progress-meter` (value/max, tone), `ui-avatar` (initials/image, team colour ring).
-- [ ] 3.5 `ui-top-app-bar` (title, leading/trailing slots, safe-area top), `ui-bottom-nav` (items with icon/label/route, active by URL prefix, safe-area bottom), `ui-toast` + `ToastService`, `ui-empty-state`.
-- [ ] 3.6 Export from `public-api.ts`; add a dev-only `/dev/gallery` route in the player showing every component in both themes; vitest smoke specs for button, chip, bottom-nav active state, theme service.
+- [x] 3.1 Add `@fontsource-variable/playfair-display` and `@fontsource-variable/plus-jakarta-sans`; write `shared/src/lib/theme/tokens.scss` (Light on `:root`, Dark under `prefers-color-scheme` guard and `[data-theme="dark"]`, spacing/radius/elevation/typography tokens, `--team-color` slot) and `ThemeService` (system/light/dark, persisted, sets `data-theme`, syncs `@capacitor/status-bar` on native).
+- [x] 3.2 Download the 16 icon SVGs from the Figma Icon Set into `shared/src/lib/ui/icons/` and build `ui-icon` (name input, `currentColor`, size input).
+- [x] 3.3 `ui-button` (primary/secondary/tinted, sm/md/lg, icon slot, loading, block, `type`), `ui-chip` (brand/solid/slate/neutral, `teamColor`), `ui-field` + `uiInput` directive (label, help, error, id wiring).
+- [x] 3.4 `ui-card`, `ui-stat-tile`, `ui-progress-meter` (value/max, tone), `ui-avatar` (initials/image, team colour ring).
+- [x] 3.5 `ui-top-app-bar` (title, leading/trailing slots, safe-area top), `ui-bottom-nav` (items with icon/label/route, active by URL prefix, safe-area bottom), `ui-toast` + `ToastService`, `ui-empty-state`.
+- [x] 3.6 Export from `public-api.ts`; add a dev-only `/dev/gallery` route in the player showing every component in both themes; vitest smoke specs for button, chip, bottom-nav active state, theme service.
 
 ## 4. Player shell and screens
 
-- [ ] 4.1 Player `styles.scss`: import tokens + fonts, Bootstrap grid and utilities SCSS only, global resets, safe-area variables; remove `bootstrap.bundle.min.js` and the full Bootstrap CSS from `angular.json` for the player; `index.html` title "Tower Rush", `viewport-fit=cover`, theme-color meta.
+- [x] 4.1 Player `styles.scss`: import tokens + fonts, Bootstrap grid and utilities SCSS only, global resets, safe-area variables; remove `bootstrap.bundle.min.js` and the full Bootstrap CSS from `angular.json` for the player; `index.html` title "Tower Rush", `viewport-fit=cover`, theme-color meta.
 - [ ] 4.2 Shell: `app.html` → `ui-top-app-bar` (session name, avatar → Ledger) + `<main>` + `ui-bottom-nav` (Journey `/`, Society `/team`, Chronicle `/history`, Ledger `/ledger`), hidden on auth/session-picker routes; routes add `/ledger` and `/journey`, `/society`, `/chronicle` redirects; all existing paths preserved.
 - [ ] 4.3 Ledger screen: live scoreboard (per-TeamGroup standings from `RealtimeService`/API), my team's locked + floating score as stat tiles, Dementors status row, links to Trail, Rules, notification + location settings, theme setting, sign out.
 - [ ] 4.4 Journey: full-bleed map under the app bar with a floating Scan action; tower detail rebuilt after the Figma Tower Challenge (Trial) screen (hero, distance + `ui-progress-meter`, challenge card, photo capture, disabled-out-of-range submit, cooldown ring); NFC scan and trail screens restyled.

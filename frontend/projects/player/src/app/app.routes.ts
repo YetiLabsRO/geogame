@@ -2,7 +2,23 @@ import { Routes } from '@angular/router';
 
 import { authGuard } from 'shared';
 
+import { environment } from '../environments/environment';
+
+/**
+ * Dev-only design-system showcase (mobile-app task 3.6). Never registered
+ * in a production build.
+ */
+const devRoutes: Routes = environment.production
+  ? []
+  : [
+      {
+        path: 'dev/gallery',
+        loadComponent: () => import('./dev/gallery.component').then((m) => m.GalleryComponent),
+      },
+    ];
+
 export const routes: Routes = [
+  ...devRoutes,
   {
     path: '',
     pathMatch: 'full',

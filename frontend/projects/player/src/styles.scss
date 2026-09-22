@@ -1,1 +1,29 @@
-/* You can add global styles to this file, and also import other style files */
+// Tower Rush player global styles.
+//
+// Tokens + fonts + base resets first (see shared/src/lib/theme/), then
+// Bootstrap reduced to grid + utilities only — no component classes
+// (`btn`, `card`, `navbar`, `form-control`, `progress`, `alert`, `modal`…)
+// ship in the player build. See docs/design-system.md and mobile-app design
+// decision D8.
+@use '../../shared/src/lib/theme' as *;
+
+@import 'bootstrap/scss/functions';
+@import 'bootstrap/scss/variables';
+@import 'bootstrap/scss/variables-dark';
+@import 'bootstrap/scss/maps';
+@import 'bootstrap/scss/mixins';
+@import 'bootstrap/scss/utilities';
+@import 'bootstrap/scss/reboot';
+@import 'bootstrap/scss/containers';
+@import 'bootstrap/scss/grid';
+@import 'bootstrap/scss/helpers';
+@import 'bootstrap/scss/utilities/api';
+
+// The reboot layer sets --bs-body-* and repaints body font/colour from its
+// own Bootstrap defaults — reassert the design-system tokens after it.
+html,
+body {
+  background-color: var(--color-bg-canvas);
+  color: var(--color-text-primary);
+  font-family: var(--font-ui);
+}

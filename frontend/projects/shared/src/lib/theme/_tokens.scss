@@ -1,0 +1,120 @@
+// Tower Rush "old-world explorer" design tokens — see docs/design-system.md §1-2.
+// Light values live on :root; Dark values are applied both when the OS
+// prefers dark (and no explicit "light" choice is stored) and when the
+// player explicitly picks dark — `ThemeService` stamps `data-theme` on
+// <html> for the explicit cases and removes it to fall back to `system`.
+
+// Static tokens (spacing/radius/elevation/safe-area/tap target/fonts) do not
+// change between themes.
+:root {
+  // Spacing scale (docs/design-system.md §2).
+  --spacing-2xs: 4px;
+  --spacing-xs: 8px;
+  --spacing-sm: 12px;
+  --spacing-md: 16px;
+  --spacing-lg: 20px;
+  --spacing-xl: 24px;
+  --spacing-2xl: 32px;
+  --spacing-3xl: 48px;
+
+  // Radii.
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 24px;
+  --radius-full: 9999px;
+
+  // Elevation.
+  --elevation-card: 0 10px 20px -5px rgba(0, 0, 0, 0.08);
+  --elevation-brand-glow:
+    0 10px 15px -3px rgba(151, 68, 0, 0.2), 0 4px 6px -4px rgba(151, 68, 0, 0.2);
+
+  // Safe areas (Capacitor WebView notch/home-indicator insets) and tap target.
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --tap-min: 44px;
+
+  // Font families (self-hosted via @fontsource-variable/*, see index.scss).
+  --font-display: 'Playfair Display Variable', Georgia, serif;
+  --font-ui: 'Plus Jakarta Sans Variable', system-ui, sans-serif;
+}
+
+// Light palette (default).
+:root {
+  --color-brand-primary: #974400;
+  --color-brand-onSurface: #974400;
+  --color-brand-deep: #5a1b03;
+  --color-brand-tint: rgba(151, 68, 0, 0.05);
+  --color-text-onBrand: #ffffff;
+
+  --color-bg-canvas: #fcf9f2;
+  --color-bg-raised: #ffffff;
+  --color-bg-inset: #ebe8e1;
+  --color-bg-surface: #f1eee7;
+  --color-field-bg: rgba(255, 255, 255, 0.5);
+
+  --color-text-primary: #321200;
+  --color-text-secondary: #564338;
+  --color-text-muted: rgba(86, 67, 56, 0.6);
+  --color-text-placeholder: rgba(86, 67, 56, 0.3);
+
+  --color-border-default: rgba(138, 114, 102, 0.2);
+  --color-border-subtle: rgba(138, 114, 102, 0.1);
+  --color-border-brand: rgba(151, 68, 0, 0.2);
+
+  --color-accent-slate: #446279;
+
+  // Runtime team colour slot — components read this, never a hard-coded hex.
+  --team-color: var(--color-accent-slate);
+
+  // Status colours (not in the Figma export; derived and kept themed).
+  --color-success: #4e7a3a;
+  --color-danger: #a33b2a;
+  --color-warning: #c9812b;
+
+  // Tints derived from whichever palette is active — declared once,
+  // resolved at use-time via the custom-property cascade.
+  --color-success-tint: color-mix(in srgb, var(--color-success) 12%, transparent);
+  --color-danger-tint: color-mix(in srgb, var(--color-danger) 12%, transparent);
+  --color-warning-tint: color-mix(in srgb, var(--color-warning) 12%, transparent);
+}
+
+@mixin dark-palette {
+  --color-brand-primary: #ffb59c;
+  --color-brand-onSurface: #ffb59c;
+  --color-brand-deep: #5a1b03;
+  --color-brand-tint: rgba(255, 181, 156, 0.12);
+  --color-text-onBrand: #5a1b03;
+
+  --color-bg-canvas: #121416;
+  --color-bg-raised: #1e2022;
+  --color-bg-inset: #333537;
+  --color-bg-surface: #1a1c1e;
+  --color-field-bg: rgba(51, 53, 55, 0.5);
+
+  --color-text-primary: #e2e2e5;
+  --color-text-secondary: #d0c4bc;
+  --color-text-muted: #6b7280;
+  --color-text-placeholder: #6b7280;
+
+  --color-border-default: rgba(77, 69, 63, 0.3);
+  --color-border-subtle: rgba(77, 69, 63, 0.3);
+  --color-border-brand: rgba(77, 69, 63, 0.5);
+
+  --color-accent-slate: #446279;
+
+  --color-success: #9ccb86;
+  --color-danger: #ff9d8f;
+  --color-warning: #f0b86a;
+}
+
+// System preference, unless the player explicitly chose "light".
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    @include dark-palette;
+  }
+}
+
+// Explicit "dark" choice always wins, regardless of the OS preference.
+:root[data-theme='dark'] {
+  @include dark-palette;
+}
