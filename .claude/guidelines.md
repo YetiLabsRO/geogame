@@ -77,6 +77,13 @@ npm run build:all         # build both apps → frontend/dist/{player,staff}
 npx ng generate component some-name --project=player
 ```
 
+### Design system & platform layer (mobile-app)
+
+- **Player screens** are built from `shared/src/lib/ui` (`ui-button`, `ui-chip`, `ui-field`+`uiInput`, `ui-card`, `ui-stat-tile`, `ui-progress-meter`, `ui-avatar`, `ui-top-app-bar`, `ui-bottom-nav`, `ui-toast-outlet`/`ToastService`, `ui-empty-state`, `ui-alert`, `ui-spinner`, `ui-icon`) and the `.tr-*` typography utilities; colours/spacing/radius come only from the CSS custom properties in `shared/src/lib/theme/_tokens.scss` (light + dark). Team identity uses the runtime `--team-color` slot. The contract is [docs/design-system.md](../docs/design-system.md); `/dev/gallery` (dev builds) shows every component in both themes. The staff app still uses full Bootstrap.
+- **Bootstrap in the player** = grid, flex/spacing utilities and reboot only. No component classes (`btn`, `card`, `alert`, `badge`, `form-control`, `list-group`, `navbar`, `progress`, `modal`, `spinner-border`) and no Bootstrap colour utilities.
+- **Platform layer**: everything device-related is a service in `shared/src/lib/platform` that picks the Capacitor plugin on native and the browser API on the web (`PlatformService`, `GeolocationService`, `BackgroundLocationService`, `PushBridge`, `NfcService`, `HapticsService`, `KeepAwakeService`, `NetworkService`, `DeepLinkService`, `BleProximityService`). Screens never touch `navigator.geolocation`, `NDEFReader`, `PushManager`, `wakeLock` or `@capacitor/*` directly. Relative `/api`/`/media`/websocket URLs resolve against `PlatformService.apiBaseUrl()` (empty on the web, `environment.nativeApiBaseUrl` in the shell, debug override via Preferences).
+- **Native shell**: `frontend/capacitor.config.ts`; `npm run cap:sync[:dev]` builds the player and syncs `android/` + `ios/`; native code that must be committed lives in `android/app/src/main/java/ro/yetilabs/geogame` and `ios/App/App` (local `BleAdvertiser` plugin). See [docs/mobile.md](../docs/mobile.md) for Firebase, signing, app links and the iOS (macOS-only) steps.
+
 ### MCP
 
 [.mcp.json](../.mcp.json) at the repo root registers two MCP servers for Claude Code:
