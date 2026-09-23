@@ -1,6 +1,6 @@
 import { HttpClient } from '@angular/common/http';
 import { Injectable, computed, inject, signal } from '@angular/core';
-import { Observable, tap } from 'rxjs';
+import { Observable, catchError, of, shareReplay, tap, throwError } from 'rxjs';
 
 const STORAGE_KEY = 'cercetador.auth.token';
 
@@ -38,6 +38,8 @@ export class AuthService {
 
   private readonly _token = signal<string | null>(this.readToken());
   private readonly _profile = signal<UserProfile | null>(null);
+  /** In-flight `/api/me/` request, shared by concurrent `ensureProfile` callers. */
+  private profileRequest: Observable<UserProfile> | null = null;
 
   readonly token = this._token.asReadonly();
   readonly profile = this._profile.asReadonly();
@@ -45,9 +47,9 @@ export class AuthService {
   readonly isStaff = computed(() => this._profile()?.is_staff ?? false);
 
   login(login: string, password: string): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>('/api/auth/login/', { login, password }).pipe(
-      tap((res) => this.storeToken(res.token)),
-    );
+    return this.http
+      .post<AuthResponse>('/api/auth/login/', { login, password })
+      .pipe(tap((res) => this.storeToken(res.token)));
   }
 
   register(payload: {
@@ -57,21 +59,59 @@ export class AuthService {
     first_name?: string;
     last_name?: string;
   }): Observable<AuthResponse> {
-    return this.http.post<AuthResponse>('/api/auth/register/', payload).pipe(
-      tap((res) => this.storeToken(res.token)),
-    );
+    return this.http
+      .post<AuthResponse>('/api/auth/register/', payload)
+      .pipe(tap((res) => this.storeToken(res.token)));
   }
 
   logout(): Observable<void> {
-    return this.http.post<void>('/api/auth/logout/', {}).pipe(
-      tap(() => this.clearToken()),
-    );
+    return this.http.post<void>('/api/auth/logout/', {}).pipe(tap(() => this.clearToken()));
   }
 
   fetchProfile(): Observable<UserProfile> {
-    return this.http.get<UserProfile>('/api/me/').pipe(
-      tap((profile) => this._profile.set(profile)),
+    return this.http
+      .get<UserProfile>('/api/me/')
+      .pipe(tap((profile) => this._profile.set(profile)));
+  }
+
+  /**
+   * The profile, fetching it once if it has not been loaded yet.
+   *
+   * A page reload restores the token from `localStorage` but not the
+   * profile, so for a moment the user is authenticated with `is_staff`
+   * unknown. Anything that authorizes on `is_staff` must await this
+   * rather than read a signal that is still null — treating "not loaded
+   * yet" as "not staff" is what used to sign people out on refresh.
+   *
+   * Concurrent callers share one in-flight request, so the route guard
+   * and the app shell do not each fetch `/api/me/` on every reload.
+   */
+  ensureProfile(): Observable<UserProfile> {
+    const loaded = this._profile();
+    if (loaded !== null) {
+      return of(loaded);
+    }
+    this.profileRequest ??= this.http.get<UserProfile>('/api/me/').pipe(
+      tap({
+        next: (profile) => {
+          this._profile.set(profile);
+          this.profileRequest = null;
+        },
+        error: () => {
+          this.profileRequest = null;
+        },
+      }),
+      catchError((error: { status?: number }) => {
+        // A token the server no longer accepts would otherwise keep
+        // bouncing the user between the guard and the login page.
+        if (error?.status === 401) {
+          this.clearToken();
+        }
+        return throwError(() => error);
+      }),
+      shareReplay({ bufferSize: 1, refCount: true }),
     );
+    return this.profileRequest;
   }
 
   requestPasswordReset(email: string): Observable<void> {

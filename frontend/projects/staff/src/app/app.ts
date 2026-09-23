@@ -92,9 +92,23 @@ export class App {
   /** Only meaningful below `lg`, where the sidebar is an overlay. */
   protected readonly sidebarOpen = signal(false);
 
+  /**
+   * True from a reload until the profile lands.
+   *
+   * The token survives a refresh but the profile does not, so `isStaff()`
+   * reads false for a moment. Without this the shell would flash its
+   * signed-out bar at a user who is signed in perfectly well.
+   */
+  protected readonly bootstrapping = signal(
+    this.auth.isAuthenticated() && this.auth.profile() === null,
+  );
+
   constructor() {
-    if (this.auth.isAuthenticated() && this.auth.profile() === null) {
-      this.auth.fetchProfile().subscribe({ error: () => {} });
+    if (this.bootstrapping()) {
+      this.auth.ensureProfile().subscribe({
+        next: () => this.bootstrapping.set(false),
+        error: () => this.bootstrapping.set(false),
+      });
     }
     // Choosing a destination dismisses the overlay; on wide screens the
     // sidebar is persistent and this is a no-op.

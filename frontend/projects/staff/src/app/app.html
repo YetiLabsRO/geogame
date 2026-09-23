@@ -69,6 +69,22 @@
       </main>
     </div>
   </div>
+} @else if (bootstrapping()) {
+  <!-- Reloaded and still resolving the profile: show a neutral bar rather
+       than the signed-out one, which would read as having been logged out. -->
+  <nav class="navbar bg-body-tertiary border-bottom">
+    <div class="container-fluid">
+      <span class="navbar-brand fw-semibold">Cercetador staff</span>
+      <span class="d-flex align-items-center gap-2 text-body-secondary small">
+        <span class="spinner-border spinner-border-sm"></span>
+        Restoring session…
+      </span>
+    </div>
+  </nav>
+
+  <main class="container py-4">
+    <router-outlet />
+  </main>
 } @else {
   <!-- Signed out / non-staff: no sidebar, just the bar and the page. -->
   <nav class="navbar bg-body-tertiary border-bottom">
