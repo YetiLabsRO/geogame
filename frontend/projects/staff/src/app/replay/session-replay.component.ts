@@ -4,7 +4,6 @@ import {
   Component,
   DestroyRef,
   ElementRef,
-  afterNextRender,
   computed,
   effect,
   inject,
@@ -31,6 +30,25 @@ import { extractErrorMessage } from '../auth/form-error';
 const FALLBACK_CENTER: [number, number] = [46.068374, 23.571797];
 const FALLBACK_ZOOM = 14;
 const UNCLAIMED_COLOR = '#9AAAB3';
+
+/**
+ * Last frame worth opening on: the final one carrying a player position,
+ * else the end of the window.
+ *
+ * A Session's scheduled window usually outlasts its actual play — and for
+ * a simulated run it outlasts it by hours. Opening on the literal last
+ * frame then shows an empty map with every player long since stale, which
+ * reads as a broken page rather than as a finished game.
+ */
+export function lastFrameOfInterest(bundle: SessionReplayBundle): number {
+  let last = -1;
+  for (const position of bundle.positions) {
+    if (position.frame > last) last = position.frame;
+  }
+  // No tracks at all (tracking off, or all purged): the end of the window
+  // still shows final tower ownership, which is the whole story there.
+  return last >= 0 ? last : Math.max(0, bundle.frame_count - 1);
+}
 
 /**
  * Session replay (session-replay capability).
@@ -157,8 +175,12 @@ const UNCLAIMED_COLOR = '#9AAAB3';
               @if (purgedFraction() > 0) {
                 <!-- The span retention has already eaten, marked rather
                      than silently trimmed off the front of the timeline. -->
-                <div class="progress mt-2" style="height: 4px" role="img"
-                     aria-label="Purged span of the timeline">
+                <div
+                  class="progress mt-2"
+                  style="height: 4px"
+                  role="img"
+                  aria-label="Purged span of the timeline"
+                >
                   <div
                     class="progress-bar bg-secondary opacity-50"
                     [style.width.%]="purgedFraction() * 100"
@@ -194,8 +216,8 @@ const UNCLAIMED_COLOR = '#9AAAB3';
               }
             </ul>
             <div class="card-footer small text-body-secondary py-2">
-              Towers held at this frame — not the score, which accrues over time from zone
-              control and is not reconstructed here.
+              Towers held at this frame — not the score, which accrues over time from zone control
+              and is not reconstructed here.
             </div>
           </div>
 
@@ -230,7 +252,11 @@ const UNCLAIMED_COLOR = '#9AAAB3';
             class="btn btn-sm btn-link p-0 text-decoration-none"
             (click)="toggleRawFeed()"
           >
-            <i class="bi" [class.bi-chevron-right]="!showRaw()" [class.bi-chevron-down]="showRaw()"></i>
+            <i
+              class="bi"
+              [class.bi-chevron-right]="!showRaw()"
+              [class.bi-chevron-down]="showRaw()"
+            ></i>
             Raw location pings
           </button>
         </div>
@@ -294,8 +320,8 @@ const UNCLAIMED_COLOR = '#9AAAB3';
 
             @if (rawFeed(); as h) {
               <p class="text-body-secondary small">
-                {{ h.pings.length }} ping(s) · kept for {{ h.retention_days }} days after
-                recording, then purged.
+                {{ h.pings.length }} ping(s) · kept for {{ h.retention_days }} days after recording,
+                then purged.
               </p>
               @if (h.pings.length) {
                 <div class="table-responsive">
@@ -316,7 +342,10 @@ const UNCLAIMED_COLOR = '#9AAAB3';
                           <td>{{ p.username }}</td>
                           <td>
                             @if (p.team_name; as team) {
-                              <span class="badge" [style.background-color]="p.team_color || '#6c757d'">
+                              <span
+                                class="badge"
+                                [style.background-color]="p.team_color || '#6c757d'"
+                              >
                                 {{ team }}
                               </span>
                             } @else {
@@ -326,7 +355,9 @@ const UNCLAIMED_COLOR = '#9AAAB3';
                           <td class="small font-monospace">
                             {{ p.lat.toFixed(6) }}, {{ p.lng.toFixed(6) }}
                           </td>
-                          <td class="text-end small">{{ p.accuracy !== null ? p.accuracy : '—' }}</td>
+                          <td class="text-end small">
+                            {{ p.accuracy !== null ? p.accuracy : '—' }}
+                          </td>
                           <td class="small">{{ p.recorded_at | date: 'medium' }}</td>
                           <td class="small text-body-secondary">
                             {{ p.received_at | date: 'shortTime' }}
@@ -458,7 +489,16 @@ export class SessionReplayComponent {
       this.load();
     }
 
-    afterNextRender(() => this.initMap());
+    // The map's host element lives inside `@if (bundle(); ...)`, so it does
+    // not exist on first render — the bundle is still in flight. Waiting for
+    // the element to appear is what makes the map show up at all; an
+    // `afterNextRender` here runs too early and silently does nothing.
+    effect(() => {
+      const host = this.mapContainer()?.nativeElement;
+      if (host && !this.map) {
+        this.initMap(host);
+      }
+    });
 
     effect(() => {
       // Re-render whenever the frame, the filter, or the bundle changes.
@@ -482,9 +522,7 @@ export class SessionReplayComponent {
       next: (bundle) => {
         for (const team of bundle.teams) this.teamColors.learn(team.id, team.color);
         this.bundle.set(bundle);
-        // Open on the end state, which is what a reader usually wants
-        // first; the scrubber walks back from there.
-        this.frameIndex.set(Math.max(0, bundle.frame_count - 1));
+        this.frameIndex.set(lastFrameOfInterest(bundle));
         this.loading.set(false);
         this.fitMapToContent();
       },
@@ -562,9 +600,7 @@ export class SessionReplayComponent {
 
   // ---- map ----------------------------------------------------------------
 
-  private initMap(): void {
-    const container = this.mapContainer()?.nativeElement;
-    if (!container) return;
+  private initMap(container: HTMLElement): void {
     this.map = L.map(container).setView(FALLBACK_CENTER, FALLBACK_ZOOM);
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19,

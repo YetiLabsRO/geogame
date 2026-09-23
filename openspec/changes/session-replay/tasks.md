@@ -51,7 +51,7 @@
 - [x] 6.3 Run `coverage run manage.py test game organize --noinput` and `coverage report --fail-under=80` clean. (942 tests OK; 92% total, `game/replay.py` 92%, `game/replay_api.py` 100%.)
 - [x] 6.4 Run the frontend test suite clean. (37 specs pass; both apps build.)
 - [x] 6.5 Drive a simulator run, stop it, then replay that Session — confirm both sources agree. Covered by `simulator.tests.SimulatedRunReplayTest` (5 tests): a driven-then-stopped run replays through the staff bundle, and the tape's last CAPTURE per tower is checked against the bundle's latest ownership interval.
-  - [ ] 6.5a Visual smoke test of the rendered page in a browser. **Not done** — needs the dev stack plus staff credentials for the local dev database, which this session does not have.
+  - [x] 6.5a Visual smoke test of the rendered page in a browser. Done once a working browser was available: map, tiles, player markers, scrubber, standings all render, and ownership changes as the timeline is dragged.
 
 ## 7. Defects found during verification
 
@@ -59,3 +59,6 @@
 - [x] 7.2 Frame assignment was off by one roughly half the time: Postgres `CAST(... AS integer)` rounds, so a window start carrying >0.5s of microseconds pushed every sample into the next frame. Replaced with an explicit `FLOOR` over float seconds; pinned by `test_frame_assignment_ignores_sub_second_window_skew`.
 - [x] 7.3 An unparseable `from`/`to` bound was silently ignored on the existing `location-history` feed. Both it and the replay endpoint now reject it with a 400 naming the bound, via a shared `parse_window_bound`.
 - [x] 7.4 CI ran only `game organize`, so the simulator app's tests — including the new sim-to-replay coverage — executed nowhere. Added `simulator` to the CI test labels and to the documented commands; the combined run is green (964 tests, 92%).
+- [x] 7.5 The map never initialized. `initMap` ran in `afterNextRender`, but its host element lives inside `@if (bundle(); ...)` and the bundle is fetched async — so the container did not exist yet and the call silently returned. Now initializes when the element appears.
+- [x] 7.6 The view opened on the last frame of the scheduled window, which for a session whose play ended early (every simulated run) is an empty map with all players stale. Now opens on the last frame carrying a position.
+- [x] 7.7 Ownership for a tower no longer in the Game's collections vanished from replay — the bundle listed only current geometry, so editing the map retroactively erased history. The bundle now also includes towers its ownership intervals refer to.

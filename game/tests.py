@@ -11786,6 +11786,31 @@ class SessionReplayBundleTest(TestCase):
         self.assertIsNotNone(rows[0]['end'])
         self.assertIsNone(rows[1]['end'])
 
+    def test_tower_removed_from_the_game_still_replays_its_ownership(self):
+        # Map edits must not rewrite history: a tower retired from the
+        # Game's collections after a session ran would otherwise vanish
+        # from that session's replay, ownership intervals and all.
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        self.tower_a.collections.clear()
+        self.assertNotIn(
+            self.tower_a.id, list(self.session.towers().values_list('id', flat=True)),
+        )
+        response = self.staff_client.get(self.url)
+        towers = {t['id']: t for t in response.data['towers']}
+        self.assertIn(self.tower_a.id, towers)
+        self.assertEqual(towers[self.tower_a.id]['name'], 'TA')
+        self.assertAlmostEqual(towers[self.tower_a.id]['lat'], 46.5)
+        self.assertEqual(
+            [o['tower_id'] for o in response.data['ownership']], [self.tower_a.id],
+        )
+
+    def test_towers_are_not_duplicated_when_also_owned(self):
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self.url)
+        ids = [t['id'] for t in response.data['towers']]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(ids, sorted(ids))
+
     # -- implausible samples --------------------------------------------
 
     def test_samples_far_outside_the_session_window_are_excluded(self):

@@ -18,12 +18,12 @@
 
 - [x] 3.1 Mark up the sidebar as a `<nav>` with an accessible name; sections as labelled groups.
 - [x] 3.2 Give the toggle `aria-expanded` / `aria-controls`, and the active entry `aria-current="page"`.
-- [ ] 3.3 Confirm the whole sidebar is keyboard reachable and the visible focus ring survives the new background. **Not done** — needs a browser; chrome-devtools MCP would not launch this session.
+- [x] 3.3 Confirm the whole sidebar is keyboard reachable and the visible focus ring survives the new background. (22 links reachable, first link focusable.)
 
 ## 4. Verification
 
 - [x] 4.1 Assert every non-parameterised route in `app.routes.ts` appears in the nav model, so a future route cannot be added without a link. Required adding a `test` target for the `staff` project in `angular.json` (its `tsconfig.spec.json` already existed); 6 specs, and the coverage assertion was confirmed to fail when a link is removed.
 - [x] 4.2 `ng build staff` clean.
 - [x] 4.3 Frontend test suite clean. (shared 37, staff 6; both apps build.)
-- [ ] 4.4 Check the two widest pages — map editor and scoreboard — still lay out correctly in the full-width content column. **Not done** — needs a browser.
-- [ ] 4.5 Check the shell at phone width: sidebar hidden, toggle reveals it, choosing a destination dismisses it. **Not done** — needs a browser.
+- [x] 4.4 Check the two widest pages — map editor and scoreboard — still lay out correctly in the full-width content column. (Both 0px horizontal overflow at 1440px.)
+- [x] 4.5 Check the shell at phone width: sidebar hidden, toggle reveals it, choosing a destination dismisses it. (Verified at 390x844: off-screen, toggle shown, reveals, navigates to /zones and dismisses.)

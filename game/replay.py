@@ -24,7 +24,7 @@ from django.db.models import FloatField, IntegerField, Q, Value
 from django.db.models.functions import Cast, Extract, Floor
 from django.utils import timezone
 
-from game.models import LocationConsent, LocationPing, TeamTowerOwnership
+from game.models import LocationConsent, LocationPing, TeamTowerOwnership, Tower
 
 # Frame-interval bounds. The floor stops a caller asking for per-second
 # frames over a three-hour session; the cap coarsens rather than
@@ -243,6 +243,26 @@ def _players(session):
     return list(players.values())
 
 
+def _towers_for(session, ownership):
+    """The Game's towers, plus any the window's ownership refers to.
+
+    A Tower reaches a Game through Collections, and that link can change
+    after a Session has been played — a tower retired from a collection,
+    or a collection unlinked. Listing only the Game's current geometry
+    would then retroactively erase that tower from past replays: the
+    ownership intervals would still be in the bundle, but with no tower
+    to attach them to, so it would silently vanish from the map and from
+    standings. History should not change because the map was edited.
+    """
+    towers = list(session.towers().order_by('id'))
+    referenced = {row['tower_id'] for row in ownership}
+    missing = referenced - {tower.id for tower in towers}
+    if missing:
+        towers.extend(Tower.objects.filter(pk__in=missing).order_by('id'))
+        towers.sort(key=lambda tower: tower.id)
+    return towers
+
+
 def build_replay_bundle(session, *, interval_seconds=None, window_from=None, window_to=None):
     """Everything needed to replay `session`, in one response."""
     start, end = _window(session, window_from, window_to)
@@ -250,6 +270,7 @@ def build_replay_bundle(session, *, interval_seconds=None, window_from=None, win
     interval, coarsened = resolve_interval(interval_seconds, span)
     frame_count = _ceil_div(span, interval) + 1 if span else 1
 
+    ownership = _ownership_intervals(session, start, end)
     return {
         'session': {
             'id': session.id,
@@ -274,13 +295,13 @@ def build_replay_bundle(session, *, interval_seconds=None, window_from=None, win
             'name': tower.name,
             'lat': tower.location.y,
             'lng': tower.location.x,
-        } for tower in session.towers().order_by('id')],
+        } for tower in _towers_for(session, ownership)],
         'zones': [{
             'id': zone.id,
             'name': zone.name,
             'shape': zone.shape.geojson if zone.shape else None,
         } for zone in session.zones().order_by('id')],
-        'ownership': _ownership_intervals(session, start, end),
+        'ownership': ownership,
         'positions': _bucket_pings(session, start, end, interval, frame_count),
         'availability': _availability(session, start),
     }
