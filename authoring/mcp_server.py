@@ -36,10 +36,12 @@ def _build_server():
         name='cercetador-authoring',
         instructions=(
             'Author scouting geo-game content. Read the available '
-            'collections, geometry, challenges, games, roles, and the '
-            'config schema; then STAGE proposals (never live writes). A '
-            'human approves and applies them. Every challenge suggestion '
-            'needs a rationale.'
+            'collections, geometry, challenges, games, sessions, roles, '
+            'and the config schema; then STAGE proposals (never live '
+            'writes). A human approves and applies them. Every challenge '
+            'suggestion needs a rationale. Staged sessions are always '
+            'created in DRAFT — lifecycle transitions (start, pause, '
+            'finish) and team membership are human-only and have no tools.'
         ),
         stateless_http=True,
     )
@@ -60,6 +62,8 @@ def _build_server():
     register('list_challenges', 'list_challenges')
     register('list_games', 'list_games')
     register('get_game', 'get_game')
+    register('list_sessions', 'list_sessions')
+    register('get_session', 'get_session')
     register('list_team_groups', 'list_team_groups')
     register('list_game_roles', 'list_game_roles')
     register('describe_config_schema', 'describe_config_schema')
@@ -75,6 +79,8 @@ def _build_server():
     register('propose_zone', 'propose_zone')
     register('propose_game', 'propose_game')
     register('propose_game_role', 'propose_game_role')
+    register('propose_session', 'propose_session')
+    register('propose_team', 'propose_team')
     register('propose_config', 'propose_config')
     register('propose_link', 'propose_link')
     register('suggest_challenge', 'suggest_challenge')

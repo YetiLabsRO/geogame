@@ -41,6 +41,10 @@ def describe_config_schema():
             'default': field.get_default(),
             'help': str(getattr(field, 'help_text', '') or ''),
             'overridable_per_session': True,
+            # Scopes `propose_config` accepts for this knob. Every knob in
+            # OVERRIDABLE_CONFIG_FIELDS is settable on the Game as a default
+            # and on a Session as an override.
+            'scopes': ['game', 'session'],
         }
         if field.choices:
             entry['enum'] = [

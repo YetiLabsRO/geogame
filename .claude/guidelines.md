@@ -55,7 +55,7 @@ VS Code launch configurations in `.vscode/launch.json` wrap these same commands 
 
 ## Tests & CI
 
-- Run the full suite: `coverage run manage.py test game organize simulator --noinput && coverage report --fail-under=80`
+- Run the full suite: `coverage run manage.py test game organize simulator authoring --noinput && coverage report --fail-under=80`
 - Backend tests live in `game/tests.py` and `organize/tests.py`, organized by feature area.
 - Two test runs cannot share the test database. To run the suite while another is in flight, give yours its own: `DB_TEST_NAME=geogame_test_<something> coverage run manage.py test ...`
 - CI workflow: `.github/workflows/ci.yml` — PostGIS 3.4 service container, runs ruff + tests + coverage gate.
