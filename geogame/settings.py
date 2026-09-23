@@ -110,6 +110,25 @@ else:
         },
     }
 
+# Cache: Redis when available, local memory otherwise. The only thing
+# that currently depends on it is the share-link rate limit, which is
+# per-process on LocMem — acceptable for development, and the reason
+# production sets REDIS_URL.
+if _REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': _REDIS_URL,
+        },
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'geogame-default',
+        },
+    }
+
 # Coalesce `scoreboard.updated` broadcasts to at most one per this many
 # seconds per Session (0 disables throttling — used by tests).
 REALTIME_SCOREBOARD_THROTTLE_SECONDS = float(
@@ -194,6 +213,12 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
     ],
+    # Only the unauthenticated share-link endpoints throttle today; the
+    # scope is keyed on the link token rather than the client address so
+    # one busy display cannot spend another display's budget.
+    'DEFAULT_THROTTLE_RATES': {
+        'overview_link': os.environ.get('OVERVIEW_LINK_THROTTLE_RATE', '120/min'),
+    },
 }
 
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')

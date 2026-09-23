@@ -43,6 +43,7 @@ from rest_framework.test import APIClient
 
 from game import (
     events,
+    overview,  # live-overview
     replay,  # session-replay
 )
 from game import trail as trail_engine  # mode-trail-discovery
@@ -100,6 +101,7 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     ProximityIdentity,
     ProximityReport,
     ScoreMultiplier,
+    SessionOverviewLink,  # live-overview
     TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -130,11 +132,15 @@ from game.proximity import (
 from geogame.asgi import application as asgi_application
 from organize.models import (  # mode-trail-discovery  # mode-dementors-ble
     DEMENTOR_EMPTY_DIE,
+    LOCATION_VISIBILITY_EVERYONE,  # live-overview
+    LOCATION_VISIBILITY_NONE,
+    LOCATION_VISIBILITY_OWN_TEAM,
     MODE_DOMINATION,
     MODE_TRAIL,
     PROXIMITY_BUCKET_FAR,
     PROXIMITY_BUCKET_NEAR,
     PROXIMITY_BUCKET_VERY_CLOSE,
+    TEAMMATE_VISIBILITY_SELECT_COUNT,  # live-overview
     TOWER_LOCK_FREE_FOR_ALL,
     TOWER_LOCK_ON_INITIATE,
     Game,
@@ -11894,3 +11900,521 @@ class SessionReplayBundleTest(TestCase):
         self.assertEqual(
             response.data['window']['from'], self.start + timedelta(minutes=30),
         )
+
+
+class LiveOverviewSnapshotTest(TestCase):
+    """live-overview — the snapshot behind the big-screen view."""
+
+    def setUp(self):
+        self.game = _make_game(name='Overview game')
+        self.game.location_tracking_enabled = True
+        self.game.location_visibility = LOCATION_VISIBILITY_EVERYONE
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.session.state = Session.RUNNING
+        self.session.save()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower_a = _make_tower(self.game, name='TA', zone=self.zone)
+        self.tower_b = _make_tower(self.game, name='TB', zone=self.zone, lng=23.6)
+        self.team_a = _make_team(self.game, self.group, name='alpha')
+        self.team_b = _make_team(self.game, self.group, name='bravo', color='#aa0000')
+        self.client_a, self.user_a = _authed_client(self.team_a, username='oa')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.url = reverse('api-staff-session-overview', args=[self.session.id])
+
+    def _own(self, tower, team, *, ended=False):
+        row = TeamTowerOwnership.objects.create(team=team, tower=tower)
+        if ended:
+            TeamTowerOwnership.objects.filter(pk=row.pk).update(
+                timestamp_end=timezone.now(),
+            )
+        return row
+
+    def _consent(self, user):
+        return LocationConsent.objects.create(
+            user=user, session=self.session, agreed_at=timezone.now(),
+        )
+
+    def _ping(self, user, team, lng=23.5, lat=46.5):
+        return LocationPing.objects.create(
+            user=user, session=self.session, team=team,
+            point=Point(lng, lat), recorded_at=timezone.now(),
+        )
+
+    # -- access ---------------------------------------------------------
+
+    def test_overview_is_staff_only(self):
+        self.assertEqual(self.client_a.get(self.url).status_code, 403)
+
+    def test_unknown_session_is_404(self):
+        url = reverse('api-staff-session-overview', args=[999999])
+        self.assertEqual(self.staff_client.get(url).status_code, 404)
+
+    # -- shape ----------------------------------------------------------
+
+    def test_snapshot_carries_geometry_teams_and_state(self):
+        response = self.staff_client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertEqual(data['session']['state'], Session.RUNNING)
+        self.assertEqual(
+            sorted(t['name'] for t in data['towers']), ['TA', 'TB'],
+        )
+        self.assertEqual([z['id'] for z in data['zones']], [self.zone.id])
+        self.assertEqual(
+            sorted(t['name'] for t in data['teams']), ['alpha', 'bravo'],
+        )
+        self.assertEqual([g['slug'] for g in data['groups']], [self.group.slug])
+
+    def test_owner_comes_from_the_open_interval(self):
+        self._own(self.tower_a, self.team_a)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertEqual(
+            towers['TA']['ownership'][self.group.slug]['team_name'], 'alpha',
+        )
+        self.assertIsNone(towers['TB']['ownership'][self.group.slug])
+
+    def test_a_closed_interval_no_longer_paints_the_tower(self):
+        # The distinction the replay view blurs on purpose and this one
+        # must not: a tower held yesterday is not held now.
+        self._own(self.tower_a, self.team_a, ended=True)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIsNone(towers['TA']['ownership'][self.group.slug])
+
+    def test_recent_events_are_newest_first_and_name_the_capture(self):
+        self._own(self.tower_a, self.team_a)
+        self._own(self.tower_b, self.team_b)
+        data = self.staff_client.get(self.url).data
+        self.assertEqual(
+            [e['tower_name'] for e in data['events']], ['TB', 'TA'],
+        )
+        self.assertEqual(data['events'][0]['team_name'], 'bravo')
+
+    def test_standings_match_the_scoreboard_endpoint(self):
+        scoreboard_url = reverse(
+            'api-session-scoreboard', args=[self.session.id],
+        )
+        expected = self.staff_client.get(scoreboard_url).data['entries']
+        standings = self.staff_client.get(self.url).data['standings']
+        self.assertEqual(
+            [e['team_id'] for e in standings], [e['team_id'] for e in expected],
+        )
+
+    # -- the visibility rule that defines this capability ----------------
+
+    def test_everyone_visibility_plots_consenting_players(self):
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertTrue(positions['visible'])
+        self.assertIsNone(positions['reason'])
+        self.assertEqual([p['user_id'] for p in positions['items']], [self.user_a.id])
+
+    def test_own_team_visibility_plots_nobody_and_says_why(self):
+        # The default. Caller-relative, so it has no meaning on a screen
+        # a whole room reads — and staff privilege must not override it.
+        self.game.location_visibility = LOCATION_VISIBILITY_OWN_TEAM
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        data = self.staff_client.get(self.url).data
+        self.assertFalse(data['positions']['visible'])
+        self.assertEqual(
+            data['positions']['reason'], overview.REASON_VISIBILITY_OWN_TEAM,
+        )
+        self.assertEqual(data['positions']['items'], [])
+        # The rest of the map is unaffected — no dots, not an empty page.
+        self.assertEqual(len(data['towers']), 2)
+
+    def test_none_visibility_plots_nobody(self):
+        self.game.location_visibility = LOCATION_VISIBILITY_NONE
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(positions['reason'], overview.REASON_VISIBILITY_NONE)
+
+    def test_nearest_n_teammate_mode_plots_nobody(self):
+        self.game.teammate_visibility_mode = TEAMMATE_VISIBILITY_SELECT_COUNT
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(
+            positions['reason'], overview.REASON_VISIBILITY_NEAREST_ONLY,
+        )
+
+    def test_tracking_disabled_plots_nobody(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(positions['reason'], overview.REASON_TRACKING_DISABLED)
+
+    def test_staff_bypass_does_not_reach_the_overview(self):
+        # `GET /api/location/live/` hands staff every position whatever
+        # the config says. That bypass is what this endpoint must NOT
+        # inherit, so assert the two disagree for the same session.
+        self.game.location_visibility = LOCATION_VISIBILITY_OWN_TEAM
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        from game.location_api import visible_live_pings
+        staff_user = get_user_model().objects.get(username='staff')
+        self.assertEqual(len(visible_live_pings(self.session, staff_user)), 1)
+        self.assertEqual(self.staff_client.get(self.url).data['positions']['items'], [])
+
+    def test_a_player_without_consent_never_appears(self):
+        self._ping(self.user_a, self.team_a)  # pinged, never consented
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertTrue(positions['visible'])
+        self.assertEqual(positions['items'], [])
+
+    def test_a_withdrawn_consent_removes_the_player(self):
+        consent = self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        consent.withdrawn_at = timezone.now()
+        consent.save()
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertEqual(positions['items'], [])
+
+
+class OverviewShareLinkTest(TestCase):
+    """live-overview — issuing, using and revoking a share link."""
+
+    def setUp(self):
+        self.game = _make_game(name='Share game')
+        self.game.location_tracking_enabled = True
+        self.game.location_visibility = LOCATION_VISIBILITY_EVERYONE
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='TA', zone=self.zone)
+        self.team = _make_team(self.game, self.group, name='alpha')
+        self.client_a, self.user_a = _authed_client(self.team, username='sa')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.links_url = reverse(
+            'api-staff-session-overview-links', args=[self.session.id],
+        )
+
+    def _issue(self, label='projector'):
+        response = self.staff_client.post(
+            self.links_url, {'label': label}, format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        return response.data
+
+    # -- issuing --------------------------------------------------------
+
+    def test_issuing_a_link_returns_an_openable_address(self):
+        link = self._issue()
+        self.assertTrue(link['token'])
+        self.assertEqual(link['label'], 'projector')
+        self.assertTrue(link['is_usable'])
+        self.assertIn(link['token'], link['path'])
+        self.assertEqual(link['created_by'], 'staff')
+
+    def test_tokens_are_long_and_distinct(self):
+        first, second = self._issue('a'), self._issue('b')
+        self.assertNotEqual(first['token'], second['token'])
+        self.assertGreaterEqual(len(first['token']), 24)
+
+    def test_issuing_is_staff_only(self):
+        response = self.client_a.post(self.links_url, {}, format='json')
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_unparseable_expiry_is_rejected(self):
+        response = self.staff_client.post(
+            self.links_url, {'expires_at': 'soonish'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    # -- viewing --------------------------------------------------------
+
+    def test_an_anonymous_viewer_sees_the_overview(self):
+        link = self._issue()
+        url = reverse('api-overview-public', args=[link['token']])
+        response = APIClient().get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['session']['id'], self.session.id)
+        self.assertEqual([t['name'] for t in response.data['towers']], ['TA'])
+
+    def test_the_share_snapshot_carries_no_usernames(self):
+        LocationConsent.objects.create(
+            user=self.user_a, session=self.session, agreed_at=timezone.now(),
+        )
+        LocationPing.objects.create(
+            user=self.user_a, session=self.session, team=self.team,
+            point=Point(23.5, 46.5), recorded_at=timezone.now(),
+        )
+        link = self._issue()
+        url = reverse('api-overview-public', args=[link['token']])
+        items = APIClient().get(url).data['positions']['items']
+        self.assertEqual(len(items), 1)
+        self.assertNotIn('username', items[0])
+        # The dot and its colour are the point; the name is not.
+        self.assertEqual(items[0]['team_name'], 'alpha')
+
+        staff_items = self.staff_client.get(
+            reverse('api-staff-session-overview', args=[self.session.id]),
+        ).data['positions']['items']
+        self.assertIn('username', staff_items[0])
+
+    def test_an_unknown_token_is_404(self):
+        url = reverse('api-overview-public', args=['nope'])
+        self.assertEqual(APIClient().get(url).status_code, 404)
+
+    # -- revoking -------------------------------------------------------
+
+    def test_revoking_stops_the_link(self):
+        link = self._issue()
+        view_url = reverse('api-overview-public', args=[link['token']])
+        self.assertEqual(APIClient().get(view_url).status_code, 200)
+        revoke_url = reverse('api-staff-overview-link-revoke', args=[link['id']])
+        revoked = self.staff_client.post(revoke_url, {}, format='json')
+        self.assertEqual(revoked.status_code, 200)
+        self.assertFalse(revoked.data['is_usable'])
+        self.assertIsNotNone(revoked.data['revoked_at'])
+        self.assertEqual(APIClient().get(view_url).status_code, 404)
+
+    def test_a_revoked_link_is_indistinguishable_from_one_that_never_existed(self):
+        link = self._issue()
+        self.staff_client.post(
+            reverse('api-staff-overview-link-revoke', args=[link['id']]), {},
+            format='json',
+        )
+        revoked = APIClient().get(
+            reverse('api-overview-public', args=[link['token']]),
+        )
+        unknown = APIClient().get(
+            reverse('api-overview-public', args=['never-existed']),
+        )
+        self.assertEqual(revoked.status_code, unknown.status_code)
+        self.assertEqual(revoked.data, unknown.data)
+
+    def test_a_revoked_link_stays_listed(self):
+        link = self._issue()
+        self.staff_client.post(
+            reverse('api-staff-overview-link-revoke', args=[link['id']]), {},
+            format='json',
+        )
+        listed = self.staff_client.get(self.links_url).data
+        self.assertEqual([row['id'] for row in listed], [link['id']])
+        self.assertFalse(listed[0]['is_active'])
+
+    def test_an_expired_link_stops_working(self):
+        link = SessionOverviewLink.objects.create(
+            session=self.session,
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        url = reverse('api-overview-public', args=[link.token])
+        self.assertEqual(APIClient().get(url).status_code, 404)
+        self.assertFalse(link.is_usable())
+
+    def test_a_link_with_a_future_expiry_still_works(self):
+        link = SessionOverviewLink.objects.create(
+            session=self.session,
+            expires_at=timezone.now() + timedelta(hours=3),
+        )
+        url = reverse('api-overview-public', args=[link.token])
+        self.assertEqual(APIClient().get(url).status_code, 200)
+
+    def test_a_link_reaches_only_its_own_session(self):
+        other_game = _make_game(name='Other game', slug='other-game')
+        other_session = _default_session(other_game)
+        link = self._issue()
+        data = APIClient().get(
+            reverse('api-overview-public', args=[link['token']]),
+        ).data
+        self.assertEqual(data['session']['id'], self.session.id)
+        self.assertNotEqual(data['session']['id'], other_session.id)
+
+    def test_the_share_endpoint_is_rate_limited_per_token(self):
+        # The rate is patched on the throttle rather than through
+        # `override_settings`: DRF binds `THROTTLE_RATES` at import time,
+        # so overriding the setting here would silently do nothing and
+        # leave this test passing against no throttle at all.
+        from django.core.cache import cache
+
+        from game.overview_api import OverviewLinkThrottle
+        cache.clear()
+        self.addCleanup(cache.clear)
+        first, second = self._issue('a'), self._issue('b')
+        first_url = reverse('api-overview-public', args=[first['token']])
+        second_url = reverse('api-overview-public', args=[second['token']])
+        client = APIClient()
+        with patch.dict(
+            OverviewLinkThrottle.THROTTLE_RATES, {'overview_link': '2/min'},
+        ):
+            self.assertEqual(client.get(first_url).status_code, 200)
+            self.assertEqual(client.get(first_url).status_code, 200)
+            self.assertEqual(client.get(first_url).status_code, 429)
+            # A second display must not have been starved by the first.
+            self.assertEqual(client.get(second_url).status_code, 200)
+
+
+class OverviewShareSocketTest(TransactionTestCase):
+    """live-overview — realtime admission and the event allowlist."""
+
+    def setUp(self):
+        events.reset_throttle()
+        self.game = _make_game('Overview WS')
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group, name='ows1')
+        self.session = self.team.session
+        self.link = SessionOverviewLink.objects.create(session=self.session)
+
+        self.game_b = _make_game('Overview WS B', slug='overview-ws-b')
+        self.group_b = _make_group(self.game_b, name='B', slug='ows-b')
+        self.team_b = _make_team(self.game_b, self.group_b, name='ows2')
+        self.session_b = self.team_b.session
+
+    async def _connect(self, session, *, overview=None, token=None):
+        query = []
+        if token:
+            query.append(f'token={token}')
+        if overview:
+            query.append(f'overview={overview}')
+        suffix = f'?{"&".join(query)}' if query else ''
+        communicator = WebsocketCommunicator(
+            asgi_application, f'/ws/session/{session.id}/{suffix}',
+        )
+        connected, code = await communicator.connect()
+        return communicator, connected, code
+
+    async def test_a_share_link_is_admitted_and_receives_overview_events(self):
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_a_share_viewer_never_receives_dementor_ticks(self):
+        # The allowlist's whole point: this envelope carries per-player
+        # role and energy detail the overview does not render.
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'dementor.tick', {'players': [{'secret': 1}]},
+        )
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        # The scoreboard event is what arrives — the tick was dropped on
+        # the way out rather than merely arriving later.
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_an_event_type_outside_the_allowlist_is_dropped(self):
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'some.future.event', {'anything': True},
+        )
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_a_member_still_receives_everything(self):
+        # The allowlist must narrow share viewers only — a real member's
+        # socket is unchanged.
+        def _member_token():
+            _, member = _authed_client(self.team, username='ows-member')
+            return Token.objects.get(user=member).key
+
+        token = await database_sync_to_async(_member_token)()
+        communicator, connected, _ = await self._connect(
+            self.session, token=token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'dementor.tick', {'players': []},
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'dementor.tick')
+        await communicator.disconnect()
+
+    async def test_a_link_is_refused_on_another_sessions_socket(self):
+        communicator, connected, code = await self._connect(
+            self.session_b, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4403)
+        await communicator.disconnect()
+
+    async def test_a_revoked_link_cannot_connect(self):
+        await database_sync_to_async(self.link.revoke)()
+        communicator, connected, code = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_an_expired_link_cannot_connect(self):
+        await database_sync_to_async(
+            lambda: SessionOverviewLink.objects.filter(pk=self.link.pk).update(
+                expires_at=timezone.now() - timedelta(minutes=1),
+            )
+        )()
+        communicator, connected, code = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_revoking_closes_a_socket_already_open(self):
+        # Without this, a revoke button stops the next request and
+        # leaves the screen already on the wall updating happily.
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_overview_revoked)(
+            self.link.token,
+        )
+        message = await communicator.receive_output()
+        self.assertEqual(message['type'], 'websocket.close')
+        self.assertEqual(message['code'], 4403)
+        await communicator.disconnect()
+
+    async def test_presenting_both_credentials_is_refused(self):
+        def _staff_token():
+            _, staff = _staff_client(username='ows-staff')
+            return Token.objects.get(user=staff).key
+
+        token = await database_sync_to_async(_staff_token)()
+        communicator, connected, code = await self._connect(
+            self.session, token=token, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_an_unknown_overview_token_is_refused(self):
+        communicator, connected, code = await self._connect(
+            self.session, overview='not-a-link',
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()

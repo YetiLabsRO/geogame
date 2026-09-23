@@ -26,6 +26,7 @@ import {
   GameMode,
   InfoHintComponent,
   LocationVisibility,
+  OverviewLink,
   PageHeaderComponent,
   PauseHistory,
   Phase10Overrides,
@@ -228,6 +229,9 @@ const TABS: TabDef[] = [
             <span actions class="badge" [class]="stateBadgeClass(s.state)">
               {{ stateLabel(s.state) }}
             </span>
+            <a actions [routerLink]="['/sessions', sessionId, 'overview']" class="btn btn-sm btn-outline-secondary">
+              <i class="bi bi-map"></i> Live overview
+            </a>
             <a actions [routerLink]="['/sessions', sessionId, 'replay']" class="btn btn-sm btn-outline-secondary">
               <i class="bi bi-play-btn"></i> Replay
             </a>
@@ -378,6 +382,104 @@ const TABS: TabDef[] = [
             </div>
           </div>
         }
+
+        <!-- live-overview: screens showing this session ------------------- -->
+        <div class="card mb-4">
+          <div class="card-body">
+            <h2 class="h6 mb-1">
+              Big-screen links
+              <app-info-hint text="A share link opens this session's live overview on a screen with nobody signed in at it — a projector in the base tent, a TV for parents. It is read-only and reaches this session only. Revoking one stops it immediately, including a screen already showing it." />
+            </h2>
+            <p class="text-body-secondary small mb-3">
+              Player positions follow this session's live-visibility setting rather than your staff
+              access, so a session limited to “own team” shows towers and standings but no dots.
+            </p>
+
+            @if (linkError(); as msg) {
+              <div class="alert alert-danger py-2">{{ msg }}</div>
+            }
+
+            <div class="d-flex flex-wrap gap-2 align-items-end mb-3">
+              <div>
+                <label class="form-label small mb-1" for="overview-link-label">
+                  What screen is this?
+                </label>
+                <input
+                  id="overview-link-label"
+                  class="form-control form-control-sm"
+                  style="min-width: 16rem"
+                  placeholder="tent projector"
+                  [value]="newLinkLabel()"
+                  (input)="newLinkLabel.set($any($event.target).value)"
+                />
+              </div>
+              <button
+                type="button"
+                class="btn btn-sm btn-primary"
+                [disabled]="linkBusy()"
+                (click)="createOverviewLink()"
+              >
+                @if (linkBusy()) {
+                  <span class="spinner-border spinner-border-sm me-1"></span>
+                }
+                Create link
+              </button>
+            </div>
+
+            @if (overviewLinks().length === 0) {
+              <p class="text-body-secondary small mb-0">No share links yet.</p>
+            } @else {
+              <div class="table-responsive">
+                <table class="table table-sm align-middle mb-0">
+                  <thead>
+                    <tr>
+                      <th>Screen</th>
+                      <th>Address</th>
+                      <th>Status</th>
+                      <th class="text-end">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (link of overviewLinks(); track link.id) {
+                      <tr [class.opacity-50]="!link.is_usable">
+                        <td>{{ link.label || '—' }}</td>
+                        <td class="small font-monospace text-truncate" style="max-width: 22rem">
+                          {{ link.url }}
+                        </td>
+                        <td>
+                          @if (link.is_usable) {
+                            <span class="badge text-bg-success">Active</span>
+                          } @else {
+                            <span class="badge text-bg-secondary">Revoked</span>
+                          }
+                        </td>
+                        <td class="text-end">
+                          @if (link.is_usable) {
+                            <button
+                              type="button"
+                              class="btn btn-sm btn-outline-secondary me-1"
+                              (click)="copyOverviewLink(link)"
+                            >
+                              {{ copiedLinkId() === link.id ? 'Copied' : 'Copy' }}
+                            </button>
+                            <button
+                              type="button"
+                              class="btn btn-sm btn-outline-danger"
+                              [disabled]="linkBusy()"
+                              (click)="revokeOverviewLink(link)"
+                            >
+                              Revoke
+                            </button>
+                          }
+                        </td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          </div>
+        </div>
 
         <!-- Danger zone: destructive ops scoped to THIS session ------------ -->
         <div class="card border-danger mb-4">
@@ -1297,6 +1399,13 @@ export class StaffSessionDetailComponent {
   protected readonly lifecycleBusy = signal(false);
   protected readonly lifecycleError = signal<string | null>(null);
 
+  // live-overview: share links pointing screens at this session.
+  protected readonly overviewLinks = signal<OverviewLink[]>([]);
+  protected readonly linkBusy = signal(false);
+  protected readonly linkError = signal<string | null>(null);
+  protected readonly newLinkLabel = signal('');
+  protected readonly copiedLinkId = signal<number | null>(null);
+
   // Start readiness (team rules) — read-only; the lifecycle `start`
   // transition enforces these blockers server-side.
   protected readonly readiness = signal<StartReadiness | null>(null);
@@ -1324,6 +1433,71 @@ export class StaffSessionDetailComponent {
   protected readonly buildBusy = signal(false);
   protected readonly buildError = signal<string | null>(null);
   protected readonly buildResult = signal<TeamBuildResult | null>(null);
+
+  // ---- Big-screen share links (live-overview) ------------------------------
+
+  private refreshOverviewLinks(): void {
+    this.staff.overviewLinks(this.sessionId).subscribe({
+      next: (list) => this.overviewLinks.set(list),
+      error: () => {},
+    });
+  }
+
+  protected createOverviewLink(): void {
+    this.linkBusy.set(true);
+    this.linkError.set(null);
+    this.staff
+      .createOverviewLink(this.sessionId, { label: this.newLinkLabel().trim() })
+      .subscribe({
+        next: (link) => {
+          this.overviewLinks.set([link, ...this.overviewLinks()]);
+          this.newLinkLabel.set('');
+          this.linkBusy.set(false);
+        },
+        error: (err) => {
+          this.linkBusy.set(false);
+          this.linkError.set(extractErrorMessage(err));
+        },
+      });
+  }
+
+  protected async revokeOverviewLink(link: OverviewLink): Promise<void> {
+    // Confirmed because it is not undoable and it reaches outward: the
+    // screen it kills is one somebody else is watching.
+    const ok = await this.confirmService.confirm({
+      title: 'Revoke this link?',
+      message:
+        `“${link.label || link.token.slice(0, 8)}” stops working immediately, including any ` +
+        'screen already showing it. This cannot be undone — issue a new link instead.',
+      confirmLabel: 'Revoke',
+      danger: true,
+    });
+    if (!ok) return;
+    this.linkBusy.set(true);
+    this.linkError.set(null);
+    this.staff.revokeOverviewLink(link.id).subscribe({
+      next: (updated) => {
+        this.overviewLinks.set(
+          this.overviewLinks().map((row) => (row.id === updated.id ? updated : row)),
+        );
+        this.linkBusy.set(false);
+      },
+      error: (err) => {
+        this.linkBusy.set(false);
+        this.linkError.set(extractErrorMessage(err));
+      },
+    });
+  }
+
+  protected copyOverviewLink(link: OverviewLink): void {
+    navigator.clipboard?.writeText(link.url).then(
+      () => {
+        this.copiedLinkId.set(link.id);
+        setTimeout(() => this.copiedLinkId.set(null), 2000);
+      },
+      () => this.linkError.set('Could not copy — select the address and copy it manually.'),
+    );
+  }
 
   // ---- Score boosts (score-multipliers) -----------------------------------
   protected readonly multipliers = signal<AdminScoreMultiplier[]>([]);
@@ -1564,6 +1738,7 @@ export class StaffSessionDetailComponent {
       error: (err) => this.loadError.set(extractErrorMessage(err)),
     });
     this.refreshMultipliers();
+    this.refreshOverviewLinks();
     forkJoin({
       towers: this.staff.listTowers(),
       zones: this.staff.listZones(),

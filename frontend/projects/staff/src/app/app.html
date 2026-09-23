@@ -1,4 +1,10 @@
-@if (isAuthenticated() && isStaff()) {
+@if (chromeless()) {
+  <!-- Share-link display: the page IS the screen. No nav, no account
+       controls, nothing to sign into. -->
+  <main class="app-bare">
+    <router-outlet />
+  </main>
+} @else if (isAuthenticated() && isStaff()) {
   <div class="app-shell">
     <!-- Backdrop only exists below `lg`, where the sidebar overlays the page. -->
     @if (sidebarOpen()) {

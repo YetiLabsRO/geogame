@@ -38,6 +38,7 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Review queue', link: '/', icon: 'bi-inbox', exact: true },
       { label: 'Field mode', link: '/field', icon: 'bi-compass' },
+      { label: 'Live overview', link: '/overview', icon: 'bi-map' },
       { label: 'Scoreboard', link: '/scoreboard', icon: 'bi-trophy' },
       { label: 'Join requests', link: '/join-requests', icon: 'bi-person-plus' },
       { label: 'Game state', link: '/game-state', icon: 'bi-sliders' },
@@ -93,6 +94,21 @@ export class App {
   protected readonly sidebarOpen = signal(false);
 
   /**
+   * Routes that render with no app chrome at all (live-overview).
+   *
+   * `/live/<token>` is a screen on a wall with nobody signed in at it.
+   * A "Sign in" bar above it is both an invitation the viewer cannot
+   * act on and staff chrome on an unauthenticated surface, so the shell
+   * steps out of the way entirely rather than picking one of its
+   * signed-in / signed-out bars.
+   */
+  protected readonly chromeless = signal(App.isChromeless(this.router.url));
+
+  private static isChromeless(url: string): boolean {
+    return url.startsWith('/live/');
+  }
+
+  /**
    * True from a reload until the profile lands.
    *
    * The token survives a refresh but the profile does not, so `isStaff()`
@@ -117,7 +133,10 @@ export class App {
         filter((event) => event instanceof NavigationEnd),
         takeUntilDestroyed(),
       )
-      .subscribe(() => this.sidebarOpen.set(false));
+      .subscribe((event) => {
+        this.sidebarOpen.set(false);
+        this.chromeless.set(App.isChromeless((event as NavigationEnd).urlAfterRedirects));
+      });
   }
 
   protected toggleSidebar(): void {

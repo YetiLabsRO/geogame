@@ -68,6 +68,12 @@ from game.multipliers_api import (
     SessionScoreMultiplierListCreate,
     SessionScoreMultiplierToggle,
 )
+from game.overview_api import (
+    PublicOverviewView,
+    StaffOverviewLinkListCreateView,
+    StaffOverviewLinkRevokeView,
+    StaffSessionOverviewView,
+)
 from game.proximity_api import (
     DementorMeView,
     ProximityCapabilityView,
@@ -191,6 +197,28 @@ urlpatterns = [
         'api/staff/sessions/<int:pk>/replay/',
         StaffSessionReplayView.as_view(),
         name='api-staff-session-replay',
+    ),
+    # live-overview: one snapshot per Session for the big-screen view,
+    # plus the revocable share links that address it without an account.
+    path(
+        'api/staff/sessions/<int:pk>/overview/',
+        StaffSessionOverviewView.as_view(),
+        name='api-staff-session-overview',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/overview-links/',
+        StaffOverviewLinkListCreateView.as_view(),
+        name='api-staff-session-overview-links',
+    ),
+    path(
+        'api/staff/overview-links/<int:pk>/revoke/',
+        StaffOverviewLinkRevokeView.as_view(),
+        name='api-staff-overview-link-revoke',
+    ),
+    path(
+        'api/overview/<str:token>/',
+        PublicOverviewView.as_view(),
+        name='api-overview-public',
     ),
     path(
         'api/towers/<int:pk>/identify/',

@@ -109,6 +109,30 @@ export const routes: Routes = [
         (m) => m.DiscoveryMatrixComponent,
       ),
   },
+  // --- live-overview ---
+  {
+    // The nav entry: the overview of whatever the session switcher has
+    // selected, matching how /scoreboard is scoped.
+    path: 'overview',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
+  },
+  {
+    path: 'sessions/:id/overview',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
+  },
+  {
+    // The share-link route. Deliberately OUTSIDE `staffGuard`: the whole
+    // point is a screen with nobody signed in at it. The token is the
+    // credential and the backend is what checks it.
+    path: 'live/:token',
+    loadComponent: () =>
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
+  },
+  // --- end live-overview ---
   // --- session-replay ---
   {
     path: 'sessions/:id/replay',

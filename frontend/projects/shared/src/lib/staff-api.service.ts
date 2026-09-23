@@ -1055,6 +1055,49 @@ export class StaffApiService {
   }
 
 
+  // ---- live-overview: the big-screen view and its share links -------------
+
+  /** The overview snapshot for a Session, as staff. */
+  sessionOverview(id: number): Observable<OverviewSnapshot> {
+    return this.http.get<OverviewSnapshot>(`/api/staff/sessions/${id}/overview/`);
+  }
+
+  /**
+   * The same snapshot addressed by a share link, with no credentials.
+   *
+   * Deliberately narrower than `sessionOverview`: no usernames come
+   * back, because a name on a projector identifies a person to a room
+   * without telling that room anything it needs.
+   */
+  publicOverview(token: string): Observable<OverviewSnapshot> {
+    return this.http.get<OverviewSnapshot>(
+      `/api/overview/${encodeURIComponent(token)}/`,
+    );
+  }
+
+  overviewLinks(sessionId: number): Observable<OverviewLink[]> {
+    return this.http.get<OverviewLink[]>(
+      `/api/staff/sessions/${sessionId}/overview-links/`,
+    );
+  }
+
+  createOverviewLink(
+    sessionId: number,
+    body: { label?: string; expires_at?: string } = {},
+  ): Observable<OverviewLink> {
+    return this.http.post<OverviewLink>(
+      `/api/staff/sessions/${sessionId}/overview-links/`,
+      body,
+    );
+  }
+
+  revokeOverviewLink(id: number): Observable<OverviewLink> {
+    return this.http.post<OverviewLink>(
+      `/api/staff/overview-links/${id}/revoke/`,
+      {},
+    );
+  }
+
   // ---- nfc-native-and-secure-links: tag provisioning + scan audit ----------
 
   nfcTags(params?: { tower?: number; mode?: string }): Observable<NfcTagInfo[]> {
@@ -1635,4 +1678,122 @@ export interface SessionReplayBundle {
   ownership: SessionReplayOwnership[];
   positions: SessionReplayPosition[];
   availability: SessionReplayAvailability;
+}
+
+
+// ---- live-overview -------------------------------------------------------
+
+/** A team as the overview paints it. */
+export interface OverviewTeamRef {
+  team_id: number;
+  team_name: string;
+  team_color: string;
+}
+
+export interface OverviewTower {
+  id: number;
+  name: string;
+  lat: number;
+  lng: number;
+  /**
+   * Owner per TeamGroup slug, or null where that group holds nobody.
+   * Groups play the same map at once, so a tower has one owner *per
+   * group* rather than one owner — the same shape the
+   * `tower.ownership_changed` envelope carries, so an event applies to
+   * a snapshot without reshaping.
+   */
+  ownership: Record<string, OverviewTeamRef | null>;
+}
+
+export interface OverviewZone {
+  id: number;
+  name: string;
+  shape: string | null;
+  /** Fill per TeamGroup slug; '#FFFFFF' contested, '#000000' unheld. */
+  colors: Record<string, string>;
+}
+
+export interface OverviewStanding {
+  team_id: number;
+  team_name: string;
+  team_color: string;
+  group_name: string | null;
+  group_slug: string | null;
+  locked_score: number;
+  floating_score: number;
+  current_score: number;
+}
+
+export interface OverviewEvent {
+  tower_id: number;
+  tower_name: string;
+  team_id: number;
+  team_name: string;
+  team_color: string;
+  group_slug: string | null;
+  at: string;
+  still_held: boolean;
+}
+
+export interface OverviewPosition {
+  user_id: number;
+  /** Absent on the share-link snapshot — the dot, not the person. */
+  username?: string;
+  team_id: number | null;
+  team_name: string | null;
+  team_color: string | null;
+  lat: number;
+  lng: number;
+  accuracy: number | null;
+  recorded_at: string;
+}
+
+/** Why the overview is not plotting anyone; see `OVERVIEW_HIDDEN_REASONS`. */
+export type OverviewHiddenReason =
+  | 'TRACKING_DISABLED'
+  | 'VISIBILITY_NONE'
+  | 'VISIBILITY_OWN_TEAM'
+  | 'VISIBILITY_NEAREST_ONLY';
+
+export interface OverviewPositions {
+  visible: boolean;
+  reason: OverviewHiddenReason | null;
+  items: OverviewPosition[];
+}
+
+export interface OverviewSnapshot {
+  session: {
+    id: number;
+    name: string;
+    slug: string;
+    state: string;
+    state_label: string;
+    game_name: string;
+    game_slug: string;
+    start_time: string;
+    end_time: string;
+  };
+  generated_at: string;
+  groups: { slug: string; name: string }[];
+  teams: { id: number; name: string; color: string; group_slug: string | null }[];
+  towers: OverviewTower[];
+  zones: OverviewZone[];
+  standings: OverviewStanding[];
+  active_multipliers: unknown;
+  events: OverviewEvent[];
+  positions: OverviewPositions;
+}
+
+export interface OverviewLink {
+  id: number;
+  token: string;
+  label: string;
+  is_active: boolean;
+  is_usable: boolean;
+  expires_at: string | null;
+  created_at: string;
+  revoked_at: string | null;
+  created_by: string | null;
+  path: string;
+  url: string;
 }

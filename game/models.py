@@ -3037,3 +3037,76 @@ class BadgeObservationSeen(models.Model):
             f'BadgeObservationSeen({self.badge.badge_id} heard '
             f'{self.seen_badge.badge_id} #{self.counter})'
         )
+
+
+def _generate_overview_token():
+    """Opaque URL-safe token (32 chars) addressing one Session's overview."""
+    return secrets.token_urlsafe(24)
+
+
+class SessionOverviewLinkQuerySet(models.QuerySet):
+    def usable(self, *, at=None):
+        """Links that a request may still be honoured by.
+
+        The single definition of "this link works" — active, and either
+        endless or not yet expired. Views resolve tokens through this so
+        revocation and expiry cannot drift apart between the REST
+        endpoint and the websocket, which is exactly the kind of gap
+        that leaves a revoked screen still updating.
+        """
+        moment = at or datetime.now(timezone.utc)
+        return self.filter(is_active=True).filter(
+            Q(expires_at__isnull=True) | Q(expires_at__gt=moment),
+        )
+
+
+class SessionOverviewLink(models.Model):
+    """A revocable, read-only address for one Session's live overview.
+
+    Threat model: the token IS the credential and it is not a secret.
+    It gets pasted into chats, shown on a projector and photographed, so
+    it is sized not to be guessable (`secrets.token_urlsafe(24)`) and
+    everything else rests on how little it grants — one Session's
+    overview, read-only, no roster, no submissions, no history, no other
+    Session — and on revocation being immediate. Expiry is a
+    convenience; revocation is the control.
+    """
+
+    token = models.CharField(
+        max_length=64, unique=True, default=_generate_overview_token, editable=False,
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='overview_links',
+    )
+    # What this screen is, for the staff member revoking it three hours
+    # later ("tent projector", "parents' TV").
+    label = models.CharField(max_length=255, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='overview_links_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    objects = SessionOverviewLinkQuerySet.as_manager()
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['session', 'is_active'])]
+
+    def __str__(self):
+        state = 'active' if self.is_usable() else 'revoked/expired'
+        return f'SessionOverviewLink({self.label or self.token[:8]}, {state})'
+
+    def is_usable(self, *, at=None):
+        moment = at or datetime.now(timezone.utc)
+        if not self.is_active:
+            return False
+        return self.expires_at is None or self.expires_at > moment
+
+    def revoke(self, *, at=None):
+        self.is_active = False
+        self.revoked_at = at or datetime.now(timezone.utc)
+        self.save(update_fields=['is_active', 'revoked_at'])
