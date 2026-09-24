@@ -20,27 +20,43 @@ Tests target the post-refactor structure:
     hardcoded categories). Each Game has its own set of TeamGroups.
 """
 import base64
+import io
 import json
 import math
+import tempfile
+import uuid
+import zipfile
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
+from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
+from urllib.parse import urlencode
 
 from channels.db import database_sync_to_async
 from channels.testing import HttpCommunicator, WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command  # tower-locking
+from django.core.management.base import CommandError
 from django.db import IntegrityError, connection, transaction  # tower-locking
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
-from game import events
+from game import (
+    bundles,  # content-bundles
+    events,
+    media,  # tower-zone-media
+    overview,  # live-overview
+    replay,  # session-replay
+)
 from game import trail as trail_engine  # mode-trail-discovery
 from game.admin import unassign_all
 from game.badges import (
@@ -60,7 +76,14 @@ from game.challenge_types import (
     get_handler,
 )
 from game.dementors import assign_initial_roles, economy_tick, run_tick
+from game.media import (
+    MEDIA_AUDIO,
+    MEDIA_IMAGE,
+    MEDIA_VIDEO,
+)
 from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links  # mode-dementors-ble
+    DEFAULT_TOWER_COLOR,  # tower-types
+    DEFAULT_TOWER_ICON,
     FLIP_CAUSE_CONVERSION,
     FLIP_CAUSE_DIED,
     FLIP_CAUSE_DRAINED,
@@ -82,12 +105,14 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     BadgeDevice,
     BadgeTelemetry,
     Challenge,
+    ChallengeMedia,
     Collection,
     DementorFlip,
     DementorState,
     GatewayNode,
     LocationConsent,
     LocationPing,
+    MediaAsset,
     NfcTag,
     PauseWindow,
     PresenceCheck,
@@ -96,6 +121,7 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     ProximityIdentity,
     ProximityReport,
     ScoreMultiplier,
+    SessionOverviewLink,  # live-overview
     TagScan,
     TeamTowerChallenge,
     TeamTowerFailCounter,
@@ -107,13 +133,15 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     Tower,
     TowerDiscovery,
     TowerLock,
-    TowerPhoto,
+    TowerType,  # tower-types
     Trail,
     TrailEdge,
     TrailStep,
     Zone,
+    effective_proximity,
     effective_tower_factor,
     effective_zone_factor,
+    proximity_radius_expression,
 )
 from game.proximity import (
     CONFIDENCE_CORROBORATED,
@@ -126,11 +154,15 @@ from game.proximity import (
 from geogame.asgi import application as asgi_application
 from organize.models import (  # mode-trail-discovery  # mode-dementors-ble
     DEMENTOR_EMPTY_DIE,
+    LOCATION_VISIBILITY_EVERYONE,  # live-overview
+    LOCATION_VISIBILITY_NONE,
+    LOCATION_VISIBILITY_OWN_TEAM,
     MODE_DOMINATION,
     MODE_TRAIL,
     PROXIMITY_BUCKET_FAR,
     PROXIMITY_BUCKET_NEAR,
     PROXIMITY_BUCKET_VERY_CLOSE,
+    TEAMMATE_VISIBILITY_SELECT_COUNT,  # live-overview
     TOWER_LOCK_FREE_FOR_ALL,
     TOWER_LOCK_ON_INITIATE,
     Game,
@@ -1994,21 +2026,62 @@ class StaffAdminEndpointsTest(TestCase):
         resp = self.player_client.get('/api/staff/challenges/')
         self.assertEqual(resp.status_code, 403)
 
-    def test_reset_scores_zeroes_every_team_and_closes_ownerships(self):
+    def test_reset_scores_zeroes_session_teams_and_closes_ownerships(self):
         self.tower.assign_to_team(self.team)
         self.team.score = 50
         self.team.save()
         resp = self.staff_client.post(
-            '/api/staff/game-state/reset-scores/', format='json',
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
         )
-        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.status_code, 200, resp.content)
         self.team.refresh_from_db()
         self.assertEqual(self.team.score, 0)
         self.assertIsNone(self.tower.tower_control(self.group))
 
+    def test_reset_scores_is_scoped_to_one_session(self):
+        # Regression: reset used to be installation-wide. A second
+        # session's team + score must survive a reset aimed elsewhere.
+        from datetime import timedelta
+
+        self.team.score = 50
+        self.team.save()
+        now = timezone.now()
+        other_session = Session.objects.create(
+            game=self.game, slug='other-run', name='Other run',
+            start_time=now, end_time=now + timedelta(hours=1),
+            state=Session.RUNNING,
+        )
+        other_team = Team.objects.create(
+            name='other-team', color='#0a0a0a',
+            session=other_session, group=self.group,
+        )
+        other_team.score = 77
+        other_team.save()
+
+        resp = self.staff_client.post(
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.team.refresh_from_db()
+        other_team.refresh_from_db()
+        self.assertEqual(self.team.score, 0)
+        self.assertEqual(other_team.score, 77)  # untouched by the scoped reset
+
+    def test_reset_scores_requires_a_session(self):
+        resp = self.staff_client.post(
+            '/api/staff/game-state/reset-scores/', format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+
     def test_reset_scores_requires_staff(self):
         resp = self.player_client.post(
-            '/api/staff/game-state/reset-scores/', format='json',
+            '/api/staff/game-state/reset-scores/',
+            {'session': self.team.session.id},
+            format='json',
         )
         self.assertEqual(resp.status_code, 403)
 
@@ -3632,6 +3705,17 @@ class CloneGameTest(TestCase):
             payload or {},
             format='json',
         )
+
+    def test_clone_gets_its_own_portable_identity(self):
+        """content-bundles: a clone is a new template, not the same one.
+
+        `clone()` copies the instance and clears its pk, which silently
+        carried the source's uuid into a unique column and made every
+        clone fail. Cheap to assert, expensive to rediscover.
+        """
+        clone = self.game.clone(slug='identity-clone')
+        self.assertNotEqual(clone.uuid, self.game.uuid)
+        self.assertIsNotNone(clone.uuid)
 
     def test_clone_copies_template_and_shares_geometry(self):
         resp = self._clone()
@@ -5630,48 +5714,581 @@ class FieldAuthoringTowerApiTest(TestCase):
     def test_photo_upload_records_capture_provenance(self):
         tower = _make_tower(self.game, name='T1')
         resp = self.staff_client.post(
-            f'/api/staff/towers/{tower.id}/photos/',
+            f'/api/staff/towers/{tower.id}/media/',
             {
-                'image': f'data:image/png;base64,{_tiny_png_b64()}',
+                'file': f'data:image/png;base64,{_tiny_png_b64()}',
                 'caption': 'north face',
             },
             format='json',
         )
         self.assertEqual(resp.status_code, 201, resp.content)
-        photo = TowerPhoto.objects.get(pk=resp.json()['id'])
-        self.assertEqual(photo.tower, tower)
-        self.assertEqual(photo.caption, 'north face')
-        self.assertEqual(photo.captured_by, self.staff)
-        self.assertIsNotNone(photo.captured_at)
+        asset = MediaAsset.objects.get(pk=resp.json()['id'])
+        self.assertEqual(asset.tower, tower)
+        self.assertIsNone(asset.zone)
+        self.assertEqual(asset.kind, MEDIA_IMAGE)
+        self.assertEqual(asset.caption, 'north face')
+        self.assertEqual(asset.captured_by, self.staff)
+        self.assertIsNotNone(asset.captured_at)
 
     def test_tower_may_have_multiple_photos_listed_and_deleted(self):
         tower = _make_tower(self.game, name='T1')
         for caption in ('front', 'back'):
             self.staff_client.post(
-                f'/api/staff/towers/{tower.id}/photos/',
-                {'image': f'data:image/png;base64,{_tiny_png_b64()}', 'caption': caption},
+                f'/api/staff/towers/{tower.id}/media/',
+                {'file': f'data:image/png;base64,{_tiny_png_b64()}', 'caption': caption},
                 format='json',
             )
-        resp = self.staff_client.get(f'/api/staff/towers/{tower.id}/photos/')
+        resp = self.staff_client.get(f'/api/staff/towers/{tower.id}/media/')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.json()), 2)
 
-        photo_id = resp.json()[0]['id']
+        asset_id = resp.json()[0]['id']
         resp = self.staff_client.delete(
-            f'/api/staff/towers/{tower.id}/photos/{photo_id}/',
+            f'/api/staff/towers/{tower.id}/media/{asset_id}/',
         )
         self.assertEqual(resp.status_code, 204)
-        self.assertEqual(tower.photos.count(), 1)
+        self.assertEqual(tower.media.count(), 1)
 
     def test_photo_endpoints_require_staff(self):
         tower = _make_tower(self.game, name='T1')
         player_client, _ = _authed_client(self.team)
         resp = player_client.post(
-            f'/api/staff/towers/{tower.id}/photos/',
-            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            f'/api/staff/towers/{tower.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
             format='json',
         )
         self.assertEqual(resp.status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# tower-zone-media — reference media on towers and zones
+# ---------------------------------------------------------------------------
+
+
+def _media_data_url(content_type, payload=b'bytes'):
+    return f'data:{content_type};base64,{base64.b64encode(payload).decode()}'
+
+
+class MediaRulesTest(TestCase):
+    """The rules themselves, away from a request.
+
+    `game.media` is the one place that decides what may be stored and
+    how much of it, and a serializer test only reaches the paths a
+    serializer happens to take. These are the rest.
+    """
+
+    def test_a_codec_parameter_does_not_change_the_type(self):
+        # Chrome's MediaRecorder emits exactly this.
+        self.assertEqual(
+            media.normalize_content_type('audio/webm;codecs=opus'), 'audio/webm',
+        )
+        self.assertEqual(media.normalize_content_type('  IMAGE/PNG '), 'image/png')
+        self.assertIsNone(media.normalize_content_type(''))
+        self.assertIsNone(media.normalize_content_type(None))
+
+    def test_a_type_is_guessed_from_a_name_when_none_was_declared(self):
+        self.assertEqual(media.content_type_for_name('gate.mp4'), 'video/mp4')
+        self.assertIsNone(media.content_type_for_name(''))
+        self.assertIsNone(media.content_type_for_name('mystery'))
+
+    def test_kinds_and_their_types_agree_in_both_directions(self):
+        for kind, content_types in media.CONTENT_TYPES_BY_KIND.items():
+            for content_type in content_types:
+                self.assertEqual(media.kind_for_content_type(content_type), kind)
+                # Every accepted type also has an extension to store it
+                # under; otherwise a decoded data URL lands as `.bin`
+                # and a web server serves it as a download.
+                self.assertNotEqual(
+                    media.extension_for(content_type), 'bin', content_type,
+                )
+        self.assertIsNone(media.kind_for_content_type('application/pdf'))
+
+    def test_an_unknown_kind_is_refused(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_kind('HOLOGRAM', 'image/png')
+        self.assertIn('HOLOGRAM', str(caught.exception))
+
+    def test_a_file_that_declares_nothing_is_refused(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_kind(MEDIA_IMAGE, None)
+        self.assertIn('did not say what type it is', str(caught.exception))
+
+    def test_a_negative_duration_is_refused(self):
+        with self.assertRaises(media.MediaRejected):
+            media.check_duration(MEDIA_VIDEO, -1)
+
+    def test_no_duration_is_allowed(self):
+        media.check_duration(MEDIA_IMAGE, None)  # a photo has none
+
+    @override_settings(MEDIA_ASSET_LIMITS={'AUDIO': {'max_seconds': 5}})
+    def test_an_override_names_one_facet_and_keeps_the_rest(self):
+        limits = media.limits_for(MEDIA_AUDIO)
+        self.assertEqual(limits['max_seconds'], 5)
+        # Not restated by the override, so it falls back to the default.
+        self.assertEqual(
+            limits['max_bytes'], media.DEFAULT_LIMITS[MEDIA_AUDIO]['max_bytes'],
+        )
+
+    def test_a_rejection_says_the_size_in_units_a_person_reads(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_size(MEDIA_VIDEO, 200 * 1024 * 1024)
+        self.assertIn('MB', str(caught.exception))
+        with self.assertRaises(media.MediaRejected) as caught:
+            with override_settings(MEDIA_ASSET_LIMITS={'IMAGE': {'max_bytes': 2048}}):
+                media.check_size(MEDIA_IMAGE, 4096)
+        self.assertIn('KB', str(caught.exception))
+
+
+class MediaAssetModelTest(TestCase):
+    """Task 1.5 — exactly one subject, cascade, and indifference to curation."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.other_tower = _make_tower(self.game, name='T2', zone=self.zone)
+
+    def _unsaved(self, **kwargs):
+        return MediaAsset(
+            kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+            **kwargs,
+        )
+
+    def test_both_subjects_is_refused(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._unsaved(tower=self.tower, zone=self.zone).save()
+
+    def test_neither_subject_is_refused(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._unsaved().save()
+
+    def test_bulk_create_cannot_bypass_the_rule(self):
+        """Why the invariant is a constraint and not a `clean()`.
+
+        Bulk creates skip model validation, and so does every data
+        migration; if the rule lived in Python this would sail through.
+        """
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            MediaAsset.objects.bulk_create([self._unsaved()])
+
+    def test_deleting_a_tower_takes_its_media(self):
+        MediaAsset.objects.create(
+            tower=self.other_tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        self.other_tower.delete()
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_deleting_a_zone_takes_its_media(self):
+        zone = _make_zone(self.game, name='Spare')
+        MediaAsset.objects.create(
+            zone=zone, kind=MEDIA_AUDIO,
+            file=SimpleUploadedFile('a.weba', b'x', 'audio/webm'),
+        )
+        zone.delete()
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_recollecting_the_geometry_leaves_media_alone(self):
+        """Media hangs off the repository row, not off a collection."""
+        asset = MediaAsset.objects.create(
+            tower=self.tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        second = Collection.objects.create(name='Second map', slug='second-map')
+        second.towers.add(self.tower)
+        _game_collection(self.game).towers.remove(self.tower)
+        asset.refresh_from_db()
+        self.assertEqual(asset.tower, self.tower)
+        self.assertEqual(self.tower.media.count(), 1)
+
+    def test_subject_names_whichever_one_is_set(self):
+        photo = MediaAsset.objects.create(
+            tower=self.tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        note = MediaAsset.objects.create(
+            zone=self.zone, kind=MEDIA_AUDIO,
+            file=SimpleUploadedFile('a.weba', b'x', 'audio/webm'),
+        )
+        self.assertEqual(photo.subject, self.tower)
+        self.assertEqual(note.subject, self.zone)
+
+
+class TowerTypeStarterSetTest(TransactionTestCase):
+    """Task 5.3 — the seed fills an empty vocabulary and touches nothing else.
+
+    The emptiness check is the whole safety property of this migration,
+    so it is tested from both sides: a bare install gets the set, and an
+    install that has its own keeps exactly what it had.
+    """
+
+    migrate_from = [('game', '0043_media_assets')]
+    migrate_to = [('game', '0044_tower_type_starter_set')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_an_empty_install_gets_the_starting_set(self):
+        old_apps = self._migrate(self.migrate_from)
+        old_apps.get_model('game', 'TowerType').objects.all().delete()
+
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+
+        names = list(TowerType.objects.order_by('order').values_list('name', flat=True))
+        self.assertEqual(
+            names,
+            ['Building', 'Place', 'Square', 'Statue', 'Art installation',
+             'Fountain', 'Church'],
+        )
+        # Usable as it stands: every one paints, and none is left on the
+        # untyped default, which would make the chips indistinguishable.
+        for row in TowerType.objects.all():
+            self.assertTrue(row.icon)
+            self.assertTrue(row.color)
+        self.assertEqual(
+            len({row.color for row in TowerType.objects.all()}), len(names),
+        )
+
+    def test_an_install_with_its_own_vocabulary_is_left_alone(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldType = old_apps.get_model('game', 'TowerType')
+        OldType.objects.all().delete()
+        OldType.objects.create(
+            name='Bunker', slug='bunker', icon='bi-bricks', color='#333333',
+        )
+
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+
+        self.assertEqual(
+            list(TowerType.objects.values_list('name', flat=True)), ['Bunker'],
+        )
+
+    def test_the_reverse_leaves_a_curator_edited_type_behind(self):
+        old_apps = self._migrate(self.migrate_from)
+        old_apps.get_model('game', 'TowerType').objects.all().delete()
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+        # Someone decides a square is worth 60 m in their town.
+        TowerType.objects.filter(slug='square').update(proximity_meters=60)
+
+        back_apps = self._migrate(self.migrate_from)
+        BackType = back_apps.get_model('game', 'TowerType')
+
+        # The untouched six go; the edited one is theirs now.
+        self.assertEqual(
+            list(BackType.objects.values_list('slug', flat=True)), ['square'],
+        )
+
+
+class MediaCarryOverMigrationTest(TransactionTestCase):
+    """Task 1.5 — every existing reference photo survives the widening.
+
+    Run against the migration rather than against a helper, because the
+    thing under test is precisely what happens to rows that already
+    exist when the schema changes, and a helper would be testing a
+    second implementation of it.
+    """
+
+    migrate_from = [('game', '0042_content_bundle_uuids')]
+    migrate_to = [('game', '0043_media_assets')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        # Leave the schema at head for the rest of the suite.
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def _seed_photo(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldTower = old_apps.get_model('game', 'Tower')
+        OldPhoto = old_apps.get_model('game', 'TowerPhoto')
+        user = User.objects.create_user(
+            username='fieldworker', email='f@example.com', password='pw',
+            is_staff=True,
+        )
+        tower = OldTower.objects.create(
+            name='Old Mill', location=Point(23.58, 46.07),
+            is_active=True, category=1,
+        )
+        photo = OldPhoto.objects.create(
+            tower=tower,
+            image='tower_photos/mill-from-the-bridge.jpg',
+            caption='From the bridge',
+            captured_by_id=user.pk,
+        )
+        captured_at = datetime(2026, 5, 4, 9, 15, tzinfo=dt_timezone.utc)
+        # `captured_at` is auto_now_add, so it has to be written past the
+        # model to be anything but "now".
+        OldPhoto.objects.filter(pk=photo.pk).update(captured_at=captured_at)
+        return {
+            'uuid': photo.uuid,
+            'tower_id': tower.pk,
+            'user_id': user.pk,
+            'captured_at': captured_at,
+        }
+
+    def test_a_photo_becomes_image_media_keeping_everything(self):
+        seeded = self._seed_photo()
+
+        new_apps = self._migrate(self.migrate_to)
+        MediaAsset = new_apps.get_model('game', 'MediaAsset')
+
+        asset = MediaAsset.objects.get()
+        self.assertEqual(asset.kind, 'IMAGE')
+        self.assertEqual(asset.tower_id, seeded['tower_id'])
+        self.assertIsNone(asset.zone_id)
+        # The stored path is copied verbatim: no file is moved, so the
+        # old `tower_photos/` prefix has to keep resolving.
+        self.assertEqual(asset.file.name, 'tower_photos/mill-from-the-bridge.jpg')
+        self.assertEqual(asset.caption, 'From the bridge')
+        self.assertEqual(asset.captured_by_id, seeded['user_id'])
+        self.assertEqual(asset.captured_at, seeded['captured_at'])
+        # Portable identity survives, so a bundle exported before this
+        # migration still names the same row after it.
+        self.assertEqual(asset.uuid, seeded['uuid'])
+
+    def test_rolling_back_restores_the_photo_it_came_from(self):
+        seeded = self._seed_photo()
+        self._migrate(self.migrate_to)
+
+        old_apps = self._migrate(self.migrate_from)
+        OldPhoto = old_apps.get_model('game', 'TowerPhoto')
+
+        photo = OldPhoto.objects.get()
+        self.assertEqual(photo.image.name, 'tower_photos/mill-from-the-bridge.jpg')
+        self.assertEqual(photo.caption, 'From the bridge')
+        self.assertEqual(photo.uuid, seeded['uuid'])
+        # `TowerPhoto.captured_at` is auto_now_add; the reverse puts the
+        # real capture time back rather than stamping the rollback.
+        self.assertEqual(photo.captured_at, seeded['captured_at'])
+
+
+class MediaApiTest(TestCase):
+    """Tasks 2.4 / 3.1–3.4 — what the media endpoints accept and refuse."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.staff_client, self.staff = _staff_client(username='curator')
+
+    def _post(self, subject, path_id, payload, fmt='json'):
+        return self.staff_client.post(
+            f'/api/staff/{subject}/{path_id}/media/', payload, format=fmt,
+        )
+
+    def test_zone_accepts_an_audio_note_with_its_duration(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm;codecs=opus'),
+            'kind': MEDIA_AUDIO,
+            'duration_seconds': 11.5,
+            'caption': 'Enter by the north gate',
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        asset = MediaAsset.objects.get(pk=resp.json()['id'])
+        self.assertEqual(asset.zone, self.zone)
+        self.assertIsNone(asset.tower)
+        self.assertEqual(asset.kind, MEDIA_AUDIO)
+        self.assertEqual(asset.duration_seconds, 11.5)
+        self.assertEqual(asset.captured_by, self.staff)
+        # The codec parameter must not have survived into the extension.
+        self.assertTrue(asset.file.name.endswith('.weba'), asset.file.name)
+
+    def test_tower_accepts_a_video_clip(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('video/mp4'),
+            'kind': MEDIA_VIDEO,
+            'duration_seconds': 12,
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().kind, MEDIA_VIDEO)
+
+    def test_kind_is_inferred_when_the_client_does_not_say(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/ogg'),
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().kind, MEDIA_AUDIO)
+
+    def test_a_declared_kind_that_contradicts_the_file_is_refused(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('audio/webm'),
+            'kind': MEDIA_IMAGE,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('audio', str(resp.json()['file']).lower())
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_a_capture_that_will_not_decode_is_refused_clearly(self):
+        # The legacy-queue carry-over deliberately forwards a data URL it
+        # could not decode rather than dropping it, so this is the reply
+        # a curator sees when that happens.
+        resp = self._post('towers', self.tower.id, {
+            'file': 'data:image/png;base64,not-valid-base64!!',
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('could not be decoded', str(resp.json()['file']))
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_an_unsupported_type_is_refused_rather_than_stored(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('application/x-msdownload'),
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('not a supported media type', str(resp.json()['file']))
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    @override_settings(MEDIA_ASSET_LIMITS={'AUDIO': {'max_bytes': 16}})
+    def test_an_oversized_upload_names_the_size_limit(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm', b'x' * 4096),
+            'kind': MEDIA_AUDIO,
+        })
+        self.assertEqual(resp.status_code, 400)
+        message = str(resp.json()['file'])
+        self.assertIn('at most', message)
+        self.assertIn('4 KB', message)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    @override_settings(MEDIA_ASSET_LIMITS={'VIDEO': {'max_seconds': 30}})
+    def test_a_clip_over_the_duration_cap_names_the_limit(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('video/webm'),
+            'kind': MEDIA_VIDEO,
+            'duration_seconds': 47,
+        })
+        self.assertEqual(resp.status_code, 400)
+        message = str(resp.json()['duration_seconds'])
+        self.assertIn('30 s', message)
+        self.assertIn('47 s', message)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_a_multipart_upload_works_as_well_as_a_data_url(self):
+        """Both shapes, one endpoint: live capture posts a file, the
+        offline queue replays JSON hours later with no multipart body
+        left to replay."""
+        upload = SimpleUploadedFile('clip.webm', b'x' * 32, 'video/webm')
+        resp = self._post(
+            'zones', self.zone.id,
+            {'file': upload, 'kind': MEDIA_VIDEO, 'duration_seconds': 4},
+            fmt='multipart',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        asset = MediaAsset.objects.get()
+        self.assertEqual(asset.kind, MEDIA_VIDEO)
+        self.assertEqual(asset.byte_size, 32)
+
+    def test_byte_size_is_measured_not_taken_from_the_client(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png', b'x' * 500),
+            'byte_size': 1,
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().byte_size, 500)
+
+    def test_media_listings_are_per_subject(self):
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png'), 'caption': 'the tower',
+        })
+        self._post('zones', self.zone.id, {
+            'file': _media_data_url('image/png'), 'caption': 'the zone',
+        })
+        tower_listing = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/media/',
+        ).json()
+        zone_listing = self.staff_client.get(
+            f'/api/staff/zones/{self.zone.id}/media/',
+        ).json()
+        self.assertEqual([m['caption'] for m in tower_listing], ['the tower'])
+        self.assertEqual([m['caption'] for m in zone_listing], ['the zone'])
+
+    def test_a_zone_asset_cannot_be_deleted_through_a_tower(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('image/png'),
+        })
+        asset_id = resp.json()['id']
+        resp = self.staff_client.delete(
+            f'/api/staff/towers/{self.tower.id}/media/{asset_id}/',
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_reference_media_and_submission_photos_stay_separate(self):
+        """Task 3.4 — asserted, because "obviously different tables" is
+        how two listings end up sharing one."""
+        team = _make_team(self.game, _make_group(self.game), name='Vulpile')
+        challenge = Challenge.objects.create(
+            game=self.game, tower=self.tower, text='How many arches?',
+            difficulty=1,
+        )
+        submission = TeamTowerChallenge.objects.create(
+            team=team, tower=self.tower, challenge=challenge,
+            photo=SimpleUploadedFile('proof.png', b'proof', 'image/png'),
+        )
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png', b'reference'),
+            'caption': 'north face',
+        })
+
+        listing = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/media/',
+        ).json()
+        self.assertEqual([m['caption'] for m in listing], ['north face'])
+        self.assertNotIn(
+            submission.photo.name, [m['file'] for m in listing],
+        )
+        # And the other direction: a reference photo is not evidence.
+        self.assertEqual(
+            TeamTowerChallenge.objects.filter(tower=self.tower).count(), 1,
+        )
+
+    def test_the_tower_payload_lists_its_media(self):
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png'), 'caption': 'north face',
+        })
+        payload = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/',
+        ).json()
+        self.assertEqual([m['caption'] for m in payload['media']], ['north face'])
+
+    def test_the_zone_payload_lists_its_media(self):
+        self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm'), 'kind': MEDIA_AUDIO,
+            'caption': 'north gate',
+        })
+        payload = self.staff_client.get(
+            f'/api/staff/zones/{self.zone.id}/',
+        ).json()
+        self.assertEqual([m['caption'] for m in payload['media']], ['north gate'])
+
+    def test_the_library_feed_counts_media_on_both_kinds_of_element(self):
+        self._post('towers', self.tower.id, {'file': _media_data_url('image/png')})
+        self._post('zones', self.zone.id, {'file': _media_data_url('image/png')})
+        self._post('zones', self.zone.id, {'file': _media_data_url('image/png')})
+        feed = self.staff_client.get('/api/staff/library/').json()
+        by_name = {t['name']: t for t in feed['towers']}
+        self.assertEqual(by_name['T1']['media_count'], 1)
+        zones = {z['name']: z for z in feed['zones']}
+        self.assertEqual(zones['Zone A']['media_count'], 2)
 
 
 class FieldAuthoringZoneApiTest(TestCase):
@@ -5849,8 +6466,15 @@ class FieldAuthoringPermissionTest(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         resp = self.other_client.post(
-            f'/api/staff/towers/{self.tower.id}/photos/',
-            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            f'/api/staff/towers/{self.tower.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        # tower-zone-media task 3.5: the gate reaches a zone's media too.
+        resp = self.other_client.post(
+            f'/api/staff/zones/{self.zone.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
             format='json',
         )
         self.assertEqual(resp.status_code, 403)
@@ -11556,3 +12180,2749 @@ class LocationPingDrivenDiscoveryTest(TestCase):
         discovery = TowerDiscovery.objects.get()
         self.assertEqual(discovery.method, TowerDiscovery.METHOD_PROXIMITY)
         self.assertEqual(discovery.team, self.team)
+
+
+# ---------------------------------------------------------------------------
+# --- map-editor --- staff desktop map editor: server-side authority for
+# "existing zones win" overlap clipping + ring-validity rejection. The
+# frontend map editor (staff/src/app/admin/map-editor/) does the same clip
+# client-side for a live preview, but this is the pass that actually
+# guards the database -- overlaps can't be introduced even by a direct API
+# call that bypasses the desktop editor.
+# ---------------------------------------------------------------------------
+
+
+class ZoneOverlapClippingTest(TestCase):
+    """AdminZoneSerializer: existing-zone-wins clipping (task: map-editor)."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.collection = _game_collection(self.game)
+        self.staff_client, self.staff = _staff_client(username='curator')
+        # Existing zone: a clean 1deg x 1deg box, lng [23.0, 24.0] x lat [46.0, 47.0].
+        self.existing = _make_zone(
+            self.game, name='Existing', shape=Polygon.from_bbox((23.0, 46.0, 24.0, 47.0)),
+        )
+
+    def test_overlapping_new_zone_gets_clipped_to_the_non_overlapping_remainder(self):
+        # New box overlaps the right half of the existing one: lng [23.5, 24.5].
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'New',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.5, 46.0], [24.5, 46.0], [24.5, 47.0], [23.5, 47.0]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        zone = Zone.objects.get(pk=resp.json()['id'])
+        # Existing zone wins: only the non-overlapping sliver (lng [24.0, 24.5])
+        # survives -- half the drawn area, and no interior overlap remains.
+        self.assertAlmostEqual(zone.shape.area, 0.5, places=6)
+        self.assertAlmostEqual(
+            zone.shape.intersection(self.existing.shape).area, 0.0, places=6,
+        )
+        xmin, ymin, xmax, ymax = zone.shape.extent
+        self.assertAlmostEqual(xmin, 24.0, places=6)
+        self.assertAlmostEqual(xmax, 24.5, places=6)
+        self.assertAlmostEqual(ymin, 46.0, places=6)
+        self.assertAlmostEqual(ymax, 47.0, places=6)
+
+    def test_self_intersecting_ring_rejected(self):
+        # A bowtie quad: crossing diagonals make an invalid (self-intersecting) ring.
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Bowtie',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.0, 46.0], [24.0, 47.0], [24.0, 46.0], [23.0, 47.0]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn('vertices', resp.json())
+
+    def test_fully_contained_new_zone_rejected(self):
+        # Entirely inside the existing box -- clipping empties it.
+        resp = self.staff_client.post(
+            '/api/staff/zones/',
+            {
+                'name': 'Swallowed',
+                'scoring_type': Zone.SCORE_LIN,
+                'vertices': [[23.2, 46.2], [23.8, 46.2], [23.8, 46.8], [23.2, 46.8]],
+                'collection': self.collection.id,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400, resp.content)
+        self.assertIn('vertices', resp.json())
+        self.assertFalse(Zone.objects.filter(name='Swallowed').exists())
+
+    def test_updating_a_zone_clips_against_its_other_collection_members(self):
+        # Growing `self.existing` itself must not clip against itself --
+        # only against OTHER zones sharing a collection with it.
+        other = _make_zone(
+            self.game, name='Other', shape=Polygon.from_bbox((24.0, 46.0, 25.0, 47.0)),
+        )
+        resp = self.staff_client.patch(
+            f'/api/staff/zones/{self.existing.id}/',
+            {'vertices': [[23.0, 46.0], [24.5, 46.0], [24.5, 47.0], [23.0, 47.0]]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        self.existing.refresh_from_db()
+        # Grew from 1.0 to 1.5 wide, minus the half that overlaps `other`.
+        self.assertAlmostEqual(self.existing.shape.area, 1.0, places=6)
+        self.assertAlmostEqual(
+            self.existing.shape.intersection(other.shape).area, 0.0, places=6,
+        )
+
+
+class SessionReplayBundleTest(TestCase):
+    """session-replay — the staff replay bundle for a recorded Session."""
+
+    def setUp(self):
+        self.game = _make_game(name='Replay game')
+        self.game.location_tracking_enabled = True
+        self.game.location_retention_days = 7
+        self.game.save()
+        self.session = _default_session(self.game)
+        # A fixed, generous window so `recorded_at` offsets below stay
+        # comfortably inside it.
+        self.start = timezone.now() - timedelta(hours=2)
+        self.session.start_time = self.start
+        self.session.end_time = self.start + timedelta(hours=2)
+        self.session.save()
+
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower_a = _make_tower(self.game, name='TA', zone=self.zone)
+        self.tower_b = _make_tower(self.game, name='TB', zone=self.zone, lng=23.6)
+        self.team_a = _make_team(self.game, self.group, name='alpha')
+        self.team_b = _make_team(self.game, self.group, name='bravo', color='#aa0000')
+        self.client_a, self.user_a = _authed_client(self.team_a, username='ra')
+        self.client_b, self.user_b = _authed_client(self.team_b, username='rb')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.url = reverse('api-staff-session-replay', args=[self.session.id])
+
+    def _ping(self, user, team, offset_seconds, lng=23.5, lat=46.5):
+        return LocationPing.objects.create(
+            user=user,
+            session=self.session,
+            team=team,
+            point=Point(lng, lat),
+            recorded_at=self.start + timedelta(seconds=offset_seconds),
+        )
+
+    def _own(self, tower, team, start_offset, end_offset=None):
+        """Create an ownership interval; `timestamp_start` is auto_now_add,
+        so it is rewritten with an explicit UPDATE afterwards."""
+        row = TeamTowerOwnership.objects.create(team=team, tower=tower)
+        TeamTowerOwnership.objects.filter(pk=row.pk).update(
+            timestamp_start=self.start + timedelta(seconds=start_offset),
+            timestamp_end=(
+                self.start + timedelta(seconds=end_offset)
+                if end_offset is not None else None
+            ),
+        )
+        return row
+
+    def _consent(self, user):
+        return LocationConsent.objects.create(
+            user=user, session=self.session, agreed_at=timezone.now(),
+        )
+
+    def _windowed(self, **offset):
+        """Replay URL with a `from` bound, percent-encoded.
+
+        Encoding matters: a raw `+00:00` offset arrives as a space and
+        the bound would be rejected.
+        """
+        query = urlencode({'from': (self.start + timedelta(**offset)).isoformat()})
+        return f'{self.url}?{query}'
+
+    # -- access ---------------------------------------------------------
+
+    def test_replay_is_staff_only(self):
+        self.assertEqual(self.client_a.get(self.url).status_code, 403)
+
+    def test_unknown_session_is_404(self):
+        url = reverse('api-staff-session-replay', args=[999999])
+        self.assertEqual(self.staff_client.get(url).status_code, 404)
+
+    # -- shape ----------------------------------------------------------
+
+    def test_bundle_carries_geometry_roster_and_teams(self):
+        response = self.staff_client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertEqual(data['session']['id'], self.session.id)
+        self.assertEqual({t['name'] for t in data['towers']}, {'TA', 'TB'})
+        self.assertEqual({t['name'] for t in data['teams']}, {'alpha', 'bravo'})
+        self.assertEqual({p['username'] for p in data['players']}, {'ra', 'rb'})
+        self.assertEqual(len(data['zones']), 1)
+        self.assertIsNotNone(data['zones'][0]['shape'])
+        tower = next(t for t in data['towers'] if t['name'] == 'TA')
+        self.assertAlmostEqual(tower['lat'], 46.5)
+        self.assertAlmostEqual(tower['lng'], 23.5)
+
+    # -- downsampling ---------------------------------------------------
+
+    def test_downsamples_to_one_position_per_player_per_frame(self):
+        # Five pings inside one 60s frame; the newest must win.
+        for offset in (0, 10, 20, 30, 59):
+            self._ping(self.user_a, self.team_a, offset, lat=46.0 + offset / 1000)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frame_zero = [
+            p for p in response.data['positions']
+            if p['frame'] == 0 and p['user_id'] == self.user_a.id
+        ]
+        self.assertEqual(len(frame_zero), 1)
+        self.assertAlmostEqual(frame_zero[0]['lat'], 46.059)
+        # The raw feed still exposes every sample.
+        history = self.staff_client.get(
+            reverse('api-staff-location-history', args=[self.session.id]),
+        )
+        self.assertEqual(len(history.data['pings']), 5)
+
+    def test_separate_frames_keep_separate_positions(self):
+        self._ping(self.user_a, self.team_a, 0, lat=46.0)
+        self._ping(self.user_a, self.team_a, 120, lat=46.2)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frames = {
+            p['frame']: p['lat'] for p in response.data['positions']
+            if p['user_id'] == self.user_a.id
+        }
+        self.assertEqual(sorted(frames), [0, 2])
+        self.assertAlmostEqual(frames[0], 46.0)
+        self.assertAlmostEqual(frames[2], 46.2)
+
+    def test_frame_assignment_ignores_sub_second_window_skew(self):
+        # Regression: casting the epoch to an integer rounds in Postgres,
+        # so a window start with >0.5s of microseconds used to push every
+        # ping one frame late — intermittently, depending on the clock.
+        self.session.start_time = self.start.replace(microsecond=900000)
+        self.session.save()
+        self.start = self.session.start_time
+        self._ping(self.user_a, self.team_a, 0, lat=46.0)
+        self._ping(self.user_a, self.team_a, 59, lat=46.059)
+        self._ping(self.user_a, self.team_a, 60, lat=46.060)
+        response = self.staff_client.get(f'{self.url}?interval_seconds=60')
+        frames = {
+            p['frame']: p['lat'] for p in response.data['positions']
+            if p['user_id'] == self.user_a.id
+        }
+        # 0s and 59s share frame 0 (newest wins); 60s opens frame 1.
+        self.assertEqual(sorted(frames), [0, 1])
+        self.assertAlmostEqual(frames[0], 46.059)
+        self.assertAlmostEqual(frames[1], 46.060)
+
+    # -- interval -------------------------------------------------------
+
+    def test_interval_floor_is_enforced(self):
+        response = self.staff_client.get(f'{self.url}?interval_seconds=1')
+        self.assertEqual(response.data['interval_seconds'], replay.MIN_INTERVAL_SECONDS)
+
+    def test_interval_coarsens_rather_than_truncating(self):
+        # 2h at 5s would be 1440 frames — under the cap. Shrink the cap
+        # so the coarsening path is exercised deterministically.
+        with patch.object(replay, 'MAX_FRAMES', 10):
+            response = self.staff_client.get(f'{self.url}?interval_seconds=5')
+        data = response.data
+        self.assertTrue(data['interval_coarsened'])
+        self.assertLessEqual(data['frame_count'], 11)
+        # The whole session is still covered end to end.
+        self.assertEqual(data['window']['to'], self.session.end_time)
+        span = (data['window']['to'] - data['window']['from']).total_seconds()
+        self.assertGreaterEqual(
+            data['interval_seconds'] * (data['frame_count'] - 1), span,
+        )
+
+    def test_bad_interval_falls_back_to_default(self):
+        response = self.staff_client.get(f'{self.url}?interval_seconds=abc')
+        self.assertEqual(
+            response.data['interval_seconds'], replay.DEFAULT_INTERVAL_SECONDS,
+        )
+
+    # -- ownership ------------------------------------------------------
+
+    def test_ownership_open_before_window_is_included(self):
+        # Held from before `from` and never released: frame 0 must know.
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        owned = response.data['ownership']
+        self.assertEqual(len(owned), 1)
+        self.assertEqual(owned[0]['tower_id'], self.tower_a.id)
+        self.assertEqual(owned[0]['team_id'], self.team_a.id)
+
+    def test_ownership_closed_before_window_is_excluded(self):
+        self._own(self.tower_a, self.team_a, start_offset=0, end_offset=60)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        self.assertEqual(response.data['ownership'], [])
+
+    def test_ownership_handover_yields_both_intervals(self):
+        self._own(self.tower_a, self.team_a, start_offset=0, end_offset=600)
+        self._own(self.tower_a, self.team_b, start_offset=600)
+        response = self.staff_client.get(self.url)
+        rows = [r for r in response.data['ownership'] if r['tower_id'] == self.tower_a.id]
+        self.assertEqual([r['team_id'] for r in rows], [self.team_a.id, self.team_b.id])
+        self.assertIsNotNone(rows[0]['end'])
+        self.assertIsNone(rows[1]['end'])
+
+    def test_tower_removed_from_the_game_still_replays_its_ownership(self):
+        # Map edits must not rewrite history: a tower retired from the
+        # Game's collections after a session ran would otherwise vanish
+        # from that session's replay, ownership intervals and all.
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        self.tower_a.collections.clear()
+        self.assertNotIn(
+            self.tower_a.id, list(self.session.towers().values_list('id', flat=True)),
+        )
+        response = self.staff_client.get(self.url)
+        towers = {t['id']: t for t in response.data['towers']}
+        self.assertIn(self.tower_a.id, towers)
+        self.assertEqual(towers[self.tower_a.id]['name'], 'TA')
+        self.assertAlmostEqual(towers[self.tower_a.id]['lat'], 46.5)
+        self.assertEqual(
+            [o['tower_id'] for o in response.data['ownership']], [self.tower_a.id],
+        )
+
+    def test_towers_are_not_duplicated_when_also_owned(self):
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self.url)
+        ids = [t['id'] for t in response.data['towers']]
+        self.assertEqual(len(ids), len(set(ids)))
+        self.assertEqual(ids, sorted(ids))
+
+    # -- implausible samples --------------------------------------------
+
+    def test_samples_far_outside_the_session_window_are_excluded(self):
+        self._ping(self.user_a, self.team_a, 60)
+        # A skewed client clock, a day before the session started.
+        LocationPing.objects.create(
+            user=self.user_a,
+            session=self.session,
+            team=self.team_a,
+            point=Point(23.5, 46.5),
+            recorded_at=self.session.start_time - timedelta(days=1),
+        )
+        response = self.staff_client.get(self.url)
+        self.assertEqual(len(response.data['positions']), 1)
+        self.assertIn('received_at', response.data['positions'][0])
+
+    # -- availability ---------------------------------------------------
+
+    def test_tracking_disabled_still_replays_ownership(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        self.session.location_tracking_enabled = None
+        self.session.save()
+        self._own(self.tower_a, self.team_a, start_offset=0)
+        response = self.staff_client.get(self.url)
+        data = response.data
+        self.assertFalse(data['availability']['location_tracking_enabled'])
+        self.assertEqual(data['positions'], [])
+        self.assertEqual(len(data['ownership']), 1)
+        self.assertEqual(len(data['teams']), 2)
+
+    def test_availability_reports_consent_coverage(self):
+        self._consent(self.user_a)
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertEqual(availability['consented_players'], 1)
+        self.assertEqual(availability['roster_players'], 2)
+
+    def test_window_reaching_past_retention_is_reported_as_truncated(self):
+        # A session older than the 7-day retention window: part of its
+        # history has been (or is about to be) purged.
+        self.session.start_time = timezone.now() - timedelta(days=10)
+        self.session.end_time = timezone.now() - timedelta(days=8)
+        self.session.save()
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertTrue(availability['history_truncated'])
+        self.assertEqual(availability['retention_days'], 7)
+        self.assertIsNotNone(availability['retention_cutoff'])
+
+    def test_a_late_first_ping_is_not_mistaken_for_purging(self):
+        # Nobody pings at the instant a session opens; that is not a
+        # purge and must not be reported as one.
+        self._ping(self.user_a, self.team_a, 3600)
+        response = self.staff_client.get(self.url)
+        availability = response.data['availability']
+        self.assertFalse(availability['history_truncated'])
+        self.assertGreater(availability['earliest_ping_at'], self.session.start_time)
+
+    def test_untruncated_history_is_not_flagged(self):
+        self._ping(self.user_a, self.team_a, 0)
+        response = self.staff_client.get(self.url)
+        self.assertFalse(response.data['availability']['history_truncated'])
+
+    # -- window parsing -------------------------------------------------
+
+    def test_unparseable_window_bound_is_rejected(self):
+        # An unencoded '+00:00' offset arrives as a space; silently
+        # replaying the whole session would hide that from the caller.
+        raw = (self.start + timedelta(minutes=30)).isoformat()
+        response = self.staff_client.get(f'{self.url}?from={raw}')
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('from', response.data['detail'])
+
+    def test_encoded_window_bound_is_honoured(self):
+        self._ping(self.user_a, self.team_a, 0)
+        self._ping(self.user_a, self.team_a, 3600)
+        response = self.staff_client.get(self._windowed(minutes=30))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data['positions']), 1)
+        self.assertEqual(
+            response.data['window']['from'], self.start + timedelta(minutes=30),
+        )
+
+
+class LiveOverviewSnapshotTest(TestCase):
+    """live-overview — the snapshot behind the big-screen view."""
+
+    def setUp(self):
+        self.game = _make_game(name='Overview game')
+        self.game.location_tracking_enabled = True
+        self.game.location_visibility = LOCATION_VISIBILITY_EVERYONE
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.session.state = Session.RUNNING
+        self.session.save()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower_a = _make_tower(self.game, name='TA', zone=self.zone)
+        self.tower_b = _make_tower(self.game, name='TB', zone=self.zone, lng=23.6)
+        self.team_a = _make_team(self.game, self.group, name='alpha')
+        self.team_b = _make_team(self.game, self.group, name='bravo', color='#aa0000')
+        self.client_a, self.user_a = _authed_client(self.team_a, username='oa')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.url = reverse('api-staff-session-overview', args=[self.session.id])
+
+    def _own(self, tower, team, *, ended=False):
+        row = TeamTowerOwnership.objects.create(team=team, tower=tower)
+        if ended:
+            TeamTowerOwnership.objects.filter(pk=row.pk).update(
+                timestamp_end=timezone.now(),
+            )
+        return row
+
+    def _consent(self, user):
+        return LocationConsent.objects.create(
+            user=user, session=self.session, agreed_at=timezone.now(),
+        )
+
+    def _ping(self, user, team, lng=23.5, lat=46.5):
+        return LocationPing.objects.create(
+            user=user, session=self.session, team=team,
+            point=Point(lng, lat), recorded_at=timezone.now(),
+        )
+
+    # -- access ---------------------------------------------------------
+
+    def test_overview_is_staff_only(self):
+        self.assertEqual(self.client_a.get(self.url).status_code, 403)
+
+    def test_unknown_session_is_404(self):
+        url = reverse('api-staff-session-overview', args=[999999])
+        self.assertEqual(self.staff_client.get(url).status_code, 404)
+
+    # -- shape ----------------------------------------------------------
+
+    def test_snapshot_carries_geometry_teams_and_state(self):
+        response = self.staff_client.get(self.url)
+        self.assertEqual(response.status_code, 200)
+        data = response.data
+        self.assertEqual(data['session']['state'], Session.RUNNING)
+        self.assertEqual(
+            sorted(t['name'] for t in data['towers']), ['TA', 'TB'],
+        )
+        self.assertEqual([z['id'] for z in data['zones']], [self.zone.id])
+        self.assertEqual(
+            sorted(t['name'] for t in data['teams']), ['alpha', 'bravo'],
+        )
+        self.assertEqual([g['slug'] for g in data['groups']], [self.group.slug])
+
+    def test_owner_comes_from_the_open_interval(self):
+        self._own(self.tower_a, self.team_a)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertEqual(
+            towers['TA']['ownership'][self.group.slug]['team_name'], 'alpha',
+        )
+        self.assertIsNone(towers['TB']['ownership'][self.group.slug])
+
+    def test_a_closed_interval_no_longer_paints_the_tower(self):
+        # The distinction the replay view blurs on purpose and this one
+        # must not: a tower held yesterday is not held now.
+        self._own(self.tower_a, self.team_a, ended=True)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIsNone(towers['TA']['ownership'][self.group.slug])
+
+    def test_recent_events_are_newest_first_and_name_the_capture(self):
+        self._own(self.tower_a, self.team_a)
+        self._own(self.tower_b, self.team_b)
+        data = self.staff_client.get(self.url).data
+        self.assertEqual(
+            [e['tower_name'] for e in data['events']], ['TB', 'TA'],
+        )
+        self.assertEqual(data['events'][0]['team_name'], 'bravo')
+
+    def test_standings_match_the_scoreboard_endpoint(self):
+        scoreboard_url = reverse(
+            'api-session-scoreboard', args=[self.session.id],
+        )
+        expected = self.staff_client.get(scoreboard_url).data['entries']
+        standings = self.staff_client.get(self.url).data['standings']
+        self.assertEqual(
+            [e['team_id'] for e in standings], [e['team_id'] for e in expected],
+        )
+
+    # -- the visibility rule that defines this capability ----------------
+
+    def test_everyone_visibility_plots_consenting_players(self):
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertTrue(positions['visible'])
+        self.assertIsNone(positions['reason'])
+        self.assertEqual([p['user_id'] for p in positions['items']], [self.user_a.id])
+
+    def test_own_team_visibility_plots_nobody_and_says_why(self):
+        # The default. Caller-relative, so it has no meaning on a screen
+        # a whole room reads — and staff privilege must not override it.
+        self.game.location_visibility = LOCATION_VISIBILITY_OWN_TEAM
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        data = self.staff_client.get(self.url).data
+        self.assertFalse(data['positions']['visible'])
+        self.assertEqual(
+            data['positions']['reason'], overview.REASON_VISIBILITY_OWN_TEAM,
+        )
+        self.assertEqual(data['positions']['items'], [])
+        # The rest of the map is unaffected — no dots, not an empty page.
+        self.assertEqual(len(data['towers']), 2)
+
+    def test_none_visibility_plots_nobody(self):
+        self.game.location_visibility = LOCATION_VISIBILITY_NONE
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(positions['reason'], overview.REASON_VISIBILITY_NONE)
+
+    def test_nearest_n_teammate_mode_plots_nobody(self):
+        self.game.teammate_visibility_mode = TEAMMATE_VISIBILITY_SELECT_COUNT
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(
+            positions['reason'], overview.REASON_VISIBILITY_NEAREST_ONLY,
+        )
+
+    def test_tracking_disabled_plots_nobody(self):
+        self.game.location_tracking_enabled = False
+        self.game.save()
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertFalse(positions['visible'])
+        self.assertEqual(positions['reason'], overview.REASON_TRACKING_DISABLED)
+
+    def test_staff_bypass_does_not_reach_the_overview(self):
+        # `GET /api/location/live/` hands staff every position whatever
+        # the config says. That bypass is what this endpoint must NOT
+        # inherit, so assert the two disagree for the same session.
+        self.game.location_visibility = LOCATION_VISIBILITY_OWN_TEAM
+        self.game.save()
+        self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        from game.location_api import visible_live_pings
+        staff_user = get_user_model().objects.get(username='staff')
+        self.assertEqual(len(visible_live_pings(self.session, staff_user)), 1)
+        self.assertEqual(self.staff_client.get(self.url).data['positions']['items'], [])
+
+    def test_a_player_without_consent_never_appears(self):
+        self._ping(self.user_a, self.team_a)  # pinged, never consented
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertTrue(positions['visible'])
+        self.assertEqual(positions['items'], [])
+
+    def test_a_withdrawn_consent_removes_the_player(self):
+        consent = self._consent(self.user_a)
+        self._ping(self.user_a, self.team_a)
+        consent.withdrawn_at = timezone.now()
+        consent.save()
+        positions = self.staff_client.get(self.url).data['positions']
+        self.assertEqual(positions['items'], [])
+
+
+class OverviewShareLinkTest(TestCase):
+    """live-overview — issuing, using and revoking a share link."""
+
+    def setUp(self):
+        self.game = _make_game(name='Share game')
+        self.game.location_tracking_enabled = True
+        self.game.location_visibility = LOCATION_VISIBILITY_EVERYONE
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='TA', zone=self.zone)
+        self.team = _make_team(self.game, self.group, name='alpha')
+        self.client_a, self.user_a = _authed_client(self.team, username='sa')
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.links_url = reverse(
+            'api-staff-session-overview-links', args=[self.session.id],
+        )
+
+    def _issue(self, label='projector'):
+        response = self.staff_client.post(
+            self.links_url, {'label': label}, format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        return response.data
+
+    # -- issuing --------------------------------------------------------
+
+    def test_issuing_a_link_returns_an_openable_address(self):
+        link = self._issue()
+        self.assertTrue(link['token'])
+        self.assertEqual(link['label'], 'projector')
+        self.assertTrue(link['is_usable'])
+        self.assertIn(link['token'], link['path'])
+        self.assertEqual(link['created_by'], 'staff')
+
+    def test_tokens_are_long_and_distinct(self):
+        first, second = self._issue('a'), self._issue('b')
+        self.assertNotEqual(first['token'], second['token'])
+        self.assertGreaterEqual(len(first['token']), 24)
+
+    def test_issuing_is_staff_only(self):
+        response = self.client_a.post(self.links_url, {}, format='json')
+        self.assertEqual(response.status_code, 403)
+
+    def test_an_unparseable_expiry_is_rejected(self):
+        response = self.staff_client.post(
+            self.links_url, {'expires_at': 'soonish'}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    # -- viewing --------------------------------------------------------
+
+    def test_an_anonymous_viewer_sees_the_overview(self):
+        link = self._issue()
+        url = reverse('api-overview-public', args=[link['token']])
+        response = APIClient().get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['session']['id'], self.session.id)
+        self.assertEqual([t['name'] for t in response.data['towers']], ['TA'])
+
+    def test_the_share_snapshot_carries_no_usernames(self):
+        LocationConsent.objects.create(
+            user=self.user_a, session=self.session, agreed_at=timezone.now(),
+        )
+        LocationPing.objects.create(
+            user=self.user_a, session=self.session, team=self.team,
+            point=Point(23.5, 46.5), recorded_at=timezone.now(),
+        )
+        link = self._issue()
+        url = reverse('api-overview-public', args=[link['token']])
+        items = APIClient().get(url).data['positions']['items']
+        self.assertEqual(len(items), 1)
+        self.assertNotIn('username', items[0])
+        # The dot and its colour are the point; the name is not.
+        self.assertEqual(items[0]['team_name'], 'alpha')
+
+        staff_items = self.staff_client.get(
+            reverse('api-staff-session-overview', args=[self.session.id]),
+        ).data['positions']['items']
+        self.assertIn('username', staff_items[0])
+
+    def test_an_unknown_token_is_404(self):
+        url = reverse('api-overview-public', args=['nope'])
+        self.assertEqual(APIClient().get(url).status_code, 404)
+
+    # -- revoking -------------------------------------------------------
+
+    def test_revoking_stops_the_link(self):
+        link = self._issue()
+        view_url = reverse('api-overview-public', args=[link['token']])
+        self.assertEqual(APIClient().get(view_url).status_code, 200)
+        revoke_url = reverse('api-staff-overview-link-revoke', args=[link['id']])
+        revoked = self.staff_client.post(revoke_url, {}, format='json')
+        self.assertEqual(revoked.status_code, 200)
+        self.assertFalse(revoked.data['is_usable'])
+        self.assertIsNotNone(revoked.data['revoked_at'])
+        self.assertEqual(APIClient().get(view_url).status_code, 404)
+
+    def test_a_revoked_link_is_indistinguishable_from_one_that_never_existed(self):
+        link = self._issue()
+        self.staff_client.post(
+            reverse('api-staff-overview-link-revoke', args=[link['id']]), {},
+            format='json',
+        )
+        revoked = APIClient().get(
+            reverse('api-overview-public', args=[link['token']]),
+        )
+        unknown = APIClient().get(
+            reverse('api-overview-public', args=['never-existed']),
+        )
+        self.assertEqual(revoked.status_code, unknown.status_code)
+        self.assertEqual(revoked.data, unknown.data)
+
+    def test_a_revoked_link_stays_listed(self):
+        link = self._issue()
+        self.staff_client.post(
+            reverse('api-staff-overview-link-revoke', args=[link['id']]), {},
+            format='json',
+        )
+        listed = self.staff_client.get(self.links_url).data
+        self.assertEqual([row['id'] for row in listed], [link['id']])
+        self.assertFalse(listed[0]['is_active'])
+
+    def test_an_expired_link_stops_working(self):
+        link = SessionOverviewLink.objects.create(
+            session=self.session,
+            expires_at=timezone.now() - timedelta(minutes=1),
+        )
+        url = reverse('api-overview-public', args=[link.token])
+        self.assertEqual(APIClient().get(url).status_code, 404)
+        self.assertFalse(link.is_usable())
+
+    def test_a_link_with_a_future_expiry_still_works(self):
+        link = SessionOverviewLink.objects.create(
+            session=self.session,
+            expires_at=timezone.now() + timedelta(hours=3),
+        )
+        url = reverse('api-overview-public', args=[link.token])
+        self.assertEqual(APIClient().get(url).status_code, 200)
+
+    def test_a_link_reaches_only_its_own_session(self):
+        other_game = _make_game(name='Other game', slug='other-game')
+        other_session = _default_session(other_game)
+        link = self._issue()
+        data = APIClient().get(
+            reverse('api-overview-public', args=[link['token']]),
+        ).data
+        self.assertEqual(data['session']['id'], self.session.id)
+        self.assertNotEqual(data['session']['id'], other_session.id)
+
+    def test_the_share_endpoint_is_rate_limited_per_token(self):
+        # The rate is patched on the throttle rather than through
+        # `override_settings`: DRF binds `THROTTLE_RATES` at import time,
+        # so overriding the setting here would silently do nothing and
+        # leave this test passing against no throttle at all.
+        from django.core.cache import cache
+
+        from game.overview_api import OverviewLinkThrottle
+        cache.clear()
+        self.addCleanup(cache.clear)
+        first, second = self._issue('a'), self._issue('b')
+        first_url = reverse('api-overview-public', args=[first['token']])
+        second_url = reverse('api-overview-public', args=[second['token']])
+        client = APIClient()
+        with patch.dict(
+            OverviewLinkThrottle.THROTTLE_RATES, {'overview_link': '2/min'},
+        ):
+            self.assertEqual(client.get(first_url).status_code, 200)
+            self.assertEqual(client.get(first_url).status_code, 200)
+            self.assertEqual(client.get(first_url).status_code, 429)
+            # A second display must not have been starved by the first.
+            self.assertEqual(client.get(second_url).status_code, 200)
+
+
+class OverviewShareSocketTest(TransactionTestCase):
+    """live-overview — realtime admission and the event allowlist."""
+
+    def setUp(self):
+        events.reset_throttle()
+        self.game = _make_game('Overview WS')
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group, name='ows1')
+        self.session = self.team.session
+        self.link = SessionOverviewLink.objects.create(session=self.session)
+
+        self.game_b = _make_game('Overview WS B', slug='overview-ws-b')
+        self.group_b = _make_group(self.game_b, name='B', slug='ows-b')
+        self.team_b = _make_team(self.game_b, self.group_b, name='ows2')
+        self.session_b = self.team_b.session
+
+    async def _connect(self, session, *, overview=None, token=None):
+        query = []
+        if token:
+            query.append(f'token={token}')
+        if overview:
+            query.append(f'overview={overview}')
+        suffix = f'?{"&".join(query)}' if query else ''
+        communicator = WebsocketCommunicator(
+            asgi_application, f'/ws/session/{session.id}/{suffix}',
+        )
+        connected, code = await communicator.connect()
+        return communicator, connected, code
+
+    async def test_a_share_link_is_admitted_and_receives_overview_events(self):
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_a_share_viewer_never_receives_dementor_ticks(self):
+        # The allowlist's whole point: this envelope carries per-player
+        # role and energy detail the overview does not render.
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'dementor.tick', {'players': [{'secret': 1}]},
+        )
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        # The scoreboard event is what arrives — the tick was dropped on
+        # the way out rather than merely arriving later.
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_an_event_type_outside_the_allowlist_is_dropped(self):
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'some.future.event', {'anything': True},
+        )
+        await database_sync_to_async(events.emit_scoreboard_update)(
+            self.session, force=True,
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'scoreboard.updated')
+        await communicator.disconnect()
+
+    async def test_a_member_still_receives_everything(self):
+        # The allowlist must narrow share viewers only — a real member's
+        # socket is unchanged.
+        def _member_token():
+            _, member = _authed_client(self.team, username='ows-member')
+            return Token.objects.get(user=member).key
+
+        token = await database_sync_to_async(_member_token)()
+        communicator, connected, _ = await self._connect(
+            self.session, token=token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_session_event)(
+            self.session.id, 'dementor.tick', {'players': []},
+        )
+        message = await communicator.receive_json_from()
+        self.assertEqual(message['type'], 'dementor.tick')
+        await communicator.disconnect()
+
+    async def test_a_link_is_refused_on_another_sessions_socket(self):
+        communicator, connected, code = await self._connect(
+            self.session_b, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4403)
+        await communicator.disconnect()
+
+    async def test_a_revoked_link_cannot_connect(self):
+        await database_sync_to_async(self.link.revoke)()
+        communicator, connected, code = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_an_expired_link_cannot_connect(self):
+        await database_sync_to_async(
+            lambda: SessionOverviewLink.objects.filter(pk=self.link.pk).update(
+                expires_at=timezone.now() - timedelta(minutes=1),
+            )
+        )()
+        communicator, connected, code = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_revoking_closes_a_socket_already_open(self):
+        # Without this, a revoke button stops the next request and
+        # leaves the screen already on the wall updating happily.
+        communicator, connected, _ = await self._connect(
+            self.session, overview=self.link.token,
+        )
+        self.assertTrue(connected)
+        await database_sync_to_async(events.broadcast_overview_revoked)(
+            self.link.token,
+        )
+        message = await communicator.receive_output()
+        self.assertEqual(message['type'], 'websocket.close')
+        self.assertEqual(message['code'], 4403)
+        await communicator.disconnect()
+
+    async def test_presenting_both_credentials_is_refused(self):
+        def _staff_token():
+            _, staff = _staff_client(username='ows-staff')
+            return Token.objects.get(user=staff).key
+
+        token = await database_sync_to_async(_staff_token)()
+        communicator, connected, code = await self._connect(
+            self.session, token=token, overview=self.link.token,
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+    async def test_an_unknown_overview_token_is_refused(self):
+        communicator, connected, code = await self._connect(
+            self.session, overview='not-a-link',
+        )
+        self.assertFalse(connected)
+        self.assertEqual(code, 4401)
+        await communicator.disconnect()
+
+
+class TowerTypeTest(TestCase):
+    """tower-types — the kind-of-place lookup and its resolution order."""
+
+    def setUp(self):
+        self.game = _make_game(name='Types game')
+        self.game.proximity_meters = 50
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.zone = _make_zone(self.game)
+        self.staff_client, _staff = _staff_client(session=self.session)
+        # A fixture of this test's own. `fountain` belongs to the
+        # starter vocabulary an install is now seeded with, and a test
+        # that borrows a slug the system ships is a test that breaks the
+        # day the system ships one.
+        self.fountain = TowerType.objects.create(
+            name='Fountain', slug='types-fountain', icon='bi-droplet-fill',
+            color='#1F6FEB', proximity_meters=25,
+        )
+
+    # -- styling resolution ---------------------------------------------
+
+    def test_untyped_tower_resolves_to_the_documented_defaults(self):
+        tower = _make_tower(self.game, name='Plain', zone=self.zone)
+        self.assertEqual(tower.resolved_icon, DEFAULT_TOWER_ICON)
+        self.assertEqual(tower.resolved_color, DEFAULT_TOWER_COLOR)
+
+    def test_a_type_supplies_icon_and_colour(self):
+        tower = _make_tower(self.game, name='Old Mill', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(tower.resolved_icon, 'bi-droplet-fill')
+        self.assertEqual(tower.resolved_color, '#1F6FEB')
+
+    def test_overrides_resolve_per_facet(self):
+        # The common case is "this one is special in exactly one way",
+        # so overriding the colour must not cost the type's icon.
+        tower = _make_tower(self.game, name='Odd one', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.color = '#C0392B'
+        tower.save()
+        self.assertEqual(tower.resolved_color, '#C0392B')
+        self.assertEqual(tower.resolved_icon, 'bi-droplet-fill')
+        self.assertEqual(tower.tower_type_id, self.fountain.id)
+
+    def test_clearing_an_override_reverts_to_the_type(self):
+        tower = _make_tower(self.game, name='Reverting', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.color = '#C0392B'
+        tower.save()
+        tower.color = None
+        tower.save()
+        self.assertEqual(tower.resolved_color, '#1F6FEB')
+
+    def test_deleting_a_type_leaves_its_towers_resolvable(self):
+        tower = _make_tower(self.game, name='Orphan', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.fountain.delete()
+        tower.refresh_from_db()
+        self.assertIsNone(tower.tower_type_id)
+        self.assertEqual(tower.resolved_icon, DEFAULT_TOWER_ICON)
+        self.assertEqual(tower.resolved_color, DEFAULT_TOWER_COLOR)
+
+    # -- capture radius --------------------------------------------------
+
+    def test_type_radius_applies_when_the_tower_has_none(self):
+        tower = _make_tower(self.game, name='Typed', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 25)
+
+    def test_tower_radius_still_beats_its_type(self):
+        tower = _make_tower(
+            self.game, name='Specific', zone=self.zone, proximity_meters=10,
+        )
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 10)
+
+    def test_game_default_applies_when_neither_speaks(self):
+        typeless_radius = TowerType.objects.create(
+            name='Unopinionated', slug='unopinionated',
+        )
+        tower = _make_tower(self.game, name='Default', zone=self.zone)
+        tower.tower_type = typeless_radius
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 50)
+
+    def test_python_and_sql_radius_agree(self):
+        """The pair that must not drift.
+
+        Asserted against *each other* rather than against expected
+        numbers, so the test keeps meaning if a default changes. A
+        disagreement here reaches a player as a tower that shows up in
+        "near me" and then refuses to capture — which reads as flaky
+        GPS, not as a bug, and would cost an evening to find.
+        """
+        combos = [
+            ('own-and-type', 10, self.fountain),
+            ('type-only', None, self.fountain),
+            ('own-only', 15, None),
+            ('neither', None, None),
+        ]
+        towers = {}
+        for label, own, tower_type in combos:
+            tower = _make_tower(
+                self.game, name=f'radius-{label}', zone=self.zone,
+                proximity_meters=own,
+            )
+            tower.tower_type = tower_type
+            tower.save()
+            towers[tower.id] = tower
+
+        annotated = Tower.objects.filter(pk__in=towers).annotate(
+            _radius=proximity_radius_expression(self.game.proximity_meters),
+        )
+        self.assertEqual(annotated.count(), len(combos))
+        for row in annotated:
+            expected = effective_proximity(towers[row.id], self.game)
+            self.assertEqual(
+                row._radius, float(expected),
+                f'SQL and Python disagree for {row.name}',
+            )
+
+    # -- API --------------------------------------------------------------
+
+    def test_type_crud_is_staff_only(self):
+        url = reverse('admin-tower-type-list')
+        anon = APIClient()
+        self.assertIn(anon.get(url).status_code, (401, 403))
+        self.assertEqual(self.staff_client.get(url).status_code, 200)
+
+    def test_creating_a_type(self):
+        # Not one of the starter vocabulary's slugs: this is about a
+        # curator extending the set, which is the case that has to keep
+        # working once the set exists.
+        response = self.staff_client.post(
+            reverse('admin-tower-type-list'),
+            {
+                'name': 'Bunker', 'slug': 'Bunker', 'icon': 'bi-bricks',
+                'color': '#8E44AD', 'proximity_meters': 40,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['slug'], 'bunker')
+        self.assertEqual(response.data['tower_count'], 0)
+
+    def test_tower_payload_carries_both_the_choice_and_the_resolution(self):
+        tower = _make_tower(self.game, name='Served', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        data = self.staff_client.get(
+            reverse('admin-tower-detail', args=[tower.id]),
+        ).data
+        # What the curator chose (blank = inherit) …
+        self.assertEqual(data['tower_type'], self.fountain.id)
+        self.assertEqual(data['icon'], '')
+        # … and what a map should paint, so no client re-implements the
+        # fallback and drifts from the others.
+        self.assertEqual(data['resolved_icon'], 'bi-droplet-fill')
+        self.assertEqual(data['resolved_color'], '#1F6FEB')
+        self.assertEqual(data['tower_type_name'], 'Fountain')
+
+    def test_untyped_tower_payload_still_carries_resolved_styling(self):
+        tower = _make_tower(self.game, name='Bare', zone=self.zone)
+        data = self.staff_client.get(
+            reverse('admin-tower-detail', args=[tower.id]),
+        ).data
+        self.assertIsNone(data['tower_type'])
+        self.assertEqual(data['resolved_icon'], DEFAULT_TOWER_ICON)
+        self.assertEqual(data['resolved_color'], DEFAULT_TOWER_COLOR)
+
+    def test_assigning_a_type_through_the_api(self):
+        tower = _make_tower(self.game, name='Assignable', zone=self.zone)
+        response = self.staff_client.patch(
+            reverse('admin-tower-detail', args=[tower.id]),
+            {'tower_type': self.fountain.id}, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resolved_color'], '#1F6FEB')
+        tower.refresh_from_db()
+        self.assertEqual(effective_proximity(tower, self.game), 25)
+
+
+# ---------------------------------------------------------------------------
+# content-bundles — portable export/import of authored content, and the
+# legacy-dump importer that brings in what predates the format.
+# ---------------------------------------------------------------------------
+
+
+def _bundle_fixture(slug='travelling'):
+    """A Game exercising every kind of content a bundle carries.
+
+    Deliberately wide rather than deep: one row of each kind is enough to
+    prove a reference survives the trip, and a fixture that omits a kind
+    is a kind nobody notices is broken.
+    """
+    game = _make_game(name='Travelling game', slug=slug)
+    game.mode = MODE_TRAIL
+    game.proximity_meters = 42
+    game.save()
+
+    fountain = TowerType.objects.create(
+        name='Fountain', slug=f'{slug}-fountain', icon='bi-droplet-fill',
+        color='#1F6FEB', proximity_meters=25,
+    )
+    zone = _make_zone(game, name='Old town')
+    other_zone = _make_zone(game, name='Riverside')
+    tower = _make_tower(game, name='Old Mill', zone=zone, lng=23.58, lat=46.07)
+    tower.zones.add(other_zone)
+    tower.tower_type = fountain
+    tower.initial_bonus = 7
+    tower.rfid_code = 'RFIDTRAVEL01'
+    tower.save()
+    second = _make_tower(game, name='Gate', zone=other_zone, lng=23.59, lat=46.08)
+
+    photo = MediaAsset.objects.create(
+        tower=tower,
+        kind=MEDIA_IMAGE,
+        file=SimpleUploadedFile('mill.jpg', b'not-really-a-jpeg', 'image/jpeg'),
+        caption='From the bridge',
+    )
+    # A zone's media travels by the same spec entry as a tower's; if the
+    # nullable-subject ref resolution were wrong, only this one would say so.
+    MediaAsset.objects.create(
+        zone=zone,
+        kind=MEDIA_AUDIO,
+        file=SimpleUploadedFile('approach.weba', b'not-really-audio', 'audio/webm'),
+        caption='Enter by the north gate',
+        duration_seconds=11.5,
+    )
+
+    requirement = PresenceRequirement.objects.create(
+        name='Two together', min_members_present=2,
+    )
+    role = GameRole.objects.create(
+        game=game, name='Navigator', slug='navigator', description='Reads the map',
+    )
+    group = _make_group(game, name='Explo', slug='explo')
+
+    bound = Challenge.objects.create(
+        game=game, tower=tower, text='How many arches?', difficulty=2,
+        presence_requirement=requirement,
+    )
+    bound.required_roles.add(role)
+    floating = Challenge.objects.create(
+        game=game, tower=None, text='Name three knots.', difficulty=3,
+    )
+
+    multiplier = ScoreMultiplier.objects.create(
+        game=game, scope=ScoreMultiplier.SCOPE_TOWER, tower=tower,
+        multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+        window_start_offset=timedelta(minutes=30),
+        window_end_offset=timedelta(minutes=90),
+        label='Double at the mill',
+    )
+
+    trail = Trail.objects.create(game=game, structure=STRUCTURE_GRAPH)
+    step_one = TrailStep.objects.create(
+        trail=trail, tower=tower, order=1, is_start=True, gate_challenge=bound,
+        clue_text='Start at the water',
+    )
+    step_two = TrailStep.objects.create(
+        trail=trail, tower=second, order=2, is_finish=True,
+    )
+    edge = TrailEdge.objects.create(
+        trail=trail, from_step=step_one, to_step=step_two, clue='Follow the wall',
+    )
+
+    return {
+        'game': game, 'collection': _game_collection(game), 'type': fountain,
+        'zone': zone, 'other_zone': other_zone, 'tower': tower,
+        'second': second, 'photo': photo, 'requirement': requirement,
+        'role': role, 'group': group, 'bound': bound, 'floating': floating,
+        'multiplier': multiplier, 'trail': trail, 'step_one': step_one,
+        'step_two': step_two, 'edge': edge,
+    }
+
+
+def _zip_bytes(entries, payload=None):
+    """Build a raw archive, for the paths that must be refused."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        if payload is not None:
+            archive.writestr(bundles.BUNDLE_JSON, json.dumps(payload))
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    buffer.seek(0)
+    return buffer
+
+
+def _minimal_payload(**overrides):
+    payload = {
+        'format': bundles.FORMAT,
+        'format_version': bundles.FORMAT_VERSION,
+        'exported_at': '2026-09-24T00:00:00+00:00',
+        'selection': {'games': [], 'collections': []},
+        'content': {},
+    }
+    payload.update(overrides)
+    return payload
+
+
+class ContentBundleIdentityTest(TestCase):
+    """The uuid that makes a row recognisable after it travels."""
+
+    def test_rows_get_distinct_uuids(self):
+        game = _make_game(name='Ident')
+        zone = _make_zone(game)
+        other = _make_zone(game, name='Second')
+        self.assertIsNotNone(zone.uuid)
+        self.assertNotEqual(zone.uuid, other.uuid)
+
+    def test_uuid_survives_an_edit(self):
+        """The point of uuid4 over a content hash: editing is when
+        identity must NOT change."""
+        game = _make_game(name='Renaming')
+        tower = _make_tower(game, name='Before', zone=_make_zone(game))
+        original = tower.uuid
+        tower.name = 'After'
+        tower.save()
+        tower.refresh_from_db()
+        self.assertEqual(tower.uuid, original)
+
+    def test_every_bundled_model_carries_one(self):
+        for spec in bundles.manifest():
+            self.assertTrue(
+                hasattr(spec.model, 'uuid'),
+                f'{spec.model.__name__} is in the manifest without a uuid',
+            )
+
+    def test_the_backfill_migration_gave_existing_rows_distinct_uuids(self):
+        """Guards the three-step migration, whose one-step form silently
+        writes the same value into every row."""
+        executor = MigrationExecutor(connection)
+        migration = executor.loader.get_migration(
+            'game', '0042_content_bundle_uuids',
+        )
+        self.assertTrue(
+            any(
+                getattr(op, 'code', None) is not None
+                for op in migration.operations
+            ),
+            'the migration must backfill, not rely on the field default',
+        )
+
+
+class ContentBundleManifestTest(TestCase):
+    """The manifest is the whole contract; these are its invariants."""
+
+    def test_manifest_is_consistent(self):
+        bundles.validate_manifest()
+
+    def test_references_point_backwards(self):
+        order = {spec.key: i for i, spec in enumerate(bundles.manifest())}
+        for spec in bundles.manifest():
+            for name, target in {**spec.refs, **spec.m2m}.items():
+                self.assertLess(
+                    order[target], order[spec.key],
+                    f'{spec.key}.{name} -> {target} breaks the single-pass order',
+                )
+
+    def test_no_spec_exports_a_user_or_a_source_timestamp(self):
+        """Fields that mean nothing in another database must not travel,
+        and this has to hold for specs added later too."""
+        for spec in bundles.manifest():
+            names = {f.name for f in bundles.scalar_fields(spec)}
+            self.assertNotIn('created_at', names, spec.key)
+            self.assertNotIn('created_by', names, spec.key)
+            self.assertNotIn('captured_by', names, spec.key)
+            for f in spec.model._meta.concrete_fields:
+                if f.is_relation and f.related_model is User:
+                    self.assertNotIn(f.name, names, f'{spec.key}.{f.name}')
+
+    def test_a_missing_relation_declaration_is_an_error(self):
+        """The property that keeps this honest as models grow: a new FK
+        must be declared to travel or declared not to."""
+        spec = bundles.BundleSpec(key='towers', model=Tower)
+        with self.assertRaises(bundles.ManifestError):
+            bundles.MANIFEST.clear()
+            bundles.MANIFEST.extend([spec])
+            bundles.validate_manifest()
+        bundles.MANIFEST.clear()
+        bundles.validate_manifest()
+
+    def test_game_lands_inactive(self):
+        names = {
+            f.name for f in bundles.scalar_fields(bundles.spec_for('games'))
+        }
+        self.assertNotIn('is_active', names)
+
+
+class ContentBundleExportTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+
+    def _payload(self, **kwargs):
+        payload, _files = bundles.build_bundle(**kwargs)
+        return payload
+
+    def test_a_game_pulls_everything_it_needs(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        expected = {
+            'tower_types': 1, 'zones': 2, 'towers': 2, 'media': 2,
+            'collections': 1, 'presence_requirements': 1, 'games': 1,
+            'game_roles': 1, 'team_groups': 1, 'challenges': 2,
+            'score_multipliers': 1, 'trails': 1, 'trail_steps': 2,
+            'trail_edges': 1,
+        }
+        self.assertEqual({k: len(v) for k, v in content.items()}, expected)
+
+    def test_every_reference_is_a_uuid(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        for spec in bundles.manifest():
+            for row in content.get(spec.key, []):
+                for name in spec.refs:
+                    value = row[name]
+                    if value is not None:
+                        uuid.UUID(value)
+                for name in spec.m2m:
+                    for value in row[name]:
+                        uuid.UUID(value)
+
+    def test_a_collection_alone_carries_geometry_without_challenges(self):
+        content = self._payload(collections=[self.fx['collection']])['content']
+        self.assertEqual(len(content['towers']), 2)
+        self.assertEqual(len(content['zones']), 2)
+        self.assertNotIn('challenges', content)
+        self.assertNotIn('games', content)
+
+    def test_run_data_never_travels(self):
+        session = _default_session(self.fx['game'])
+        team = _make_team(self.fx['game'], self.fx['group'], name='Badgers')
+        self.fx['tower'].assign_to_team(team)
+        TeamTowerChallenge.objects.create(
+            team=team, tower=self.fx['tower'], challenge=self.fx['bound'],
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+        ScoreMultiplier.objects.create(
+            session=session, scope=ScoreMultiplier.SCOPE_GLOBAL, factor=3.0,
+        )
+        payload = self._payload(games=[self.fx['game']])
+        blob = json.dumps(payload)
+        self.assertNotIn('Badgers', blob)
+        known = {spec.key for spec in bundles.manifest()}
+        self.assertTrue(set(payload['content']) <= known)
+        # The Session-owned multiplier stayed behind; the Game-owned one came.
+        self.assertEqual(len(payload['content']['score_multipliers']), 1)
+        self.assertEqual(
+            payload['content']['score_multipliers'][0]['label'],
+            'Double at the mill',
+        )
+
+    def test_geometry_is_geojson(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        tower = next(
+            row for row in content['towers'] if row['name'] == 'Old Mill'
+        )
+        self.assertEqual(tower['location']['type'], 'Point')
+        self.assertAlmostEqual(tower['location']['coordinates'][0], 23.58)
+        zone = content['zones'][0]
+        self.assertEqual(zone['shape']['type'], 'Polygon')
+
+    def test_media_is_carried(self):
+        _payload, files = bundles.build_bundle(games=[self.fx['game']])
+        # The tower's photo and the zone's audio note.
+        self.assertEqual(len(files), 2)
+        self.assertTrue(
+            all(name.startswith(bundles.MEDIA_ROOT) for name in files),
+        )
+        self.assertIn(b'not-really-a-jpeg', files.values())
+        self.assertIn(b'not-really-audio', files.values())
+
+    def test_a_photo_whose_file_vanished_does_not_fail_the_export(self):
+        self.fx['photo'].file.storage.delete(self.fx['photo'].file.name)
+        payload, files = bundles.build_bundle(games=[self.fx['game']])
+        self.assertEqual(len(files), 1)
+        rows = {row['caption']: row for row in payload['content']['media']}
+        self.assertIsNone(rows['From the bridge']['file'])
+        self.assertIsNotNone(rows['Enter by the north gate']['file'])
+
+
+class ContentBundleImportTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, self.payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _bundle(self):
+        return bundles.read_bundle(io.BytesIO(self.archive_bytes))
+
+    def _wipe(self):
+        """Remove the exported content, leaving an install that has none."""
+        Game.objects.all().delete()
+        Challenge.objects.all().delete()
+        Tower.objects.all().update(autocreate_zone=False)
+        Zone.objects.all().delete()
+        Tower.objects.all().delete()
+        Collection.objects.all().delete()
+        TowerType.objects.all().delete()
+        PresenceRequirement.objects.all().delete()
+
+    def test_import_into_an_install_that_holds_none_of_it(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.updated, {})
+        game = Game.objects.get(slug='travelling')
+        self.assertEqual(game.uuid, self.fx['game'].uuid)
+        self.assertEqual(game.mode, MODE_TRAIL)
+        self.assertEqual(game.proximity_meters, 42)
+        # every reference resolved locally
+        tower = Tower.objects.get(name='Old Mill')
+        self.assertEqual(tower.tower_type.name, 'Fountain')
+        self.assertEqual(
+            sorted(z.name for z in tower.zones.all()), ['Old town', 'Riverside'],
+        )
+        self.assertEqual(
+            sorted(c.slug for c in game.collections.all()),
+            [self.fx['collection'].slug],
+        )
+        bound = Challenge.objects.get(text='How many arches?')
+        self.assertEqual(bound.tower_id, tower.id)
+        self.assertEqual(bound.game_id, game.id)
+        self.assertEqual(bound.presence_requirement.name, 'Two together')
+        self.assertEqual(
+            [r.slug for r in bound.required_roles.all()], ['navigator'],
+        )
+        self.assertIsNone(Challenge.objects.get(text='Name three knots.').tower_id)
+        trail = Trail.objects.get(game=game)
+        self.assertEqual(trail.structure, STRUCTURE_GRAPH)
+        step = TrailStep.objects.get(trail=trail, order=1)
+        self.assertEqual(step.tower_id, tower.id)
+        self.assertEqual(step.gate_challenge_id, bound.id)
+        edge = TrailEdge.objects.get(trail=trail)
+        self.assertEqual(edge.from_step.order, 1)
+        self.assertEqual(edge.to_step.order, 2)
+        multiplier = ScoreMultiplier.objects.get(game=game)
+        self.assertEqual(multiplier.window_start_offset, timedelta(minutes=30))
+        self.assertEqual(multiplier.tower_id, tower.id)
+
+    def test_geometry_survives_the_round_trip(self):
+        original = Tower.objects.get(name='Old Mill').location
+        original_zone = Zone.objects.get(name='Old town').shape
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        landed = Tower.objects.get(name='Old Mill').location
+        self.assertAlmostEqual(landed.x, original.x, places=9)
+        self.assertAlmostEqual(landed.y, original.y, places=9)
+        self.assertEqual(landed.srid, 4326)
+        self.assertTrue(
+            Zone.objects.get(name='Old town').shape.equals_exact(
+                original_zone, tolerance=1e-9,
+            ),
+        )
+
+    def test_media_lands_as_a_stored_file(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.media, 2)
+        photo = MediaAsset.objects.get(caption='From the bridge')
+        with photo.file.open('rb') as fh:
+            self.assertEqual(fh.read(), b'not-really-a-jpeg')
+
+    def test_zone_media_travels_with_its_zone(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        note = MediaAsset.objects.get(caption='Enter by the north gate')
+        self.assertEqual(note.kind, MEDIA_AUDIO)
+        self.assertIsNone(note.tower)
+        self.assertEqual(note.zone.name, 'Old town')
+        self.assertEqual(note.duration_seconds, 11.5)
+
+    def test_reimport_updates_in_place(self):
+        game = self.fx['game']
+        game.name = 'Locally renamed'
+        game.proximity_meters = 99
+        game.save()
+        before = Tower.objects.count()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.created, {})
+        self.assertEqual(Tower.objects.count(), before)
+        self.assertEqual(Game.objects.count(), 1)
+        game.refresh_from_db()
+        self.assertEqual(game.name, 'Travelling game')
+        self.assertEqual(game.proximity_meters, 42)
+
+    def test_copy_mode_lands_a_second_independent_copy(self):
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(report.updated, {})
+        self.assertEqual(Game.objects.count(), 2)
+        self.assertEqual(Tower.objects.count(), 4)
+        copy = Game.objects.exclude(pk=self.fx['game'].pk).get()
+        self.assertEqual(copy.slug, 'travelling-2')
+        self.assertNotEqual(copy.uuid, self.fx['game'].uuid)
+        # the original is untouched
+        self.fx['game'].refresh_from_db()
+        self.assertEqual(self.fx['game'].slug, 'travelling')
+        self.assertEqual(self.fx['game'].collections.count(), 1)
+        # and the copy points only at its own geometry
+        copied_tower_ids = set(copy.towers().values_list('pk', flat=True))
+        self.assertTrue(copied_tower_ids.isdisjoint(
+            set(self.fx['game'].towers().values_list('pk', flat=True)),
+        ))
+        copied_challenge = Challenge.objects.get(
+            game=copy, text='How many arches?',
+        )
+        self.assertIn(copied_challenge.tower_id, copied_tower_ids)
+
+    def test_copy_mode_does_not_autocreate_zones(self):
+        """`Tower.save()` conjures a circle for a tower with no zones,
+        which during an import is every tower until its m2m lands."""
+        self.fx['tower'].autocreate_zone = True
+        self.fx['tower'].save()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        before = Zone.objects.count()
+        with bundles.read_bundle(buffer) as bundle:
+            bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(Zone.objects.count(), before + 2)
+        copied = Tower.objects.filter(
+            name='Old Mill',
+        ).exclude(pk=self.fx['tower'].pk).get()
+        self.assertTrue(copied.autocreate_zone)
+        self.assertEqual(copied.zones.count(), 2)
+
+    def test_an_rfid_collision_keeps_the_incumbent(self):
+        self._wipe()
+        squatter = Tower.objects.create(
+            name='Squatter', location=Point(23.0, 46.0), is_active=True,
+            category=Tower.CATEGORY_NORMAL, rfid_code='RFIDTRAVEL01',
+        )
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        squatter.refresh_from_db()
+        self.assertEqual(squatter.rfid_code, 'RFIDTRAVEL01')
+        arrived = Tower.objects.get(name='Old Mill')
+        self.assertIsNone(arrived.rfid_code)
+        self.assertTrue(
+            any('RFIDTRAVEL01' in c['message'] for c in report.conflicts),
+        )
+
+    def test_a_slug_held_by_a_different_row_refuses_the_import(self):
+        self._wipe()
+        Game.objects.create(name='Someone else', slug='travelling')
+        with self._bundle() as bundle:
+            with self.assertRaises(bundles.BundleError) as caught:
+                bundles.import_bundle(bundle)
+        self.assertIn('travelling', str(caught.exception))
+        self.assertEqual(Tower.objects.count(), 0)
+
+    def test_a_failure_rolls_the_whole_import_back(self):
+        self._wipe()
+        counts = (Tower.objects.count(), Zone.objects.count())
+        with self._bundle() as bundle:
+            # A challenge pointing at a tower nobody has: the failure
+            # happens after zones and towers have been written.
+            bundle.payload['content']['challenges'][0]['tower'] = str(uuid.uuid4())
+            with self.assertRaises(bundles.BundleError):
+                bundles.import_bundle(bundle)
+        self.assertEqual(
+            (Tower.objects.count(), Zone.objects.count()), counts,
+        )
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_export_import_export_is_stable(self):
+        """Round-tripped content re-exports identically.
+
+        Media is compared by its bytes rather than by its archive path:
+        storage names the file it stores, so the path is expected to
+        differ and the content is not.
+        """
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        again, _payload = bundles.export_bundle(
+            games=[Game.objects.get(slug='travelling')],
+        )
+        first = _normalised(zipfile.ZipFile(io.BytesIO(self.archive_bytes)))
+        second = _normalised(zipfile.ZipFile(again))
+        self.assertEqual(first, second)
+
+    def test_an_unknown_mode_is_refused(self):
+        with self._bundle() as bundle:
+            with self.assertRaises(bundles.BundleError):
+                bundles.import_bundle(bundle, mode='merge-somehow')
+
+
+def _normalised(archive):
+    """A bundle's content, comparable across two exports.
+
+    Rows are ordered by uuid (row order is not content), the export
+    timestamp is dropped, and every file reference is replaced by the
+    bytes it points at — the archive path is chosen by storage on
+    arrival and is expected to change.
+    """
+    content = json.loads(archive.read(bundles.BUNDLE_JSON))['content']
+    out = {}
+    for spec in bundles.manifest():
+        rows = content.get(spec.key)
+        if rows is None:
+            continue
+        copied = []
+        for row in rows:
+            row = dict(row)
+            for name in spec.files:
+                row[name] = archive.read(row[name]) if row.get(name) else None
+            copied.append(row)
+        out[spec.key] = sorted(copied, key=lambda r: r['uuid'])
+    return out
+
+
+class ContentBundleReadSafetyTest(TestCase):
+    """An archive from elsewhere is input, not instructions."""
+
+    def test_a_non_zip_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(io.BytesIO(b'this is not a zip at all'))
+
+    def test_an_archive_without_bundle_json_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(_zip_bytes({'media/x.jpg': b'x'}))
+
+    def test_a_path_traversal_entry_is_refused(self):
+        for name in ('../escape.txt', '/etc/passwd', 'media/../../x'):
+            with self.subTest(name=name):
+                with self.assertRaises(bundles.BundleError):
+                    bundles.read_bundle(
+                        _zip_bytes({name: b'x'}, payload=_minimal_payload()),
+                    )
+
+    def test_an_unexpected_entry_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(
+                _zip_bytes({'run.sh': b'#!/bin/sh'}, payload=_minimal_payload()),
+            )
+
+    def test_too_many_entries_are_refused(self):
+        entries = {
+            f'media/{i}.jpg': b'x' for i in range(bundles.MAX_ENTRIES + 2)
+        }
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(_zip_bytes(entries, payload=_minimal_payload()))
+
+    def test_an_oversized_expansion_is_refused(self):
+        with patch.object(bundles, 'MAX_UNCOMPRESSED_BYTES', 64):
+            with self.assertRaises(bundles.BundleError):
+                bundles.read_bundle(
+                    _zip_bytes(
+                        {'media/big.jpg': b'x' * 4096},
+                        payload=_minimal_payload(),
+                    ),
+                )
+
+    def test_a_future_format_version_is_refused_by_name(self):
+        with self.assertRaises(bundles.BundleError) as caught:
+            bundles.read_bundle(
+                _zip_bytes({}, payload=_minimal_payload(format_version=99)),
+            )
+        self.assertIn('99', str(caught.exception))
+        self.assertIn(str(bundles.FORMAT_VERSION), str(caught.exception))
+
+    def test_another_format_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(
+                _zip_bytes({}, payload=_minimal_payload(format='something-else')),
+            )
+
+    def test_unreadable_json_is_refused(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr(bundles.BUNDLE_JSON, b'{not json')
+        buffer.seek(0)
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(buffer)
+
+    def test_an_unknown_content_kind_is_refused(self):
+        with self.assertRaises(bundles.BundleError) as caught:
+            bundles.read_bundle(
+                _zip_bytes(
+                    {},
+                    payload=_minimal_payload(content={'wormholes': [{'uuid': '1'}]}),
+                ),
+            )
+        self.assertIn('wormholes', str(caught.exception))
+
+    def test_a_row_without_a_usable_uuid_is_refused(self):
+        for rows in ([{'name': 'no uuid'}], [{'uuid': 'not-a-uuid'}]):
+            with self.subTest(rows=rows):
+                with self.assertRaises(bundles.BundleError):
+                    bundles.read_bundle(
+                        _zip_bytes({}, payload=_minimal_payload(
+                            content={'zones': rows},
+                        )),
+                    )
+
+
+class ContentBundleInspectTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _inspect(self, mode=bundles.MODE_SYNC):
+        with bundles.read_bundle(io.BytesIO(self.archive_bytes)) as bundle:
+            return bundles.inspect_bundle(bundle, mode=mode)
+
+    def test_reports_what_is_already_here(self):
+        inspection = self._inspect()
+        by_kind = {k['kind']: k for k in inspection['kinds']}
+        self.assertEqual(by_kind['towers']['in_bundle'], 2)
+        self.assertEqual(by_kind['towers']['already_here'], 2)
+        self.assertEqual(by_kind['towers']['would_create'], 0)
+        self.assertEqual(by_kind['towers']['would_update'], 2)
+        self.assertEqual(inspection['media_files'], 2)
+        self.assertEqual(inspection['selection']['games'], ['travelling'])
+
+    def test_copy_mode_would_create_everything(self):
+        by_kind = {k['kind']: k for k in self._inspect(bundles.MODE_COPY)['kinds']}
+        self.assertEqual(by_kind['towers']['would_create'], 2)
+        self.assertEqual(by_kind['towers']['would_update'], 0)
+
+    def test_reports_slug_collisions(self):
+        Game.objects.filter(pk=self.fx['game'].pk).delete()
+        Game.objects.create(name='Impostor', slug='travelling')
+        collisions = self._inspect()['slug_collisions']
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]['slug'], 'travelling')
+        self.assertEqual(collisions[0]['kind'], 'games')
+
+    def test_copy_mode_reports_no_collisions_because_it_suffixes(self):
+        self.assertEqual(self._inspect(bundles.MODE_COPY)['slug_collisions'], [])
+
+    def test_inspection_writes_nothing(self):
+        before = {
+            model.__name__: model.objects.count()
+            for model in (Game, Tower, Zone, Challenge, Collection, MediaAsset)
+        }
+        self._inspect()
+        self._inspect(bundles.MODE_COPY)
+        after = {
+            model.__name__: model.objects.count()
+            for model in (Game, Tower, Zone, Challenge, Collection, MediaAsset)
+        }
+        self.assertEqual(before, after)
+
+
+class ContentBundleCommandTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        self.path = Path(tempfile.mkdtemp()) / 'bundle.zip'
+
+    def test_export_then_import(self):
+        out = StringIO()
+        call_command(
+            'export_bundle', '--game', 'travelling',
+            '-o', str(self.path), stdout=out,
+        )
+        self.assertIn('towers', out.getvalue())
+        self.assertTrue(self.path.exists())
+
+        out = StringIO()
+        call_command(
+            'import_bundle', str(self.path), '--mode', 'copy', stdout=out,
+        )
+        self.assertIn('created', out.getvalue())
+        self.assertEqual(Game.objects.count(), 2)
+
+    def test_export_by_id_and_by_slug_agree(self):
+        by_slug = Path(tempfile.mkdtemp()) / 'a.zip'
+        by_id = Path(tempfile.mkdtemp()) / 'b.zip'
+        call_command('export_bundle', '--game', 'travelling', '-o', str(by_slug))
+        call_command(
+            'export_bundle', '--game', str(self.fx['game'].pk), '-o', str(by_id),
+        )
+        first = json.loads(zipfile.ZipFile(by_slug).read(bundles.BUNDLE_JSON))
+        second = json.loads(zipfile.ZipFile(by_id).read(bundles.BUNDLE_JSON))
+        self.assertEqual(first['content'].keys(), second['content'].keys())
+
+    def test_export_needs_a_selection(self):
+        with self.assertRaises(CommandError):
+            call_command('export_bundle', '-o', str(self.path))
+
+    def test_export_names_what_it_could_not_find(self):
+        with self.assertRaises(CommandError) as caught:
+            call_command('export_bundle', '--game', 'no-such-game', '-o', str(self.path))
+        self.assertIn('no-such-game', str(caught.exception))
+
+    def test_dry_run_writes_nothing(self):
+        call_command('export_bundle', '--game', 'travelling', '-o', str(self.path))
+        Game.objects.all().delete()
+        out = StringIO()
+        call_command('import_bundle', str(self.path), '--dry-run', stdout=out)
+        self.assertIn('Nothing was written', out.getvalue())
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_an_unreadable_bundle_is_a_command_error(self):
+        bad = Path(tempfile.mkdtemp()) / 'bad.zip'
+        bad.write_bytes(b'nope')
+        with self.assertRaises(CommandError):
+            call_command('import_bundle', str(bad))
+
+
+class ContentBundleApiTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        self.client_staff, _staff = _staff_client()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _upload(self, data=None):
+        return SimpleUploadedFile(
+            'bundle.zip', data if data is not None else self.archive_bytes,
+            'application/zip',
+        )
+
+    def test_export_returns_a_zip(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [self.fx['game'].pk], 'collections': []},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/zip')
+        self.assertIn('attachment', response['Content-Disposition'])
+        payload = json.loads(
+            zipfile.ZipFile(io.BytesIO(response.content)).read(bundles.BUNDLE_JSON),
+        )
+        self.assertEqual(payload['selection']['games'], ['travelling'])
+
+    def test_export_needs_a_selection(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [], 'collections': []}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_export_of_an_unknown_id_is_404(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [99999], 'collections': []}, format='json',
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_inspect_changes_nothing(self):
+        before = Tower.objects.count()
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-inspect'),
+            {'file': self._upload(), 'mode': 'sync'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['format_version'], bundles.FORMAT_VERSION)
+        self.assertTrue(response.data['kinds'])
+        self.assertEqual(Tower.objects.count(), before)
+
+    def test_import_applies_and_reports(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(), 'mode': 'copy'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['mode'], 'copy')
+        self.assertEqual(response.data['created']['games'], 1)
+        self.assertEqual(Game.objects.count(), 2)
+
+    def test_a_bad_bundle_is_a_400_not_a_500(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(b'not a zip')}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('detail', response.data)
+
+    def test_a_bad_mode_is_refused(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(), 'mode': 'whatever'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_without_a_file_is_refused(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'), {}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_every_endpoint_is_staff_only(self):
+        session = _default_session(self.fx['game'])
+        team = _make_team(self.fx['game'], self.fx['group'])
+        team.session = session
+        team.save()
+        player, _user = _authed_client(team, username='player-bundles')
+        anon = APIClient()
+        for name in (
+            'api-staff-bundle-export',
+            'api-staff-bundle-inspect',
+            'api-staff-bundle-import',
+        ):
+            url = reverse(name)
+            with self.subTest(endpoint=name):
+                self.assertIn(anon.post(url, {}).status_code, (401, 403))
+                self.assertIn(player.post(url, {}).status_code, (401, 403))
+
+
+LEGACY_SCHEMA = """
+CREATE TABLE geogame_zone (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    color varchar(18) NOT NULL,
+    scoring_type smallint NOT NULL,
+    shape geometry(Polygon, 4326)
+);
+CREATE TABLE geogame_tower (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    location geometry(Point, 4326) NOT NULL,
+    category smallint NOT NULL,
+    is_active boolean NOT NULL,
+    zone_id integer NOT NULL,
+    rfid_code varchar(16)
+);
+CREATE TABLE geogame_challenge (
+    id integer PRIMARY KEY,
+    text text NOT NULL,
+    difficulty smallint NOT NULL,
+    tower_id integer
+);
+CREATE TABLE geogame_team (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    category smallint NOT NULL
+);
+"""
+
+LEGACY_ROWS = """
+INSERT INTO geogame_zone VALUES
+  (1, 'Z1', '#112233', 1,
+   ST_GeomFromText('POLYGON((23.0 46.0, 23.1 46.0, 23.1 46.1, 23.0 46.1, 23.0 46.0))', 4326)),
+  (2, 'BZ2', '#000000', 4,
+   ST_GeomFromText('POLYGON((23.2 46.2, 23.3 46.2, 23.3 46.3, 23.2 46.3, 23.2 46.2))', 4326));
+INSERT INTO geogame_tower VALUES
+  (10, 'Cetate', ST_SetSRID(ST_MakePoint(23.05, 46.05), 4326), 1, true, 1, NULL),
+  (11, E'Trei m\\u0103gari\\n', ST_SetSRID(ST_MakePoint(23.06, 46.06), 4326), 1, true, 1, NULL),
+  (12, 'Poarta', ST_SetSRID(ST_MakePoint(23.25, 46.25), 4326), 2, false, 2, 'LEGACYCODE01'),
+  (13, 'Orphan', ST_SetSRID(ST_MakePoint(23.26, 46.26), 4326), 1, true, 99, NULL);
+INSERT INTO geogame_challenge VALUES
+  (100, 'How many gates?', 2, 10),
+  (101, 'Name three knots.', 3, NULL),
+  (102, 'Challenge for a tower that is not here', 1, 555);
+INSERT INTO geogame_team VALUES
+  (1, 'Pisicile', 1), (2, 'Inferno', 2), (3, 'Redu', 3), (4, 'Second explo', 1);
+"""
+
+
+class LegacyDumpImportTest(TransactionTestCase):
+    """The pre-Session schema, mapped onto the current one.
+
+    Reads through `--from-db` against legacy tables created inside the
+    test database: their names (`geogame_*`) cannot collide with the
+    current schema's (`game_*`), and it exercises the real SQL the
+    command runs rather than a stand-in for it.
+    """
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            cursor.execute(LEGACY_SCHEMA)
+            cursor.execute(LEGACY_ROWS)
+        self.dbname = connection.settings_dict['NAME']
+
+    def tearDown(self):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'DROP TABLE IF EXISTS geogame_zone, geogame_tower, '
+                'geogame_challenge, geogame_team CASCADE',
+            )
+
+    def _import(self, **kwargs):
+        out = StringIO()
+        options = {
+            'from_db': self.dbname,
+            'collection': 'Legacy map',
+            'game': 'Legacy game',
+            'stdout': out,
+            **kwargs,
+        }
+        call_command('import_legacy_dump', **options)
+        return out.getvalue()
+
+    def test_zones_towers_and_challenges_land(self):
+        self._import()
+        collection = Collection.objects.get(name='Legacy map')
+        game = Game.objects.get(name='Legacy game')
+        self.assertEqual(collection.zones.count(), 2)
+        self.assertEqual(collection.towers.count(), 4)
+        self.assertIn(collection, game.collections.all())
+
+        zone = Zone.objects.get(name='Z1')
+        self.assertEqual(zone.color, '#112233')
+        self.assertEqual(zone.scoring_type, 1)
+        self.assertAlmostEqual(zone.shape.centroid.x, 23.05, places=6)
+        self.assertEqual(Zone.objects.get(name='BZ2').scoring_type, 4)
+
+        tower = Tower.objects.get(name='Cetate')
+        self.assertAlmostEqual(tower.location.x, 23.05)
+        self.assertEqual(tower.category, Tower.CATEGORY_NORMAL)
+        self.assertTrue(tower.is_active)
+        self.assertEqual([z.name for z in tower.zones.all()], ['Z1'])
+
+        gate = Tower.objects.get(name='Poarta')
+        self.assertEqual(gate.category, Tower.CATEGORY_RFID)
+        self.assertFalse(gate.is_active)
+        self.assertEqual(gate.rfid_code, 'LEGACYCODE01')
+        self.assertEqual([z.name for z in gate.zones.all()], ['BZ2'])
+
+    def test_legacy_names_are_stripped(self):
+        self._import()
+        self.assertTrue(Tower.objects.filter(name='Trei măgari').exists())
+
+    def test_a_tower_bound_challenge_keeps_its_tower(self):
+        self._import()
+        challenge = Challenge.objects.get(text='How many gates?')
+        self.assertEqual(challenge.tower.name, 'Cetate')
+        self.assertEqual(challenge.game.name, 'Legacy game')
+        self.assertEqual(challenge.difficulty, 2)
+
+    def test_a_challenge_with_no_tower_becomes_game_wide(self):
+        output = self._import()
+        challenge = Challenge.objects.get(text='Name three knots.')
+        self.assertIsNone(challenge.tower_id)
+        self.assertEqual(challenge.game.name, 'Legacy game')
+        self.assertIn('game-wide', output)
+
+    def test_a_challenge_for_a_missing_tower_is_skipped_and_reported(self):
+        output = self._import()
+        self.assertFalse(
+            Challenge.objects.filter(
+                text='Challenge for a tower that is not here',
+            ).exists(),
+        )
+        self.assertIn('555', output)
+
+    def test_a_tower_naming_a_missing_zone_still_lands(self):
+        output = self._import()
+        orphan = Tower.objects.get(name='Orphan')
+        self.assertEqual(orphan.zones.count(), 0)
+        self.assertIn('99', output)
+
+    def test_team_categories_become_team_groups_and_teams_do_not_travel(self):
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        self.assertEqual(
+            sorted(TeamGroup.objects.filter(game=game).values_list('slug', flat=True)),
+            ['explo', 'seniori', 'temerari'],
+        )
+        self.assertFalse(Team.objects.filter(name='Pisicile').exists())
+
+    def test_an_rfid_code_already_held_here_is_dropped_and_reported(self):
+        Tower.objects.create(
+            name='Incumbent', location=Point(22.0, 45.0), is_active=True,
+            category=Tower.CATEGORY_NORMAL, rfid_code='LEGACYCODE01',
+        )
+        output = self._import()
+        self.assertIsNone(Tower.objects.get(name='Poarta').rfid_code)
+        self.assertEqual(
+            Tower.objects.get(name='Incumbent').rfid_code, 'LEGACYCODE01',
+        )
+        self.assertIn('LEGACYCODE01', output)
+
+    def test_the_game_opens_on_the_imported_towers(self):
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        self.assertIsNotNone(game.base_point)
+        self.assertAlmostEqual(game.base_point.x, 23.155, places=3)
+        self.assertAlmostEqual(game.base_point.y, 46.155, places=3)
+
+    def test_rerunning_refuses_to_duplicate(self):
+        self._import()
+        with self.assertRaises(CommandError) as caught:
+            self._import()
+        self.assertIn('--replace', str(caught.exception))
+        self.assertEqual(Tower.objects.count(), 4)
+
+    def test_replace_replaces_rather_than_duplicating(self):
+        self._import()
+        first = set(Tower.objects.values_list('name', flat=True))
+        self._import(replace=True)
+        self.assertEqual(Tower.objects.count(), 4)
+        self.assertEqual(set(Tower.objects.values_list('name', flat=True)), first)
+        self.assertEqual(Collection.objects.filter(name='Legacy map').count(), 1)
+
+    def test_a_database_that_is_not_a_legacy_one_is_refused_before_writing(self):
+        self.tearDown()
+        with self.assertRaises(CommandError) as caught:
+            self._import()
+        self.assertIn('geogame_zone', str(caught.exception))
+        self.assertFalse(Collection.objects.filter(name='Legacy map').exists())
+        self.assertFalse(Game.objects.filter(name='Legacy game').exists())
+
+    def test_naming_both_a_dump_and_a_database_is_refused(self):
+        with self.assertRaises(CommandError):
+            call_command(
+                'import_legacy_dump', 'some.dump', '--from-db', self.dbname,
+                '--collection', 'X', '--game', 'Y',
+            )
+
+    def test_imported_content_can_then_be_exported_as_a_bundle(self):
+        """The two halves of this change, against each other."""
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        buffer, payload = bundles.export_bundle(games=[game])
+        self.assertEqual(len(payload['content']['towers']), 4)
+        self.assertEqual(len(payload['content']['challenges']), 2)
+        with bundles.read_bundle(buffer) as bundle:
+            report = bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(report.created['towers'], 4)
+        self.assertEqual(Game.objects.filter(name='Legacy game').count(), 2)
+
+
+class StaffLibraryFeedTest(TestCase):
+    """library-map — the whole repository, drawable in one request."""
+
+    def setUp(self):
+        self.game = _make_game(name='Library game')
+        self.session = _default_session(self.game)
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.client_plain = APIClient()
+        self.url = reverse('api-staff-library')
+
+        # Named for this test, not for the starter vocabulary the
+        # install ships with — see `TowerTypeTest`.
+        self.fountain = TowerType.objects.create(
+            name='Fountain', slug='library-fountain', icon='bi-droplet-fill',
+            color='#1F6FEB', proximity_meters=25,
+        )
+        self.zone = _make_zone(self.game, name='Old town')
+        self.typed = _make_tower(self.game, name='Mill', zone=self.zone)
+        self.typed.tower_type = self.fountain
+        self.typed.save()
+        self.untyped = _make_tower(self.game, name='Well', zone=self.zone, lng=23.6)
+
+        self.riverside = Collection.objects.create(
+            name='Riverside', slug='riverside',
+        )
+        self.riverside.towers.add(self.typed)
+        self.riverside.zones.add(self.zone)
+
+    def test_library_is_staff_only(self):
+        self.assertIn(self.client_plain.get(self.url).status_code, (401, 403))
+        self.assertEqual(self.staff_client.get(self.url).status_code, 200)
+
+    def test_feed_carries_geometry_styling_and_membership(self):
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIn('Mill', towers)
+        self.assertAlmostEqual(towers['Mill']['lat'], 46.5)
+        self.assertEqual(towers['Mill']['icon'], 'bi-droplet-fill')
+        self.assertEqual(towers['Mill']['color'], '#1F6FEB')
+        self.assertEqual(towers['Mill']['tower_type_name'], 'Fountain')
+        # Untyped elements still draw — with the documented defaults.
+        self.assertEqual(towers['Well']['icon'], DEFAULT_TOWER_ICON)
+        self.assertEqual(towers['Well']['color'], DEFAULT_TOWER_COLOR)
+
+    def test_membership_rides_with_each_element(self):
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIn(self.riverside.id, towers['Mill']['collection_ids'])
+        self.assertNotIn(self.riverside.id, towers['Well']['collection_ids'])
+        zones = {z['name']: z for z in data['zones']}
+        self.assertIn(self.riverside.id, zones['Old town']['collection_ids'])
+
+    def test_an_element_in_no_collection_reports_an_empty_list(self):
+        # An empty list, not a missing key — the map asks every pin the
+        # same question and must get an answer from all of them.
+        loose = _make_tower(self.game, name='Loose', zone=self.zone, lng=23.9)
+        loose.collections.clear()
+        towers = {t['name']: t for t in self.staff_client.get(self.url).data['towers']}
+        self.assertEqual(towers['Loose']['collection_ids'], [])
+
+    def test_an_element_in_several_collections_reports_all_of_them(self):
+        second = Collection.objects.create(name='Walking tour', slug='walking-tour')
+        second.towers.add(self.typed)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        for expected in (self.riverside.id, second.id):
+            self.assertIn(expected, towers['Mill']['collection_ids'])
+
+    def test_feed_carries_collections_and_types_for_the_side_panel(self):
+        data = self.staff_client.get(self.url).data
+        collections = {c['slug']: c for c in data['collections']}
+        self.assertEqual(collections['riverside']['tower_count'], 1)
+        self.assertEqual(collections['riverside']['zone_count'], 1)
+        self.assertIn('library-fountain', {t['slug'] for t in data['tower_types']})
+
+    def test_zone_geometry_is_serialized(self):
+        zones = {z['name']: z for z in self.staff_client.get(self.url).data['zones']}
+        self.assertIsNotNone(zones['Old town']['shape'])
+        self.assertIn('Polygon', zones['Old town']['shape'])
+
+    def test_the_whole_library_costs_a_bounded_number_of_queries(self):
+        # The point of one feed is that it does not degrade per element.
+        # Ten more towers in two more collections must not mean ten more
+        # queries, so the count is asserted to be identical.
+        with CaptureQueriesContext(connection) as small:
+            self.staff_client.get(self.url)
+        extra = Collection.objects.create(name='Extra', slug='extra')
+        for index in range(10):
+            tower = _make_tower(
+                self.game, name=f'Bulk {index}', zone=self.zone, lng=23.7 + index / 100,
+            )
+            tower.tower_type = self.fountain
+            tower.save()
+            extra.towers.add(tower)
+        with CaptureQueriesContext(connection) as large:
+            response = self.staff_client.get(self.url)
+        self.assertEqual(len(response.data['towers']), 12)
+        self.assertEqual(
+            len(large.captured_queries), len(small.captured_queries),
+            'the library feed gained a query per element',
+        )
+
+
+class ContentBundleAdoptionTest(TestCase):
+    """Two installs that each grew the same per-game child.
+
+    The uuid is the identity, but a Game has exactly one Trail and one
+    role per slug. When both sides created theirs independently, a sync
+    used to hit a unique constraint and refuse a bundle that was not
+    really in conflict; now it adopts the local row and converges the
+    identifiers.
+    """
+
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _bundle(self):
+        return bundles.read_bundle(io.BytesIO(self.archive_bytes))
+
+    def _reuuid(self, instance):
+        """Give a row a fresh uuid, as if it had been created here."""
+        type(instance).objects.filter(pk=instance.pk).update(uuid=uuid.uuid4())
+        instance.refresh_from_db()
+
+    def test_a_role_created_on_both_sides_is_adopted_not_duplicated(self):
+        self._reuuid(self.fx['role'])
+        local_pk, local_uuid = self.fx['role'].pk, self.fx['role'].uuid
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        roles = GameRole.objects.filter(game=self.fx['game'], slug='navigator')
+        self.assertEqual(roles.count(), 1)
+        adopted = roles.get()
+        self.assertEqual(adopted.pk, local_pk)
+        self.assertNotEqual(adopted.uuid, local_uuid)
+        # …and the challenge's requirement points at the surviving row.
+        challenge = Challenge.objects.get(text='How many arches?')
+        self.assertEqual(
+            [r.pk for r in challenge.required_roles.all()], [local_pk],
+        )
+
+    def test_a_trail_created_on_both_sides_is_adopted_not_duplicated(self):
+        self._reuuid(self.fx['trail'])
+        local_pk = self.fx['trail'].pk
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        trails = Trail.objects.filter(game=self.fx['game'])
+        self.assertEqual(trails.count(), 1)
+        self.assertEqual(trails.get().pk, local_pk)
+
+    def test_a_team_group_created_on_both_sides_is_adopted(self):
+        self._reuuid(self.fx['group'])
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        self.assertEqual(
+            TeamGroup.objects.filter(game=self.fx['game'], slug='explo').count(), 1,
+        )
+
+    def test_adoption_converges_so_a_second_sync_matches_directly(self):
+        self._reuuid(self.fx['role'])
+        for _ in range(2):
+            with self._bundle() as bundle:
+                bundles.import_bundle(bundle)
+        self.assertEqual(
+            GameRole.objects.filter(game=self.fx['game'], slug='navigator').count(), 1,
+        )
+
+    def test_copy_mode_never_adopts(self):
+        """Copy means a second copy — it must not reach into what is here."""
+        self._reuuid(self.fx['role'])
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(GameRole.objects.filter(slug='navigator').count(), 2)
+        self.assertEqual(Trail.objects.count(), 2)
+
+# ---------------------------------------------------------------------------
+# challenge-media — media as a challenge's own content (tasks 7.1–7.9)
+# ---------------------------------------------------------------------------
+
+
+def _png_bytes(size=(4, 4)):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new('RGB', size, color=(0, 128, 255)).save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def _wav_bytes(seconds=1.0, rate=8000):
+    """A real PCM WAV whose duration mutagen reads from the header."""
+    import struct
+
+    frames = int(rate * seconds)
+    data = b'\x00\x00' * frames  # 16-bit mono silence
+    byte_rate = rate * 2
+    header = (
+        b'RIFF' + struct.pack('<I', 36 + len(data)) + b'WAVE'
+        + b'fmt ' + struct.pack('<IHHIIHH', 16, 1, 1, rate, byte_rate, 2, 16)
+        + b'data' + struct.pack('<I', len(data))
+    )
+    return header + data
+
+
+def _mp4_bytes(seconds=1.0):
+    """A minimal MP4: ftyp + moov/mvhd. mutagen reads length from mvhd."""
+    import struct
+
+    def box(kind, payload):
+        return struct.pack('>I', 8 + len(payload)) + kind + payload
+
+    timescale = 1000
+    mvhd = struct.pack(
+        '>IIIII', 0, 0, 0, timescale, int(seconds * timescale),
+    ) + b'\x00' * 80
+    return (
+        box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso2mp41')
+        + box(b'moov', box(b'mvhd', mvhd))
+    )
+
+
+def _upload(name, content, content_type):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, content, content_type=content_type)
+
+
+def _media_url(challenge):
+    return f'/api/staff/challenges/{challenge.id}/media/'
+
+
+class ChallengeMediaUploadTest(TestCase):
+    """Task 7.1 — every kind uploads; anything over a limit is refused."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def _post(self, **fields):
+        return self.staff_client.post(
+            _media_url(self.challenge), fields, format='multipart',
+        )
+
+    def test_image_upload(self):
+        resp = self._post(
+            kind='IMAGE',
+            file=_upload('a.png', _png_bytes(), 'image/png'),
+            alt_text='the square before',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertEqual(item.challenge, self.challenge)
+        self.assertEqual(item.kind, 'IMAGE')
+        self.assertEqual(item.alt_text, 'the square before')
+        self.assertEqual(item.uploaded_by, self.staff)
+        self.assertGreater(item.bytes, 0)
+        # Images are untimed.
+        self.assertIsNone(item.duration_seconds)
+
+    def test_audio_upload_records_duration(self):
+        resp = self._post(
+            kind='AUDIO',
+            file=_upload('bells.wav', _wav_bytes(seconds=2.0), 'audio/wav'),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertAlmostEqual(item.duration_seconds, 2.0, places=1)
+
+    def test_video_upload_records_duration(self):
+        resp = self._post(
+            kind='VIDEO',
+            file=_upload('clip.mp4', _mp4_bytes(seconds=3.0), 'video/mp4'),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertAlmostEqual(item.duration_seconds, 3.0, places=1)
+
+    def test_oversized_file_is_refused_naming_the_limit(self):
+        with self.settings(CHALLENGE_MEDIA_MAX_BYTES={
+            'IMAGE': 100, 'AUDIO': 100, 'VIDEO': 100,
+        }):
+            resp = self._post(
+                kind='IMAGE',
+                file=_upload('big.png', _png_bytes(size=(64, 64)), 'image/png'),
+            )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('the limit is', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_over_long_audio_is_refused_naming_the_limit(self):
+        with self.settings(CHALLENGE_MEDIA_MAX_SECONDS={'AUDIO': 1, 'VIDEO': 1}):
+            resp = self._post(
+                kind='AUDIO',
+                file=_upload('long.wav', _wav_bytes(seconds=4.0), 'audio/wav'),
+            )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('4s long', detail)
+        self.assertIn('the limit is 1s', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_disallowed_mime_is_refused_listing_accepted_types(self):
+        resp = self._post(
+            kind='IMAGE',
+            file=_upload('x.tiff', b'II*\x00junk', 'image/tiff'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('not an accepted image type', detail)
+        self.assertIn('image/png', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_undeterminable_duration_is_refused(self):
+        # Right MIME, but not a container mutagen can read.
+        resp = self._post(
+            kind='VIDEO',
+            file=_upload('broken.mp4', b'not really an mp4', 'video/mp4'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('Could not read the duration', str(resp.json()))
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_unknown_kind_is_refused(self):
+        resp = self._post(
+            kind='HOLOGRAM',
+            file=_upload('a.png', _png_bytes(), 'image/png'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+
+class ChallengeMediaOrderingTest(TestCase):
+    """Tasks 7.2, 7.3 — order is explicit, editable, and kind-agnostic."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def _upload_image(self, name):
+        resp = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload(name, _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()['id']
+
+    def test_uploads_append_in_order(self):
+        first = self._upload_image('before.png')
+        second = self._upload_image('after.png')
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [first, second])
+        self.assertEqual([m['order'] for m in listed], [0, 1])
+
+    def test_reorder_persists_without_reupload(self):
+        first = self._upload_image('before.png')
+        second = self._upload_image('after.png')
+        resp = self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [second, first]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [second, first])
+        # Same rows — nothing was re-uploaded.
+        self.assertEqual(ChallengeMedia.objects.count(), 2)
+
+    def test_reorder_rejects_a_partial_list(self):
+        first = self._upload_image('before.png')
+        self._upload_image('after.png')
+        resp = self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [first]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_order_is_preserved_across_mixed_kinds(self):
+        image = self._upload_image('before.png')
+        audio = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'AUDIO', 'file': _upload('b.wav', _wav_bytes(), 'audio/wav')},
+            format='multipart',
+        ).json()['id']
+        video = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'VIDEO', 'file': _upload('c.mp4', _mp4_bytes(), 'video/mp4')},
+            format='multipart',
+        ).json()['id']
+        self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [video, image, audio]},
+            format='json',
+        )
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [video, image, audio])
+        self.assertEqual(
+            [m['kind'] for m in listed], ['VIDEO', 'IMAGE', 'AUDIO'],
+        )
+
+    def test_patch_edits_caption_and_alt_text(self):
+        media_id = self._upload_image('before.png')
+        resp = self.staff_client.patch(
+            f'{_media_url(self.challenge)}{media_id}/',
+            {'caption': 'the square in 1940', 'alt_text': 'a market square'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        item = ChallengeMedia.objects.get(pk=media_id)
+        self.assertEqual(item.caption, 'the square in 1940')
+        self.assertEqual(item.alt_text, 'a market square')
+
+    def test_delete_removes_the_item(self):
+        media_id = self._upload_image('before.png')
+        resp = self.staff_client.delete(
+            f'{_media_url(self.challenge)}{media_id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(ChallengeMedia.objects.filter(pk=media_id).exists())
+
+
+class ChallengeMediaScopeTest(TestCase):
+    """Tasks 7.4, 7.5 — authoring is creator-scoped; deletion cascades."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def test_non_author_cannot_upload(self):
+        other_client, other = _staff_client(
+            session=self.team.session, username='stranger',
+        )
+        self.game.created_by = User.objects.create_user(
+            username='owner', password='pw', is_staff=True,
+        )
+        self.game.save(update_fields=['created_by'])
+        resp = other_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload('a.png', _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_deleting_a_challenge_deletes_its_media(self):
+        staff_client, staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload('a.png', _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(ChallengeMedia.objects.count(), 1)
+        self.challenge.delete()
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+
+class ChallengeMediaPlayerPayloadTest(TestCase):
+    """Tasks 7.6, 7.7, 7.8 — delivery, visibility, and unchanged behaviour."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game,
+            tower=self.tower, difficulty=1,
+        )
+        self.team = _make_team(self.game, self.group)
+        self.client, self.user = _authed_client(self.team, username='athlete')
+
+    def _attach(self, **kwargs):
+        from django.core.files.base import ContentFile
+        defaults = {
+            'challenge': self.challenge, 'kind': 'IMAGE',
+            'caption': '', 'alt_text': '', 'order': 0, 'bytes': 10,
+        }
+        defaults.update(kwargs)
+        item = ChallengeMedia(**defaults)
+        item.file.save('shot.png', ContentFile(_png_bytes()), save=False)
+        item.save()
+        return item
+
+    def test_media_is_served_in_order_with_its_fields(self):
+        self._attach(order=1, caption='after', alt_text='square, edited')
+        self._attach(order=0, caption='before', alt_text='square')
+        body = self.client.get(f'/api/towers/{self.tower.id}/state/').json()
+        media = body['next_challenge']['media']
+        self.assertEqual([m['caption'] for m in media], ['before', 'after'])
+        self.assertEqual(media[0]['alt_text'], 'square')
+        # Absolute, not a bare /media/ path: the player SPA and the
+        # Capacitor app are served from a different origin than the API.
+        self.assertTrue(media[0]['url'].startswith('http'), media[0]['url'])
+
+    def test_hidden_challenge_leaks_no_media_anywhere_in_the_response(self):
+        self._attach(caption='before')
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        resp = self.client.get(f'/api/towers/{self.tower.id}/state/')
+        body = resp.json()
+        self.assertTrue(body['challenge_hidden'])
+        self.assertIsNone(body['next_challenge'])
+        # The whole serialized response, not just the media field: a URL
+        # surfacing anywhere is a spoiler that defeats hidden-until-arrival.
+        raw = resp.content.decode()
+        self.assertNotIn('challenge_media', raw)
+        self.assertNotIn('before', raw)
+
+    def test_media_appears_once_the_challenge_does(self):
+        self._attach(caption='before')
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        body = self.client.get(
+            f'/api/towers/{self.tower.id}/state/',
+            {'lat': 46.5, 'lng': 23.5},
+        ).json()
+        self.assertFalse(body['challenge_hidden'])
+        self.assertEqual(len(body['next_challenge']['media']), 1)
+
+    def test_challenge_without_media_reports_an_empty_list(self):
+        body = self.client.get(f'/api/towers/{self.tower.id}/state/').json()
+        self.assertEqual(body['next_challenge']['media'], [])
+        self.assertEqual(body['next_challenge']['text'], 'Spot five differences')
+
+    def test_media_challenge_obeys_the_same_proximity_rules(self):
+        """A self-contained puzzle is still submitted at the tower."""
+        self._attach()
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.6,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        # On site, the same submission is accepted.
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+
+class ExistingBase64UploadsStillWorkTest(TestCase):
+    """Task 7.9 — the base64 paths challenge-media deliberately did not touch.
+
+    Reference media moved from `{tower}/photos/` with an `image` field to
+    `{tower}/media/` with a `file` one (tower-zone-media) after this test
+    was written. The endpoint it names changed; what it is guarding did
+    not — that a curator's queued base64 capture still replays while
+    challenge media travels only as multipart.
+    """
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='curator',
+        )
+
+    def test_reference_media_base64_upload_still_works(self):
+        tower = _make_tower(self.game, name='T1')
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{tower.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get(tower=tower).kind, MEDIA_IMAGE)

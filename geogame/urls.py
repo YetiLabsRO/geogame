@@ -30,6 +30,7 @@ from game.admin_api import (
     AdminTeamGroupList,
     AdminTeamMembershipViewSet,
     AdminTeamViewSet,
+    AdminTowerTypeViewSet,
     AdminTowerViewSet,
     AdminZoneViewSet,
     ResetScoresView,
@@ -50,11 +51,17 @@ from game.badge_api import (
     StaffBadgeListView,
     StaffGatewayListView,
 )
+from game.bundles_api import (
+    StaffBundleExportView,
+    StaffBundleImportView,
+    StaffBundleInspectView,
+)
 from game.discovery_api import (
     DiscoveredTowersView,
     DiscoveryPingView,
     StaffRevealView,
 )
+from game.library_api import StaffLibraryView
 from game.location_api import (
     LocationConsentView,
     LocationLiveView,
@@ -68,6 +75,12 @@ from game.multipliers_api import (
     SessionScoreMultiplierListCreate,
     SessionScoreMultiplierToggle,
 )
+from game.overview_api import (
+    PublicOverviewView,
+    StaffOverviewLinkListCreateView,
+    StaffOverviewLinkRevokeView,
+    StaffSessionOverviewView,
+)
 from game.proximity_api import (
     DementorMeView,
     ProximityCapabilityView,
@@ -75,6 +88,7 @@ from game.proximity_api import (
     ProximityReportView,
     StaffDementorTotalsView,
 )
+from game.replay_api import StaffSessionReplayView
 from game.trail_api import (
     AdminTrailEdgeViewSet,
     AdminTrailStepViewSet,
@@ -109,6 +123,10 @@ router.register(r'team_tower_challenges', TeamTowerChallengeViewSet)
 admin_router = routers.DefaultRouter()
 admin_router.register(r'zones', AdminZoneViewSet, basename='admin-zone')
 admin_router.register(r'towers', AdminTowerViewSet, basename='admin-tower')
+# tower-types: the kind-of-place lookup towers are styled and defaulted from.
+admin_router.register(
+    r'tower-types', AdminTowerTypeViewSet, basename='admin-tower-type',
+)
 admin_router.register(r'teams', AdminTeamViewSet, basename='admin-team')
 admin_router.register(
     r'team-groups', AdminTeamGroupList, basename='admin-team-group',
@@ -193,6 +211,36 @@ urlpatterns = [
         'api/staff/sessions/<int:pk>/location-history/',
         StaffLocationHistoryView.as_view(),
         name='api-staff-location-history',
+    ),
+    # session-replay: one bundle per Session, scrubbed client-side.
+    path(
+        'api/staff/sessions/<int:pk>/replay/',
+        StaffSessionReplayView.as_view(),
+        name='api-staff-session-replay',
+    ),
+    # library-map: the whole repository, drawable in one request.
+    path('api/staff/library/', StaffLibraryView.as_view(), name='api-staff-library'),
+    # live-overview: one snapshot per Session for the big-screen view,
+    # plus the revocable share links that address it without an account.
+    path(
+        'api/staff/sessions/<int:pk>/overview/',
+        StaffSessionOverviewView.as_view(),
+        name='api-staff-session-overview',
+    ),
+    path(
+        'api/staff/sessions/<int:pk>/overview-links/',
+        StaffOverviewLinkListCreateView.as_view(),
+        name='api-staff-session-overview-links',
+    ),
+    path(
+        'api/staff/overview-links/<int:pk>/revoke/',
+        StaffOverviewLinkRevokeView.as_view(),
+        name='api-staff-overview-link-revoke',
+    ),
+    path(
+        'api/overview/<str:token>/',
+        PublicOverviewView.as_view(),
+        name='api-overview-public',
     ),
     path(
         'api/towers/<int:pk>/identify/',
@@ -328,6 +376,23 @@ urlpatterns = [
         StaffGatewayListView.as_view(),
         name='api-staff-gateways',
     ),
+    # content-bundles: move authored content between installs. Export is a
+    # POST because the selection is two lists of ids, not a URL's worth.
+    path(
+        'api/staff/bundles/export/',
+        StaffBundleExportView.as_view(),
+        name='api-staff-bundle-export',
+    ),
+    path(
+        'api/staff/bundles/inspect/',
+        StaffBundleInspectView.as_view(),
+        name='api-staff-bundle-inspect',
+    ),
+    path(
+        'api/staff/bundles/import/',
+        StaffBundleImportView.as_view(),
+        name='api-staff-bundle-import',
+    ),
     path('api/staff/', include(admin_router.urls)),
     path(
         'api/staff/game-state/reset-scores/',
@@ -337,6 +402,8 @@ urlpatterns = [
     path('api/', include('organize.urls')),
     # mcp-authoring-server: staff review + MCP credential endpoints.
     path('', include('authoring.urls')),
+    # game-simulator-backend: staff-only fake-game runner (record/replay).
+    path('', include('simulator.urls')),
     path('api-auth/', include('rest_framework.urls')),
     path('chaining/', include('smart_selects.urls')),
 

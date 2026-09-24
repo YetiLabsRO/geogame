@@ -1,113 +1,117 @@
-<nav class="navbar navbar-expand-sm bg-body-tertiary border-bottom">
-  <div class="container-fluid">
-    <a class="navbar-brand fw-semibold" routerLink="/">Cercetador staff</a>
-    @if (isAuthenticated() && isStaff()) {
-      <ul class="navbar-nav flex-row gap-3 me-auto ms-3 small">
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/" routerLinkActive="active" [routerLinkActiveOptions]="{ exact: true }">
-            Review queue
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/invites" routerLinkActive="active">
-            Invites
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/join-requests" routerLinkActive="active">
-            Join requests
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/field" routerLinkActive="active">
-            Field mode
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/towers" routerLinkActive="active">
-            Towers
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/zones" routerLinkActive="active">
-            Zones
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/teams" routerLinkActive="active">
-            Teams
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/challenges" routerLinkActive="active">
-            Challenges
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/collections" routerLinkActive="active">
-            Collections
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/games" routerLinkActive="active">
-            Games
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/sessions" routerLinkActive="active">
-            Sessions
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/trails" routerLinkActive="active">
-            Trails
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/scoreboard" routerLinkActive="active">
-            Scoreboard
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/dementors" routerLinkActive="active">
-            Dementors
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/game-state" routerLinkActive="active">
-            Game state
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/badges" routerLinkActive="active">
-            Badges
-          </a>
-        </li>
-        <li class="nav-item">
-          <a class="nav-link" routerLink="/authoring" routerLinkActive="active">
-            AI review
-          </a>
-        </li>
-      </ul>
+@if (chromeless()) {
+  <!-- Share-link display: the page IS the screen. No nav, no account
+       controls, nothing to sign into. -->
+  <main class="app-bare">
+    <router-outlet />
+  </main>
+} @else if (isAuthenticated() && isStaff()) {
+  <div class="app-shell">
+    <!-- Backdrop only exists below `lg`, where the sidebar overlays the page. -->
+    @if (sidebarOpen()) {
+      <div class="app-backdrop" (click)="closeSidebar()"></div>
     }
-    <div class="ms-auto d-flex align-items-center gap-2">
-      @if (isAuthenticated() && isStaff()) {
-        <app-session-switcher />
-      }
-      @if (isAuthenticated()) {
-        @if (username(); as name) {
-          <span class="text-body-secondary small">{{ name }}</span>
+
+    <nav class="app-sidebar" [class.open]="sidebarOpen()" aria-label="Staff sections">
+      <a class="app-brand" routerLink="/" (click)="closeSidebar()">
+        <i class="bi bi-compass-fill"></i>
+        <span>Cercetador staff</span>
+      </a>
+
+      <div class="app-nav">
+        @for (section of sections; track section.label) {
+          <div class="app-nav-section" role="group" [attr.aria-label]="section.label">
+            <div class="app-nav-heading">{{ section.label }}</div>
+            @for (item of section.items; track item.link) {
+              <a
+                class="app-nav-link"
+                [routerLink]="item.link"
+                routerLinkActive="active"
+                #rla="routerLinkActive"
+                [routerLinkActiveOptions]="{ exact: !!item.exact }"
+                [attr.aria-current]="rla.isActive ? 'page' : null"
+                (click)="closeSidebar()"
+              >
+                <i class="bi" [class]="item.icon"></i>
+                <span>{{ item.label }}</span>
+              </a>
+            }
+          </div>
         }
-        <button type="button" class="btn btn-sm btn-outline-secondary" (click)="logout()">
-          Sign out
+      </div>
+
+      <!-- Escape hatch for the operations the staff UI doesn't cover. -->
+      <a class="app-nav-link app-nav-foot" href="/admin/" target="_blank" rel="noopener">
+        <i class="bi bi-box-arrow-up-right"></i>
+        <span>Django Admin</span>
+      </a>
+    </nav>
+
+    <div class="app-main">
+      <header class="app-topbar">
+        <button
+          type="button"
+          class="btn btn-sm btn-outline-secondary app-sidebar-toggle"
+          (click)="toggleSidebar()"
+          [attr.aria-expanded]="sidebarOpen()"
+          aria-controls="app-sidebar"
+          aria-label="Toggle navigation"
+        >
+          <i class="bi bi-list"></i>
         </button>
-      } @else {
-        <a class="btn btn-sm btn-outline-primary" routerLink="/login">Sign in</a>
-      }
+
+        <div class="ms-auto d-flex align-items-center gap-2">
+          <app-session-switcher />
+          @if (username(); as name) {
+            <span class="text-body-secondary small d-none d-sm-inline">{{ name }}</span>
+          }
+          <button type="button" class="btn btn-sm btn-outline-secondary" (click)="logout()">
+            Sign out
+          </button>
+        </div>
+      </header>
+
+      <main class="app-content">
+        <router-outlet />
+      </main>
     </div>
   </div>
-</nav>
+} @else if (bootstrapping()) {
+  <!-- Reloaded and still resolving the profile: show a neutral bar rather
+       than the signed-out one, which would read as having been logged out. -->
+  <nav class="navbar bg-body-tertiary border-bottom">
+    <div class="container-fluid">
+      <span class="navbar-brand fw-semibold">Cercetador staff</span>
+      <span class="d-flex align-items-center gap-2 text-body-secondary small">
+        <span class="spinner-border spinner-border-sm"></span>
+        Restoring session…
+      </span>
+    </div>
+  </nav>
 
-<main class="container py-4">
-  <router-outlet />
-</main>
+  <main class="container py-4">
+    <router-outlet />
+  </main>
+} @else {
+  <!-- Signed out / non-staff: no sidebar, just the bar and the page. -->
+  <nav class="navbar bg-body-tertiary border-bottom">
+    <div class="container-fluid">
+      <a class="navbar-brand fw-semibold" routerLink="/">Cercetador staff</a>
+      <div class="d-flex align-items-center gap-2">
+        @if (isAuthenticated()) {
+          @if (username(); as name) {
+            <span class="text-body-secondary small">{{ name }}</span>
+          }
+          <button type="button" class="btn btn-sm btn-outline-secondary" (click)="logout()">
+            Sign out
+          </button>
+        } @else {
+          <a class="btn btn-sm btn-outline-primary" routerLink="/login">Sign in</a>
+        }
+      </div>
+    </div>
+  </nav>
+
+  <main class="container py-4">
+    <router-outlet />
+  </main>
+}

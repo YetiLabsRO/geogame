@@ -186,7 +186,10 @@ server {
     listen 443 ssl http2;
     server_name cercetador.albascout.ro;
 
-    client_max_body_size 20M;  # challenge photo uploads
+    # Must exceed the largest CHALLENGE_MEDIA_MAX_BYTES (video, 100M by
+    # default) plus multipart overhead, or challenge video uploads are
+    # rejected with a 413 before Django ever sees them.
+    client_max_body_size 110M;
 
     location /static/ {
         alias /var/app/cercetador/staticfiles/;
@@ -218,7 +221,7 @@ server {
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto https;
         proxy_read_timeout 60s;
-        client_max_body_size 20M;
+        client_max_body_size 110M;
     }
 
     location /admin/ {
@@ -309,6 +312,71 @@ curl -i https://cercetador.albascout.ro/health/
 ```
 
 If it returns 503, the view reached Django but couldn't `SELECT 1` from PostgreSQL — check the DB is running and `/etc/cercetador.env` has the right credentials. If it returns 502, gunicorn isn't responding — check `sudo supervisorctl status geogame` and the error log at `/var/log/supervisor/geogame.err.log`.
+
+## Challenge media storage
+
+Challenges can carry images, audio, and video (the `challenge-media`
+capability). Files are written through Django's storage API, so the
+backend is a settings choice — no model or view code depends on it.
+
+**Default: local `MEDIA_ROOT`.** Nothing to configure. Media lands under
+`MEDIA_ROOT/challenge_media/` alongside the existing tower and
+submission photos, and this is what ships.
+
+> ⚠️ **`MEDIA_ROOT` does not survive a container rebuild without a
+> mounted volume.** This has always been true for tower and submission
+> photos, but video makes it hurt much sooner: a season of challenge
+> video is a different order of magnitude from a few reference photos.
+> If the app runs from an image that is rebuilt on deploy, either mount
+> a persistent volume at `MEDIA_ROOT` or switch to object storage below.
+> The current VPS deploy updates a checkout in place, so `MEDIA_ROOT`
+> persists — this is a caveat for a containerised future, not today.
+
+**Object storage (S3-compatible).** Install `django-storages[s3]` and set
+in `local_settings.py`:
+
+```python
+STORAGES = {
+    'default': {'BACKEND': 'storages.backends.s3.S3Storage'},
+    'staticfiles': {
+        'BACKEND': 'django.contrib.staticfiles.storage.StaticFilesStorage',
+    },
+}
+AWS_STORAGE_BUCKET_NAME = 'cercetador-media'
+AWS_S3_ENDPOINT_URL = 'https://...'   # any S3-compatible provider
+AWS_S3_ACCESS_KEY_ID = '...'
+AWS_S3_SECRET_ACCESS_KEY = '...'
+```
+
+Existing files under `MEDIA_ROOT` are **not** migrated by this switch —
+copy them into the bucket under the same relative paths first, or old
+media 404s.
+
+### Upload limits
+
+Per-kind ceilings live in `settings.py` and can be overridden in
+`local_settings.py`:
+
+| Setting | Purpose |
+| --- | --- |
+| `CHALLENGE_MEDIA_MIME_TYPES` | Accepted types per kind |
+| `CHALLENGE_MEDIA_MAX_BYTES` | Size ceiling per kind |
+| `CHALLENGE_MEDIA_MAX_SECONDS` | Duration ceiling for audio/video |
+
+Uploads are validated and **rejected**, never transcoded — a file over a
+limit is refused at upload with the limit named. Duration is probed with
+`mutagen` (pure Python, no ffmpeg). The MIME allowlists are deliberately
+narrow: every accepted type is one `mutagen` can read, so a file is never
+stored with an unknown duration. **WebM is absent for that reason** — if
+you need it, you need a probe that can read Matroska, not just a wider
+allowlist.
+
+**Keep nginx in step.** `client_max_body_size` in the nginx config above
+is 110M to clear the 100MB default video ceiling plus multipart
+overhead. If you raise `CHALLENGE_MEDIA_MAX_BYTES['VIDEO']`, raise
+`client_max_body_size` with it — otherwise nginx returns a 413 and the
+creator sees a browser error rather than the limit message Django would
+have given them.
 
 ## Rollback
 

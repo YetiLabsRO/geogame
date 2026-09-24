@@ -169,6 +169,35 @@ interface Position {
           </div>
           <p class="tr-body-italic">&ldquo;{{ c.text }}&rdquo;</p>
 
+          <!-- challenge-media: the challenge's own media, in creator
+               order. A tower-bound challenge need not be ABOUT its
+               tower — two pictures to compare are the puzzle itself.
+               Ported onto the design system during the mobile merge;
+               the markup below carries no Bootstrap component classes,
+               which the player build no longer ships. -->
+          @if (c.media?.length) {
+            <div class="tower-media">
+              @for (m of c.media; track m.id) {
+                <figure class="tower-media__item">
+                  @switch (m.kind) {
+                    @case ('IMAGE') {
+                      <img [src]="m.url" [alt]="m.alt_text" />
+                    }
+                    @case ('AUDIO') {
+                      <audio [src]="m.url" controls preload="none"></audio>
+                    }
+                    @case ('VIDEO') {
+                      <video [src]="m.url" controls preload="none" playsinline></video>
+                    }
+                  }
+                  @if (m.caption) {
+                    <figcaption class="tr-meta-tiny">{{ m.caption }}</figcaption>
+                  }
+                </figure>
+              }
+            </div>
+          }
+
           @if (s.presence; as p) {
             <div class="tower-divider"></div>
             <span class="tr-field-label">Presence requirement</span>
@@ -333,6 +362,33 @@ interface Position {
     }
   `,
   styles: `
+    /* challenge-media, on the design system: the media is the puzzle, so
+       it gets the full card width and the token radius rather than a
+       Bootstrap border utility. */
+    .tower-media {
+      display: flex;
+      flex-direction: column;
+      gap: var(--spacing-md);
+      margin-top: var(--spacing-md);
+    }
+    .tower-media__item {
+      margin: 0;
+    }
+    .tower-media__item img,
+    .tower-media__item video {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: var(--radius-md);
+    }
+    .tower-media__item audio {
+      width: 100%;
+    }
+    .tower-media__item figcaption {
+      margin-top: var(--spacing-2xs);
+      color: var(--color-text-secondary);
+    }
+
     :host {
       display: block;
     }

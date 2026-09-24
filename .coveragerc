@@ -1,5 +1,5 @@
 [run]
-source = game,organize
+source = game,organize,authoring,simulator
 omit =
     */migrations/*
     */tests.py

@@ -14,10 +14,17 @@ from game.admin_api import (
     AdminCollectionSerializer,
     AdminGameRoleSerializer,
     AdminGameSerializer,
+    AdminSessionSerializer,
     AdminTeamGroupSerializer,
 )
 from game.models import Challenge, Collection, Tower, Zone
-from organize.models import Game, GameRole, TeamGroup
+from organize.models import (
+    OVERRIDABLE_CONFIG_FIELDS,
+    Game,
+    GameRole,
+    Session,
+    TeamGroup,
+)
 
 from .config_schema import describe_config_schema
 from .engine import authorize_operation
@@ -30,6 +37,8 @@ from .models import (
     ENTITY_CONFIG,
     ENTITY_GAME,
     ENTITY_GAME_ROLE,
+    ENTITY_SESSION,
+    ENTITY_TEAM,
     ENTITY_TOWER,
     ENTITY_ZONE,
     EVENT_TOOL_CALL,
@@ -42,6 +51,13 @@ from .models import (
 )
 
 _STAFF_CONTEXT = {'request': None}
+
+# Payload keys that would assert who plays on a team — never stageable.
+_MEMBERSHIP_KEYS = frozenset({
+    'members', 'member', 'membership', 'memberships',
+    'players', 'player', 'users', 'user', 'profiles', 'profile',
+    'captain',
+})
 
 
 def authorable_games(user):
@@ -182,6 +198,35 @@ class AuthoringTools:
         self._audit('list_game_roles', args={'game_id': game_id}, result={'count': len(data)})
         return list(data)
 
+    def list_sessions(self, game_id=None):
+        games = {g.id for g in authorable_games(self.user)}
+        qs = Session.objects.filter(game_id__in=games).order_by('game_id', 'start_time')
+        if game_id is not None:
+            if game_id not in games:
+                raise PermissionDenied('Game is outside your authoring scope.')
+            qs = qs.filter(game_id=game_id)
+        data = AdminSessionSerializer(qs, many=True, context=_STAFF_CONTEXT).data
+        self._audit('list_sessions', args={'game_id': game_id}, result={'count': len(data)})
+        return list(data)
+
+    def get_session(self, session_id):
+        session = Session.objects.select_related('game').get(pk=session_id)
+        if not session.game.can_edit(self.user):
+            raise PermissionDenied('Session is outside your authoring scope.')
+        data = dict(AdminSessionSerializer(session, context=_STAFF_CONTEXT).data)
+        # Show override-vs-inherited per knob, so the LLM proposes only real
+        # deltas instead of restating a value the Session already resolves to.
+        data['config'] = {
+            name: {
+                'override': getattr(session, name),
+                'effective': session.effective(name),
+                'inherited': getattr(session, name) is None,
+            }
+            for name in OVERRIDABLE_CONFIG_FIELDS
+        }
+        self._audit('get_session', args={'session_id': session_id})
+        return data
+
     def describe_config_schema(self):
         self._audit('describe_config_schema')
         return describe_config_schema()
@@ -258,6 +303,21 @@ class AuthoringTools:
         proposal = self._current_proposal()
         if not proposal.is_open:
             raise ValueError('The open proposal is no longer accepting operations.')
+        # Assigning real people to teams is not an authoring decision an LLM
+        # may make; players join through invites / join codes instead.
+        if entity_type == ENTITY_TEAM:
+            forbidden = sorted(_MEMBERSHIP_KEYS & set(payload))
+            if forbidden:
+                self._audit(
+                    'stage_operation_denied',
+                    args={'entity_type': entity_type, 'membership_keys': forbidden},
+                    proposal=proposal,
+                )
+                raise PermissionDenied(
+                    'Team membership cannot be staged: remove '
+                    f'{", ".join(forbidden)}. Players join through invites '
+                    'or a join code.',
+                )
         # Scope gate: an operation whose target is an EXISTING object must
         # be inside the creator's scope right now (temp refs are checked
         # at apply time — their defining CREATE carries the authorization).
@@ -334,7 +394,38 @@ class AuthoringTools:
         payload = {'game': game_ref, 'name': name, **extra}
         return self._stage(ENTITY_GAME_ROLE, ACTION_CREATE, payload, rationale, temp_ref)
 
+    def propose_session(self, game_ref, name, slug, start_time, end_time,
+                        scheduled_start=None, temp_ref='', rationale='', **extra):
+        # `state` is not stageable: a staged Session is always born DRAFT and
+        # a human drives it onward. AdminSessionSerializer marks `state`
+        # read-only too, so this only keeps the refusal explicit and early.
+        extra.pop('state', None)
+        payload = {
+            'game': game_ref, 'name': name, 'slug': slug,
+            'start_time': start_time, 'end_time': end_time, **extra,
+        }
+        if scheduled_start is not None:
+            payload['scheduled_start'] = scheduled_start
+        return self._stage(ENTITY_SESSION, ACTION_CREATE, payload, rationale, temp_ref)
+
+    def propose_team(self, session_ref, name, color, description='',
+                     group_ref=None, temp_ref='', rationale='', **extra):
+        payload = {
+            'session': session_ref, 'name': name, 'color': color,
+            'description': description, **extra,
+        }
+        if group_ref is not None:
+            payload['group'] = group_ref
+        return self._stage(ENTITY_TEAM, ACTION_CREATE, payload, rationale, temp_ref)
+
     def propose_config(self, target_id, fields, scope='game', rationale=''):
+        if scope == 'session':
+            unsupported = sorted(set(fields) - set(OVERRIDABLE_CONFIG_FIELDS))
+            if unsupported:
+                raise ValueError(
+                    f'Not overridable per session: {", ".join(unsupported)}. '
+                    'These knobs support scope "game" only.',
+                )
         payload = {'scope': scope, 'id': target_id, 'fields': fields}
         return self._stage(ENTITY_CONFIG, ACTION_UPDATE, payload, rationale)
 

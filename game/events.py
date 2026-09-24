@@ -56,6 +56,33 @@ def session_group(session_id):
     return f'session_{session_id}'
 
 
+def overview_link_group(token):
+    """Channel-layer group for one share link's open displays.
+
+    A restricted viewer joins this alongside the Session group purely so
+    revocation can reach it. Without it, revoking a link would stop new
+    requests but leave the screen already on the wall updating happily —
+    which is the one failure that makes a revoke button not mean
+    anything.
+    """
+    return f'overview_link_{token}'
+
+
+def broadcast_overview_revoked(token):
+    """Tell any display holding `token` to stop."""
+    layer = _channel_layer()
+    if layer is None:
+        return False
+    try:
+        async_to_sync(layer.group_send)(
+            overview_link_group(token), {'type': 'overview.revoked'},
+        )
+    except Exception:
+        logger.warning('Failed to signal revocation of an overview link', exc_info=True)
+        return False
+    return True
+
+
 def reset_throttle():
     """Test hook: forget coalesced-broadcast throttle timestamps."""
     _scoreboard_last_sent.clear()

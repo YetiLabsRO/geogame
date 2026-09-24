@@ -57,8 +57,11 @@ class Command(BaseCommand):
 
         # Idempotent by replacement: recreate this collection's geometry
         # (deleting the Tower rows cascades their tower-bound challenges).
-        Tower.objects.filter(collections=collection).delete()
+        # Zones go first: the at-least-one-tower-per-zone guard refuses to
+        # delete a tower that is a zone's last member, so towers-first
+        # cannot replace a collection that has already been imported once.
         Zone.objects.filter(collections=collection).delete()
+        Tower.objects.filter(collections=collection).delete()
 
         doc = xml.dom.minidom.parse(str(settings.BASE_DIR / "game" / "data" / "zone_normal.kml"))
         self.parse_zones(doc, 1, collection)

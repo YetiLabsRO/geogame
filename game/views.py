@@ -6,7 +6,7 @@ from django.contrib.gis.geos import Point
 from django.contrib.gis.measure import Distance
 from django.db import OperationalError, connection, transaction
 from django.db.models import Count, F, FloatField, Q, Value
-from django.db.models.functions import Cast, Coalesce, Least
+from django.db.models.functions import Least
 from django.http import JsonResponse
 from django.shortcuts import render
 from django.utils import timezone
@@ -27,6 +27,7 @@ from game.models import (
     TeamTowerFailCounter,
     Tower,
     Zone,
+    proximity_radius_expression,
 )
 from game.scoping import (
     GameGeometryScopedViewSetMixin,
@@ -160,10 +161,17 @@ class TowerViewSet(TeamVisibilityMixin, GameGeometryScopedViewSetMixin, viewsets
             point = Point(lng, lat, srid=4326)
             accuracy = float(self.request.query_params.get("accuracy", 100.))
 
-            # Effective per-tower radius (zone-conquest-and-scoring-config):
-            # the tower's own proximity_meters when set, else the Game's
-            # game-wide default — each capped by the reported GPS accuracy,
-            # preserving the historical `min(accuracy, game default)` shape.
+            # Effective per-tower radius: the tower's own
+            # proximity_meters, else its TowerType's default
+            # (tower-types), else the Game's game-wide default — each
+            # capped by the reported GPS accuracy, preserving the
+            # historical `min(accuracy, game default)` shape.
+            #
+            # This Coalesce is the SQL twin of `models.effective_proximity`
+            # and the two MUST stay in step. A tower that appears here
+            # under one radius but refuses capture under another reads
+            # as flaky GPS, not as a bug, so the pair is pinned by
+            # `test_python_and_sql_radius_agree`.
             session = _current_session(self.request)
             default_radius = float(
                 session.game.proximity_meters if session is not None else 50,
@@ -171,10 +179,7 @@ class TowerViewSet(TeamVisibilityMixin, GameGeometryScopedViewSetMixin, viewsets
             return queryset.annotate(
                 _distance=DistanceFunc('location', point),
                 _radius=Least(
-                    Coalesce(
-                        Cast('proximity_meters', FloatField()),
-                        Value(default_radius),
-                    ),
+                    proximity_radius_expression(default_radius),
                     Value(accuracy),
                     output_field=FloatField(),
                 ),

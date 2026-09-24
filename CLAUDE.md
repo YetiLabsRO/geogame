@@ -19,7 +19,7 @@ Guidance for Claude Code when working in this repository.
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py runserver 8200
 
 # Tests + coverage (matches CI)
-/home/yeti/.virtualenvs/cercetador/bin/coverage run manage.py test game organize --noinput
+/home/yeti/.virtualenvs/cercetador/bin/coverage run manage.py test game organize simulator authoring --noinput
 /home/yeti/.virtualenvs/cercetador/bin/coverage report --fail-under=80
 
 # Lint (matches CI)
@@ -28,6 +28,14 @@ Guidance for Claude Code when working in this repository.
 # Migrations
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py migrate
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py makemigrations
+
+# Content portability — move maps/game templates between installs
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py export_bundle --game <slug> -o bundle.zip
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_bundle bundle.zip --dry-run
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_bundle bundle.zip --mode sync|copy
+
+# Import a pre-Session production dump into a Collection + Game
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_legacy_dump <dump> --collection "<name>" --game "<name>"
 
 # Mobile (from frontend/; needs ANDROID_HOME=~/Android/Sdk and a JDK 21 with javac)
 npm run cap:sync:dev      # web build (dev API origin) + cap sync

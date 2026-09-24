@@ -259,6 +259,12 @@ class Game(models.Model):
     multiple independent runs can share the same Game.
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=64, unique=True)
 
@@ -538,6 +544,10 @@ class Game(models.Model):
             clone = Game.objects.get(pk=self.pk)
             clone.pk = None
             clone._state.adding = True
+            # A clone is a new template, so it needs its own portable
+            # identity (content-bundles) — copying the instance would
+            # otherwise carry the source's uuid into a unique column.
+            clone.uuid = uuid.uuid4()
             clone.slug = slug
             clone.name = name or f'{self.name} (copy)'
             clone.is_active = False
@@ -620,6 +630,12 @@ class GameRole(models.Model):
     engine behavior (currently only INVITER); everything else is flavor
     usable purely through challenge role requirements.
     """
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     game = models.ForeignKey(Game, on_delete=models.CASCADE, related_name='roles')
     name = models.CharField(max_length=255)
@@ -713,6 +729,12 @@ class UserProfile(models.Model):
 
 
 class TeamGroup(models.Model):
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
     game = models.ForeignKey(Game, on_delete=models.CASCADE)
     slug = models.SlugField()

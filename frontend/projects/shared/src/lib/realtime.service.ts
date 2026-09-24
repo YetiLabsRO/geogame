@@ -93,6 +93,8 @@ export class RealtimeService {
 
   private socket: WebSocket | null = null;
   private sessionId: number | null = null;
+  /** Share-link token when this socket is a big-screen viewer. */
+  private shareToken: string | null = null;
   private attempts = 0;
   private reconnectHandle: ReturnType<typeof setTimeout> | null = null;
   private heartbeatHandle: ReturnType<typeof setInterval> | null = null;
@@ -127,16 +129,37 @@ export class RealtimeService {
    * entirely — consumers then rely on their existing polling.
    */
   connect(sessionId: number, enabled = true): void {
+    this.openFor(sessionId, null, enabled);
+  }
+
+  /**
+   * Open the session socket as a share-link viewer (live-overview).
+   *
+   * The big screen has no account, so it presents the overview link's
+   * token instead of a DRF token. The server admits it read-only and
+   * forwards only the event types the overview renders; nothing on the
+   * client side may assume the full event stream on this path.
+   */
+  connectShared(sessionId: number, shareToken: string, enabled = true): void {
+    this.openFor(sessionId, shareToken, enabled);
+  }
+
+  private openFor(sessionId: number, shareToken: string | null, enabled: boolean): void {
     if (!enabled) {
       this.disconnect();
       this._status.set('disabled');
       return;
     }
-    if (this.sessionId === sessionId && (this.socket || this.reconnectHandle)) {
+    if (
+      this.sessionId === sessionId &&
+      this.shareToken === shareToken &&
+      (this.socket || this.reconnectHandle)
+    ) {
       return; // already connected / reconnecting to this session
     }
     this.disconnect();
     this.sessionId = sessionId;
+    this.shareToken = shareToken;
     this.attempts = 0;
     this.open();
   }
@@ -154,19 +177,32 @@ export class RealtimeService {
       socket.close();
     }
     this.sessionId = null;
+    this.shareToken = null;
     this._status.set('idle');
   }
 
   private open(): void {
-    const token = this.auth.token();
-    if (this.sessionId === null || !token || typeof WebSocket === 'undefined') {
+    // Exactly one credential goes on the URL: the server refuses a
+    // connection presenting both rather than resolving the stronger.
+    const credential = this.shareToken
+      ? { name: 'overview', value: this.shareToken }
+      : { name: 'token', value: this.auth.token() };
+    if (
+      this.sessionId === null ||
+      !credential.value ||
+      typeof WebSocket === 'undefined'
+    ) {
       this._status.set('disabled');
       return;
     }
     this._status.set(this.attempts === 0 ? 'connecting' : 'reconnecting');
     const { scheme, host } = this.wsOrigin();
     const url =
-      `${scheme}://${host}/ws/session/${this.sessionId}/` + `?token=${encodeURIComponent(token)}`;
+      // `host` from `wsOrigin()`, not `location.host`: inside a Capacitor
+      // WebView the page is served from a local scheme and the API lives
+      // elsewhere, so the socket needs the configured origin.
+      `${scheme}://${host}/ws/session/${this.sessionId}/` +
+      `?${credential.name}=${encodeURIComponent(credential.value)}`;
     // Run the socket outside Angular so heartbeats/reconnect timers do
     // not hold change detection; re-enter the zone per message.
     this.zone.runOutsideAngular(() => {

@@ -36,11 +36,29 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/towers.component').then((m) => m.TowersComponent),
   },
+  // --- tower-types ---
+  {
+    path: 'tower-types',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/tower-types.component').then((m) => m.TowerTypesComponent),
+  },
+  // --- end tower-types ---
   {
     path: 'zones',
     canActivate: [staffGuard],
     loadComponent: () => import('./admin/zones.component').then((m) => m.ZonesComponent),
   },
+  // --- map-editor ---
+  {
+    path: 'map-editor',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/map-editor/map-editor.component').then(
+        (m) => m.MapEditorComponent,
+      ),
+  },
+  // --- end map-editor ---
   {
     path: 'teams',
     canActivate: [staffGuard],
@@ -52,12 +70,25 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/challenges.component').then((m) => m.ChallengesComponent),
   },
+  // --- library-map ---
   {
-    path: 'collections',
+    path: 'library',
     canActivate: [staffGuard],
     loadComponent: () =>
-      import('./admin/collections.component').then((m) => m.CollectionsComponent),
+      import('./library/library.component').then((m) => m.LibraryComponent),
   },
+  // The map-first library replaced the name-list collections page;
+  // keep old links working.
+  { path: 'collections', redirectTo: 'library' },
+  // --- end library-map ---
+  // --- content-portability ---
+  {
+    path: 'bundles',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/bundles.component').then((m) => m.BundlesComponent),
+  },
+  // --- end content-portability ---
   {
     // nfc-native-and-secure-links: tag provisioning + scan audit.
     path: 'nfc-tags',
@@ -99,14 +130,41 @@ export const routes: Routes = [
         (m) => m.DiscoveryMatrixComponent,
       ),
   },
+  // --- live-overview ---
   {
-    path: 'sessions/:id/locations',
+    // The nav entry: the overview of whatever the session switcher has
+    // selected, matching how /scoreboard is scoped.
+    path: 'overview',
     canActivate: [staffGuard],
     loadComponent: () =>
-      import('./location/location-history.component').then(
-        (m) => m.LocationHistoryComponent,
-      ),
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
   },
+  {
+    path: 'sessions/:id/overview',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
+  },
+  {
+    // The share-link route. Deliberately OUTSIDE `staffGuard`: the whole
+    // point is a screen with nobody signed in at it. The token is the
+    // credential and the backend is what checks it.
+    path: 'live/:token',
+    loadComponent: () =>
+      import('./overview/live-overview.component').then((m) => m.LiveOverviewComponent),
+  },
+  // --- end live-overview ---
+  // --- session-replay ---
+  {
+    path: 'sessions/:id/replay',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./replay/session-replay.component').then((m) => m.SessionReplayComponent),
+  },
+  // The replay view replaced the table-only location-history page;
+  // keep old links working.
+  { path: 'sessions/:id/locations', redirectTo: 'sessions/:id/replay' },
+  // --- end session-replay ---
   {
     path: 'trails',
     canActivate: [staffGuard],
@@ -139,9 +197,30 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/badges.component').then((m) => m.BadgesComponent),
   },
+  // --- simulator ---
+  {
+    path: 'simulator',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./simulator/simulator.component').then((m) => m.SimulatorComponent),
+  },
   {
     path: 'login',
     loadComponent: () => import('./auth/login.component').then((m) => m.LoginComponent),
   },
+  // --- game-creation-wizard ---
+  {
+    path: 'games/new',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/game-wizard/game-wizard.component').then((m) => m.GameWizardComponent),
+  },
+  {
+    path: 'games/:id/edit',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/game-wizard/game-wizard.component').then((m) => m.GameWizardComponent),
+  },
+  // --- end game-creation-wizard ---
   { path: '**', redirectTo: '' },
 ];

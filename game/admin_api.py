@@ -10,16 +10,20 @@ from django.utils.text import slugify
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.challenge_types import REVIEW_MANUAL, TYPE_NFC_QR, TYPE_TEXT
+from game.media_api import MediaAssetSerializer, MediaSubjectMixin
+from game.media_validation import validate_upload
 from game.models import (
     NFC_MODE_LEGACY_URL,
     NFC_MODE_SECURE_TOKEN,
     ROLE_REQUIREMENT_NONE,
     Challenge,
+    ChallengeMedia,
     Collection,
     NfcTag,
     PresenceRequirement,
@@ -29,7 +33,7 @@ from game.models import (
     TeamZoneOwnership,
     Tower,
     TowerLock,  # tower-locking
-    TowerPhoto,
+    TowerType,
     Zone,
 )
 from game.scoping import (
@@ -37,7 +41,6 @@ from game.scoping import (
     SessionScopedViewSetMixin,
     _current_session,
 )
-from game.serializers import Base64ImageField
 from organize.models import (
     Game,
     GameRole,
@@ -104,26 +107,20 @@ def _close_ring(vertices):
         raise serializers.ValidationError({'vertices': f'Invalid polygon: {exc}'})
 
 
-class TowerPhotoSerializer(serializers.ModelSerializer):
-    """Reference photo payload (field-authoring, task 2.2).
+class AdminTowerTypeSerializer(serializers.ModelSerializer):
+    """Tower type payload (tower-types)."""
 
-    `image` accepts a multipart file OR a base64 data URL (the offline
-    queue replays captures as JSON). `tower` / `captured_by` are set by
-    the viewset, never by the client.
-    """
-
-    image = Base64ImageField(use_url=True)
-    captured_by_username = serializers.CharField(
-        source='captured_by.username', read_only=True, default=None,
-    )
+    tower_count = serializers.IntegerField(source='towers.count', read_only=True)
 
     class Meta:
-        model = TowerPhoto
+        model = TowerType
         fields = (
-            'id', 'tower', 'image', 'caption',
-            'captured_by', 'captured_by_username', 'captured_at',
+            'id', 'name', 'slug', 'icon', 'color', 'proximity_meters',
+            'description', 'order', 'tower_count',
         )
-        read_only_fields = ('tower', 'captured_by', 'captured_at')
+
+    def validate_slug(self, value):
+        return value.strip().lower()
 
 
 class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
@@ -149,12 +146,16 @@ class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         queryset=Collection.objects.all(),
         write_only=True, required=False, allow_null=True,
     )
+    # tower-zone-media: "the meadow behind the church, enter by the north
+    # gate" is exactly what a curator knows on site and could not write
+    # down until a zone could carry media of its own.
+    media = MediaAssetSerializer(many=True, read_only=True)
 
     class Meta:
         model = Zone
         fields = (
             'id', 'name', 'color', 'scoring_type', 'conquest_rule',
-            'towers', 'shape', 'vertices', 'collection',
+            'towers', 'shape', 'vertices', 'collection', 'media',
             'collections', 'games',
             # tower-visibility: per-zone fog threshold (null = inherit).
             'fog_reveal_coverage_pct',
@@ -179,8 +180,112 @@ class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     def validate(self, attrs):
         vertices = attrs.pop('vertices', None)
         if vertices is not None:
-            attrs['shape'] = _close_ring(vertices)
+            if self.instance is None:
+                self._require_create_collection_author(attrs)
+            shape = _close_ring(vertices)
+            if not shape.valid:
+                raise serializers.ValidationError(
+                    {
+                        'vertices': (
+                            'Self-intersecting or otherwise invalid polygon: '
+                            f'{shape.valid_reason}'
+                        ),
+                    },
+                )
+            attrs['shape'] = self._clip_against_existing_zones(shape, attrs)
         return attrs
+
+    def _require_create_collection_author(self, attrs):
+        """Authorization wins over content validation (map-editor capability).
+
+        `_close_ring`'s vertex-count/validity check and the
+        existing-zone-wins clip below both raise 400s from inside
+        `validate()`, which DRF runs BEFORE the view's `perform_create`
+        permission gate (`CollectionAuthorGateMixin`). Without this early
+        re-check, an unauthorised POST whose ring also happens to be
+        invalid/overlapping would surface as 400 instead of the expected
+        403. Mirrors `AdminZoneViewSet.perform_create`, which still runs
+        too (defense in depth) -- this just makes sure authorization wins
+        the ordering race for zone-boundary writes specifically.
+        """
+        collection = attrs.get('collection')
+        request = self.context.get('request')
+        if (
+            collection is not None
+            and request is not None
+            and not collection.can_author(request.user)
+        ):
+            raise PermissionDenied(
+                'You are not authorised to author into this collection. '
+                'Ask its game creator for CREATOR collaboration, or clone the game.',
+            )
+
+    def _clip_against_existing_zones(self, shape, attrs):
+        """Existing-zone-wins clipping (map-editor capability).
+
+        Authoritative server-side pass: subtract the union of every
+        OTHER zone sharing a Collection with this one from the incoming
+        ring, so overlapping geometry can never be introduced -- even
+        via a direct API call bypassing the desktop map editor's own
+        (advisory, client-side) preview clip.
+
+        Scope is the zone's own Collections on update, or the target
+        `collection` (if any) on create -- a zone/collection combo not
+        tied to any Collection has no defined "map" to avoid overlapping,
+        so it is left untouched (legacy zones, standalone geometry).
+        """
+        if self.instance is not None:
+            collections = list(self.instance.collections.all())
+            exclude_pk = self.instance.pk
+        else:
+            collection = attrs.get('collection')
+            collections = [collection] if collection is not None else []
+            exclude_pk = None
+
+        if not collections:
+            return shape
+
+        others = Zone.objects.filter(
+            collections__in=collections, shape__isnull=False,
+        ).distinct()
+        if exclude_pk is not None:
+            others = others.exclude(pk=exclude_pk)
+
+        union = None
+        for other in others:
+            union = other.shape if union is None else union.union(other.shape)
+        if union is None:
+            return shape
+
+        clipped = shape.difference(union)
+
+        if clipped.empty or clipped.area <= 0:
+            raise serializers.ValidationError(
+                {
+                    'vertices': (
+                        'This zone is fully contained within existing zone(s). '
+                        'Existing zones win overlaps -- draw a boundary outside '
+                        'them, or edit the existing zone instead.'
+                    ),
+                },
+            )
+
+        if clipped.geom_type == 'MultiPolygon':
+            # The new ring straddled a gap between existing zones and
+            # got split into disconnected pieces -- keep the largest.
+            clipped = max(clipped, key=lambda piece: piece.area)
+        elif clipped.geom_type != 'Polygon':
+            raise serializers.ValidationError(
+                {
+                    'vertices': (
+                        'Clipping against existing zones left an unusable '
+                        f'{clipped.geom_type} (likely a sliver along a shared '
+                        'edge). Adjust the boundary and try again.'
+                    ),
+                },
+            )
+
+        return clipped
 
     def create(self, validated_data):
         collection = validated_data.pop('collection', None)
@@ -202,7 +307,8 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     Field authoring (task 2.1): create-at-GPS writes `lat`/`lng`
     (+ optional `authored_accuracy_m` capture provenance) and an optional
     target `collection` the new tower is filed into in the same call.
-    `location` reads back as GeoJSON; `photos` lists reference photos.
+    `location` reads back as GeoJSON; `media` lists reference media
+    (tower-zone-media) — photos, audio notes and short clips.
     """
 
     # Many-to-many zone membership (tower-zone-topology).
@@ -216,7 +322,18 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         queryset=Collection.objects.all(),
         write_only=True, required=False, allow_null=True,
     )
-    photos = TowerPhotoSerializer(many=True, read_only=True)
+    media = MediaAssetSerializer(many=True, read_only=True)
+    # tower-types. The nullable `icon`/`color` say what the curator
+    # chose (blank = inherit); the resolved pair says what to paint.
+    # Both are served because an editor needs the first and every map
+    # needs the second — and four clients re-implementing
+    # tower-over-type-over-default is four chances to differ in a way
+    # that shows up as a slightly wrong colour on one screen.
+    resolved_icon = serializers.CharField(read_only=True)
+    resolved_color = serializers.CharField(read_only=True)
+    tower_type_name = serializers.CharField(
+        source='tower_type.name', read_only=True, default=None,
+    )
 
     class Meta:
         model = Tower
@@ -228,7 +345,10 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
             'discoverability', 'challenge_visibility',
             'initial_bonus', 'rfid_code',
             'location', 'lat', 'lng', 'authored_accuracy_m',
-            'collection', 'photos', 'collections', 'games',
+            # tower-types: the choice, and the resolution of it.
+            'tower_type', 'tower_type_name', 'icon', 'color',
+            'resolved_icon', 'resolved_color',
+            'collection', 'media', 'collections', 'games',
         )
 
     def get_location(self, tower):
@@ -321,12 +441,39 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
         fields = ('id', 'name', 'game', 'slug')
 
 
+class AdminChallengeMediaSerializer(serializers.ModelSerializer):
+    """Staff-side challenge media payload (challenge-media capability).
+
+    `file` is write-once through the multipart upload endpoint; editing
+    an item changes its caption, alt text, or order, never its bytes.
+    """
+
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChallengeMedia
+        fields = (
+            'id', 'challenge', 'kind', 'url', 'caption', 'alt_text',
+            'order', 'bytes', 'duration_seconds', 'uploaded_at',
+        )
+        read_only_fields = (
+            'challenge', 'kind', 'bytes', 'duration_seconds', 'uploaded_at',
+        )
+
+    def get_url(self, media):
+        request = self.context.get('request')
+        url = media.file.url
+        return request.build_absolute_uri(url) if request is not None else url
+
+
 class AdminChallengeSerializer(serializers.ModelSerializer):
     """Staff-side challenge payload.
 
     Unlike the player serializers this DOES expose `validation_code` —
     staff author it and hand it to the venue (printable handout).
     """
+
+    media = AdminChallengeMediaSerializer(many=True, read_only=True)
 
     class Meta:
         model = Challenge
@@ -336,6 +483,8 @@ class AdminChallengeSerializer(serializers.ModelSerializer):
             'role_requirement_mode', 'required_roles', 'require_holders_present',
             # presence-rules: null = no presence requirement.
             'presence_requirement',
+            # challenge-media: the challenge's own media, in creator order.
+            'media',
         )
 
     def validate(self, attrs):
@@ -435,7 +584,10 @@ class CollectionAuthorGateMixin:
             self._require_collection_author(collection)
 
 
-class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
+class AdminZoneViewSet(
+    MediaSubjectMixin, CollectionAuthorGateMixin, CollectionFilterMixin,
+    viewsets.ModelViewSet,
+):
     """Staff-only CRUD for repository Zones.
 
     `?tower=<id>` narrows to the zones a tower belongs to (many-to-many
@@ -443,13 +595,18 @@ class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewset
 
     Field authoring: boundaries are writable as `vertices` (walked or
     tapped [[lng, lat], ...]); new zones are filed into the target
-    `collection` in the same call. Writes into a Collection are gated
+    `collection` in the same call; reference media attaches under
+    {id}/media/ (tower-zone-media). Writes into a Collection are gated
     by `Collection.can_author` (task 2.5).
     """
 
     permission_classes = [IsAdminUser]
-    queryset = Zone.objects.all().order_by('name')
+    queryset = (
+        Zone.objects.all().order_by('name')
+        .prefetch_related('media__captured_by')
+    )
     serializer_class = AdminZoneSerializer
+    media_subject_field = 'zone'
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -471,7 +628,23 @@ class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewset
         instance.delete()
 
 
-class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
+class AdminTowerTypeViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for tower types (tower-types).
+
+    Deleting a type does not take its towers with it: the FK is
+    `SET_NULL`, so they fall back to the untyped defaults. A library
+    should survive someone tidying its vocabulary.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = TowerType.objects.all()
+    serializer_class = AdminTowerTypeSerializer
+
+
+class AdminTowerViewSet(
+    MediaSubjectMixin, CollectionAuthorGateMixin, CollectionFilterMixin,
+    viewsets.ModelViewSet,
+):
     """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
     `?zone=<id>` narrows to one zone's member towers (many-to-many
@@ -480,14 +653,20 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
     Field authoring: create-at-GPS via `lat`/`lng` (+ optional
     `authored_accuracy_m` provenance and a target `collection` the new
     tower is filed into in one call, task 2.1); reference-photo
-    endpoints under {id}/photos/ (task 2.2); attach-challenge action
+    media endpoints under {id}/media/ (task 2.2, widened by
+    tower-zone-media); attach-challenge action
     (task 2.4). Collection-touching writes are gated by
     `Collection.can_author` (task 2.5).
     """
 
     permission_classes = [IsAdminUser]
-    queryset = Tower.objects.all().order_by('name').prefetch_related('photos__captured_by')
+    queryset = (
+        Tower.objects.all().order_by('name')
+        .select_related('tower_type')
+        .prefetch_related('media__captured_by')
+    )
     serializer_class = AdminTowerSerializer
+    media_subject_field = 'tower'
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -513,41 +692,6 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
                 instance.delete()
         except DjangoValidationError as exc:
             raise serializers.ValidationError({'detail': exc.messages})
-
-    @action(detail=True, methods=['get', 'post'])
-    def photos(self, request, pk=None):
-        """Reference photos: GET lists, POST uploads (multipart or base64)."""
-        tower = self.get_object()
-        if request.method == 'POST':
-            self._require_geometry_author(tower)
-            serializer = TowerPhotoSerializer(
-                data=request.data, context=self.get_serializer_context(),
-            )
-            serializer.is_valid(raise_exception=True)
-            photo = serializer.save(tower=tower, captured_by=request.user)
-            return Response(
-                TowerPhotoSerializer(
-                    photo, context=self.get_serializer_context(),
-                ).data,
-                status=status.HTTP_201_CREATED,
-            )
-        return Response(
-            TowerPhotoSerializer(
-                tower.photos.all(), many=True,
-                context=self.get_serializer_context(),
-            ).data,
-        )
-
-    @action(
-        detail=True, methods=['delete'],
-        url_path=r'photos/(?P<photo_id>[0-9]+)',
-    )
-    def delete_photo(self, request, pk=None, photo_id=None):
-        tower = self.get_object()
-        self._require_geometry_author(tower)
-        photo = get_object_or_404(TowerPhoto, pk=photo_id, tower=tower)
-        photo.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='attach-challenge')
     def attach_challenge(self, request, pk=None):
@@ -690,6 +834,117 @@ class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         self._require_edit(instance.game)
         instance.delete()
+
+    # --- challenge-media -------------------------------------------------
+
+    @action(detail=True, methods=['get', 'post'], parser_classes=[
+        MultiPartParser, FormParser, JSONParser,
+    ])
+    def media(self, request, pk=None):
+        """GET lists this challenge's media; POST uploads one item.
+
+        POST is multipart only — audio and video never travel as base64,
+        because a 50MB clip would become ~67MB of JSON buffered in
+        memory. The file streams to `default_storage` instead.
+        """
+        challenge = self.get_object()
+        if request.method == 'POST':
+            self._require_edit(challenge.game)
+            kind = request.data.get('kind')
+            upload = request.data.get('file')
+            if not upload:
+                raise serializers.ValidationError({'file': 'No file supplied.'})
+            try:
+                size, duration = validate_upload(kind, upload)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError({'file': exc.messages})
+            # Append to the end unless the client placed it explicitly.
+            order = request.data.get('order')
+            if order in (None, ''):
+                order = challenge.media.count()
+            item = ChallengeMedia.objects.create(
+                challenge=challenge,
+                kind=kind,
+                file=upload,
+                caption=request.data.get('caption', '') or '',
+                alt_text=request.data.get('alt_text', '') or '',
+                order=int(order),
+                bytes=size,
+                duration_seconds=duration,
+                uploaded_by=request.user,
+            )
+            return Response(
+                AdminChallengeMediaSerializer(
+                    item, context=self.get_serializer_context(),
+                ).data,
+                status=status.HTTP_201_CREATED,
+            )
+        return Response(
+            AdminChallengeMediaSerializer(
+                challenge.media.all(), many=True,
+                context=self.get_serializer_context(),
+            ).data,
+        )
+
+    @action(
+        detail=True, methods=['patch', 'delete'],
+        url_path=r'media/(?P<media_id>[0-9]+)',
+    )
+    def media_detail(self, request, pk=None, media_id=None):
+        """PATCH edits caption/alt text/order; DELETE removes the item.
+
+        The file itself is write-once: re-uploading is a delete plus a
+        POST, so an edit can never silently swap the bytes under a
+        challenge a team is already looking at.
+        """
+        challenge = self.get_object()
+        self._require_edit(challenge.game)
+        item = get_object_or_404(ChallengeMedia, pk=media_id, challenge=challenge)
+        if request.method == 'DELETE':
+            item.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = AdminChallengeMediaSerializer(
+            item, data=request.data, partial=True,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='media/reorder')
+    def media_reorder(self, request, pk=None):
+        """Set the display order of this challenge's media in one call.
+
+        Body: {"order": [<media id>, ...]}. Reordering must not require
+        re-uploading anything, and for a spot-the-difference puzzle which
+        image comes first is part of the puzzle.
+        """
+        challenge = self.get_object()
+        self._require_edit(challenge.game)
+        ids = request.data.get('order')
+        if not isinstance(ids, list):
+            raise serializers.ValidationError(
+                {'order': 'Expected a list of media ids.'},
+            )
+        items = {item.id: item for item in challenge.media.all()}
+        unknown = [i for i in ids if int(i) not in items]
+        if unknown or len(ids) != len(items):
+            raise serializers.ValidationError({
+                'order': (
+                    'Must list every media id of this challenge exactly once.'
+                ),
+            })
+        with transaction.atomic():
+            for position, media_id in enumerate(ids):
+                item = items[int(media_id)]
+                item.order = position
+                item.save(update_fields=['order'])
+        return Response(
+            AdminChallengeMediaSerializer(
+                challenge.media.all(), many=True,
+                context=self.get_serializer_context(),
+            ).data,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1124,27 +1379,42 @@ class AdminNfcTagViewSet(viewsets.ModelViewSet):
 
 
 class ResetScoresView(APIView):
-    """Staff-only: zero out all Team.score and close every open ownership.
+    """Staff-only: zero out ONE session's Team.score and close its open ownerships.
 
-    Intended as a "start a fresh round" button. Distinct from
-    unassign_all (which just closes current tower ownerships) in that
-    this also resets the locked, cumulative Team.score to 0.
+    Scoped to the required `session` id: a "start a fresh round" button
+    for that run only. Distinct from unassign_all (which just closes
+    current tower ownerships) in that this also resets the locked,
+    cumulative Team.score to 0. Session scoping is deliberate — an
+    unscoped reset would wipe scores and ownerships across every other
+    game/session in the installation.
     """
 
     permission_classes = [IsAdminUser]
 
     @transaction.atomic
     def post(self, request):
+        session_id = request.data.get('session')
+        if session_id in (None, ''):
+            return Response(
+                {'session': 'This field is required.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        session = Session.objects.filter(pk=session_id).first()
+        if session is None:
+            return Response(
+                {'session': 'No session with that id.'},
+                status=status.HTTP_404_NOT_FOUND,
+            )
         now = timezone.now()
         TeamTowerOwnership.objects.filter(
-            timestamp_end__isnull=True,
+            team__session=session, timestamp_end__isnull=True,
         ).update(timestamp_end=now)
         TeamZoneOwnership.objects.filter(
-            timestamp_end__isnull=True,
+            team__session=session, timestamp_end__isnull=True,
         ).update(timestamp_end=now)
-        updated = Team.objects.update(score=0)
+        updated = Team.objects.filter(session=session).update(score=0)
         return Response(
-            {'teams_reset': updated},
+            {'teams_reset': updated, 'session': session.id},
             status=status.HTTP_200_OK,
         )
 

@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'game',
     'organize',
     'authoring',
+    'simulator',
 
 ]
 
@@ -108,6 +109,25 @@ else:
     CHANNEL_LAYERS = {
         'default': {
             'BACKEND': 'channels.layers.InMemoryChannelLayer',
+        },
+    }
+
+# Cache: Redis when available, local memory otherwise. The only thing
+# that currently depends on it is the share-link rate limit, which is
+# per-process on LocMem — acceptable for development, and the reason
+# production sets REDIS_URL.
+if _REDIS_URL:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.redis.RedisCache',
+            'LOCATION': _REDIS_URL,
+        },
+    }
+else:
+    CACHES = {
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'geogame-default',
         },
     }
 
@@ -242,6 +262,12 @@ REST_FRAMEWORK = {
         'rest_framework.authentication.SessionAuthentication',
         'rest_framework.authentication.TokenAuthentication',
     ],
+    # Only the unauthenticated share-link endpoints throttle today; the
+    # scope is keyed on the link token rather than the client address so
+    # one busy display cannot spend another display's budget.
+    'DEFAULT_THROTTLE_RATES': {
+        'overview_link': os.environ.get('OVERVIEW_LINK_THROTTLE_RATE', '120/min'),
+    },
 }
 
 EMAIL_BACKEND = os.environ.get('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
@@ -261,6 +287,62 @@ DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8200")
 
 MEDIA_ROOT = BASE_DIR / 'media'
+
+# Reference media on towers and zones (tower-zone-media). Caps are per
+# kind and are enforced server-side; the field client applies the same
+# numbers up front so a curator learns the limit before recording rather
+# than after walking away. Raise them per install if the pipe allows —
+# `game.media.limits_for` merges whatever is named here over the
+# documented defaults in `game.media.DEFAULT_LIMITS`, so overriding one
+# number does not mean restating the other five.
+MEDIA_ASSET_LIMITS = {
+    # A photo is downscaled on the device before it is sent, so this cap
+    # catches a client that failed to, not a curator being careless.
+    'IMAGE': {
+        'max_bytes': int(os.environ.get('MEDIA_IMAGE_MAX_BYTES', 12 * 1024 * 1024)),
+    },
+    # Three minutes is a long spoken note; past that it is a recording
+    # someone forgot to stop.
+    'AUDIO': {
+        'max_bytes': int(os.environ.get('MEDIA_AUDIO_MAX_BYTES', 12 * 1024 * 1024)),
+        'max_seconds': int(os.environ.get('MEDIA_AUDIO_MAX_SECONDS', 180)),
+    },
+    # A clip shows an approach or a route. Thirty seconds is enough for
+    # either, and short enough that a curator on mobile data can send one.
+    'VIDEO': {
+        'max_bytes': int(os.environ.get('MEDIA_VIDEO_MAX_BYTES', 48 * 1024 * 1024)),
+        'max_seconds': int(os.environ.get('MEDIA_VIDEO_MAX_SECONDS', 30)),
+    },
+}
+
+# A video clip arrives as one multipart part; Django's default in-memory
+# ceiling would otherwise refuse it before any of our own limits get a
+# say, and the error that produces names nothing useful.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', 64 * 1024 * 1024),
+)
+
+# --- challenge-media -------------------------------------------------------
+# Per-kind upload limits for media that is part of a Challenge. The MIME
+# allowlists are deliberately narrow: every listed type is one the
+# duration probe can actually read, so the allowlist and the probe agree
+# and no file is ever stored with an unknown duration. WebM is absent for
+# that reason — see docs/deployment.md.
+CHALLENGE_MEDIA_MIME_TYPES = {
+    'IMAGE': ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
+    'AUDIO': ['audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/flac', 'audio/wav', 'audio/x-wav'],
+    'VIDEO': ['video/mp4', 'video/quicktime'],
+}
+CHALLENGE_MEDIA_MAX_BYTES = {
+    'IMAGE': 10 * 1024 * 1024,
+    'AUDIO': 25 * 1024 * 1024,
+    'VIDEO': 100 * 1024 * 1024,
+}
+# Only the timed kinds are bounded by duration.
+CHALLENGE_MEDIA_MAX_SECONDS = {
+    'AUDIO': 300,
+    'VIDEO': 180,
+}
 
 try:
     from .local_settings import *

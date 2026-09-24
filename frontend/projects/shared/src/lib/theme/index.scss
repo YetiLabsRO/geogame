@@ -7,7 +7,7 @@
 // pulls in the self-hosted fonts, and emits the base resets plus the `.tr-*`
 // typography utility classes exactly once.
 
-@forward './tokens';
+@forward './design-tokens';
 @forward './typography';
 @forward './base';
 

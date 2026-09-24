@@ -1,5 +1,6 @@
 import math
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from colorfield.fields import ColorField
@@ -10,12 +11,17 @@ from django.db import transaction
 from django.db.models import Count, F, Max, Q, Value
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, pre_delete
+from django.utils import timezone as dj_timezone
 
 from game.challenge_types import (
     CHALLENGE_TYPE_CHOICES,
     REVIEW_MODE_CHOICES,
     TYPE_TEXT,
     get_handler,
+)
+from game.media import (
+    MEDIA_IMAGE,
+    MEDIA_KIND_CHOICES,
 )
 from organize.models import (
     CHALLENGE_VIS_VISIBLE_ANYWHERE,
@@ -63,10 +69,40 @@ def effective_conquest_rule(zone, session=None, game=None):
 
 
 def effective_proximity(tower, game):
-    """Capture radius in meters: Tower override when set, else the Game default."""
+    """Capture radius in metres: tower override, else its type, else the Game.
+
+    Paired with `proximity_radius_expression`, which is the same
+    fallback written as SQL for nearby-tower filtering. They MUST agree:
+    if one learns a layer and the other does not, a tower appears in a
+    player's "near me" list under one radius and refuses capture under
+    another — which reads as flaky GPS rather than as a bug. Change one,
+    change the other, and `test_python_and_sql_radius_agree` will say so
+    if you forget.
+    """
     if tower.proximity_meters is not None:
         return tower.proximity_meters
+    if tower.tower_type_id is not None and tower.tower_type.proximity_meters is not None:
+        return tower.tower_type.proximity_meters
     return game.proximity_meters
+
+
+def proximity_radius_expression(default_radius):
+    """`effective_proximity` as a queryset expression over Tower rows.
+
+    Lives here rather than at its call site so the Python and SQL
+    fallbacks are one definition in one file, read together. The caller
+    supplies the Game default because a queryset spanning one Session
+    has exactly one.
+    """
+    from django.db.models import FloatField, Value
+    from django.db.models.functions import Cast, Coalesce
+
+    return Coalesce(
+        Cast('proximity_meters', FloatField()),
+        Cast('tower_type__proximity_meters', FloatField()),
+        Value(float(default_radius), output_field=FloatField()),
+        output_field=FloatField(),
+    )
 
 
 def effective_time_unit(session):
@@ -158,6 +194,12 @@ class Zone(models.Model):
         (SCORE_BONUS, "Putine punct la început, tot mai multe apoi (bonus)")
     ]
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
 
     color = ColorField(default="#000000", max_length=18)
@@ -246,6 +288,62 @@ class Zone(models.Model):
         return score_functions[self.scoring_type](units)
 
 
+# tower-types: what an untyped tower is drawn as. Named constants rather
+# than literals at call sites, because four surfaces draw towers and a
+# drifting default is the kind of bug nobody reports — it just looks
+# slightly wrong on one screen.
+DEFAULT_TOWER_ICON = 'bi-geo-alt-fill'
+DEFAULT_TOWER_COLOR = '#5F6B7A'
+
+
+class TowerType(models.Model):
+    """A kind of place, described once: icon, colour, and its defaults.
+
+    The taxonomy field `Tower.category` looks like it should be and is
+    not — that one is NORMAL/RFID, the *capture method*, branched on by
+    NFC provisioning and the RFID landing flow. Putting "Fountain" there
+    would break RFID capture, so kinds of place live here instead.
+
+    A type carries styling and the capture radius, and deliberately
+    nothing else. Every default a type carries is another resolution
+    chain to keep consistent across a Python path and a SQL path (see
+    `effective_proximity`), and the radius is the one that earns it:
+    it is physical, a fountain being a smaller target than a hilltop.
+    """
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=80, unique=True)
+    # A Bootstrap Icons class name, the icon vocabulary the staff app
+    # already speaks. Not an upload: per-type SVG would mean sanitising
+    # user SVG and having no sensible fallback for a broken file.
+    icon = models.CharField(
+        max_length=64, default=DEFAULT_TOWER_ICON,
+        help_text='Bootstrap Icons class name, e.g. bi-droplet-fill.',
+    )
+    color = ColorField(default=DEFAULT_TOWER_COLOR, max_length=18)
+    # Default capture radius for towers of this kind. NULL means the
+    # type has no opinion and the Game default applies.
+    proximity_meters = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Default capture radius for this kind of place. '
+                  'Blank falls through to the Game default.',
+    )
+    description = models.TextField(blank=True, default='')
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'name']
+
+    def __str__(self):
+        return self.name
+
+
 class Tower(models.Model):
     CATEGORY_NORMAL = 1
     CATEGORY_RFID = 2
@@ -253,6 +351,12 @@ class Tower(models.Model):
         (CATEGORY_NORMAL, "Normal"),
         (CATEGORY_RFID, "RFID")
     ]
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     name = models.CharField(max_length=255)
 
@@ -263,6 +367,22 @@ class Tower(models.Model):
     zones = models.ManyToManyField(Zone, related_name='towers', blank=True)
     category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
     is_active = models.BooleanField()
+
+    # --- tower-types: what kind of place this is, and how it is drawn. ---
+    # The type supplies defaults; the two override fields let one tower
+    # disagree per facet without leaving the type, because the common
+    # case is "this one is special in exactly one way" and an
+    # all-or-nothing override would push curators to abandon the type —
+    # which is how a library stops being queryable.
+    tower_type = models.ForeignKey(
+        TowerType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='towers',
+    )
+    # NULL means "inherit", which is why these are nullable rather than
+    # defaulted: there has to be a difference between "no colour chosen"
+    # and "this colour, which happens to equal the type's".
+    icon = models.CharField(max_length=64, blank=True, default='')
+    color = ColorField(max_length=18, null=True, blank=True)
 
     # Per-tower capture-radius override (zone-conquest-and-scoring-config).
     # NULL falls back to the game-wide Game.proximity_meters default.
@@ -294,6 +414,24 @@ class Tower(models.Model):
         blank=True,
         help_text='GPS accuracy in metres of the field capture that placed this tower (provenance).',
     )
+
+    @property
+    def resolved_icon(self):
+        """Icon to draw: this tower's override, else its type's, else the default."""
+        if self.icon:
+            return self.icon
+        if self.tower_type_id is not None:
+            return self.tower_type.icon
+        return DEFAULT_TOWER_ICON
+
+    @property
+    def resolved_color(self):
+        """Colour to draw, resolved per facet independently of the icon."""
+        if self.color:
+            return self.color
+        if self.tower_type_id is not None:
+            return self.tower_type.color
+        return DEFAULT_TOWER_COLOR
 
     def __init__(self, *args, **kwargs):
         super(Tower, self).__init__(*args, **kwargs)
@@ -764,33 +902,105 @@ pre_delete.connect(
 )
 
 
-class TowerPhoto(models.Model):
-    """A curator-captured reference photo of a Tower's physical objective.
+def media_upload_to(instance, filename):
+    """Store each kind under its own prefix.
 
-    Field-authoring provenance: helps players recognise the thing the
-    tower stands for. Explicitly distinct from the player submission
-    photos on `TeamTowerChallenge` — a Tower MAY have many reference
-    photos (several angles of the same fountain).
+    Purely for the humans who will one day look at the storage bucket.
+    Nothing reads the path back apart from the storage layer; the rows
+    migrated from the old `tower_photos/` prefix keep theirs, because a
+    `FileField` holds a path and re-homing several hundred files buys
+    nothing but a window in which half of them are missing.
+    """
+    return f'reference_media/{instance.kind.lower()}/{filename}'
+
+
+class MediaAsset(models.Model):
+    """Curator-captured reference media for a Tower or a Zone.
+
+    What turns a coordinate into a findable place: which of the four
+    fountains, which gate to enter the meadow by, and — for the things
+    badly suited to a still — ten seconds of someone saying where the
+    marker actually is.
+
+    Explicitly distinct from the photos players submit against
+    challenges (`TeamTowerChallenge.photo`). That is evidence of an
+    attempt; this is a description of a place, and neither belongs in
+    the other's listing.
+
+    **Exactly one subject.** `tower` and `zone` are both nullable and a
+    database `CheckConstraint` requires precisely one of them. The
+    alternative shapes — a parallel `ZonePhoto`, or a `GenericForeignKey`
+    — either duplicate every query and every rule, or give up
+    referential integrity and `select_related` for a polymorphism that
+    only ever points at two models. The rule lives in the constraint
+    rather than in `clean()` because bulk creates and data migrations
+    bypass model validation and the invariant has to hold for them too.
     """
 
-    tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='photos')
-    image = models.ImageField(upload_to='tower_photos')
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
+    tower = models.ForeignKey(
+        Tower, on_delete=models.CASCADE, related_name='media',
+        null=True, blank=True,
+    )
+    zone = models.ForeignKey(
+        Zone, on_delete=models.CASCADE, related_name='media',
+        null=True, blank=True,
+    )
+    kind = models.CharField(
+        max_length=8, choices=MEDIA_KIND_CHOICES, default=MEDIA_IMAGE,
+    )
+    file = models.FileField(upload_to=media_upload_to)
     caption = models.CharField(max_length=255, blank=True, default='')
+    # Audio and video only; the client measures it, because decoding
+    # every upload server-side to recover a number the recorder already
+    # knew is a lot of work for a chip that reads "0:12". Bounded on the
+    # way in (`game.media.check_duration`) rather than trusted.
+    duration_seconds = models.FloatField(null=True, blank=True)
+    # Recorded at upload from the stored file, never taken from the
+    # client. Migrated rows carry 0, meaning "not measured".
+    byte_size = models.PositiveBigIntegerField(default=0)
     captured_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='tower_photos',
+        related_name='captured_media',
     )
-    captured_at = models.DateTimeField(auto_now_add=True)
+    # Settable rather than `auto_now_add`: a capture queued offline and
+    # replayed three days later happened in the field, not at the moment
+    # the phone found a signal. Defaults to now for everything else.
+    captured_at = models.DateTimeField(default=dj_timezone.now)
 
     class Meta:
-        ordering = ['-captured_at']
+        # `-id` breaks the tie, so two captures a second apart — which a
+        # burst of three photos of the same gate certainly is — come back
+        # in a stable order rather than shuffling between requests.
+        ordering = ['-captured_at', '-id']
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(tower__isnull=False, zone__isnull=True)
+                    | Q(tower__isnull=True, zone__isnull=False)
+                ),
+                name='media_asset_exactly_one_subject',
+            ),
+        ]
+
+    @property
+    def subject(self):
+        """The Tower or Zone this describes — never both, never neither."""
+        return self.tower or self.zone
 
     def __str__(self):
-        return f'Reference photo of {self.tower.name} ({self.captured_at:%Y-%m-%d})' \
-            if self.captured_at else f'Reference photo of {self.tower.name}'
+        subject = self.subject
+        label = dict(MEDIA_KIND_CHOICES).get(self.kind, self.kind)
+        where = subject.name if subject is not None else 'nothing'
+        return f'{label} of {where}'
 
 
 class Collection(models.Model):
@@ -802,6 +1012,12 @@ class Collection(models.Model):
     `Game.collections`. A Tower or Zone may belong to any number of
     Collections; removing it from a Collection never deletes the row.
     """
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=80, unique=True)
@@ -857,6 +1073,12 @@ class PresenceRequirement(models.Model):
     `game.presence.resolve_presence`).
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
     min_members_present = models.PositiveIntegerField(default=1)
     method = models.CharField(
@@ -881,6 +1103,12 @@ class PresenceRequirement(models.Model):
 
 
 class Challenge(models.Model):
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     # game is nullable at the column level through T3.1 so the data
     # migration can backfill; T3.2 tightens to NOT NULL once every row
     # is attached to a Game.
@@ -993,6 +1221,60 @@ class Challenge(models.Model):
             covered = len(missing) < len(required)
             return covered, ([] if covered else missing)
         return not missing, missing
+
+
+class ChallengeMedia(models.Model):
+    """An image, audio clip, or video clip that is part of a Challenge.
+
+    This is the challenge's own content — the two pictures in a
+    spot-the-difference puzzle ARE the challenge — so it hangs off
+    `Challenge` the way `TowerPhoto` hangs off `Tower`, and dies with it.
+    Explicitly distinct from `TeamTowerChallenge.photo`, which is a
+    player's ANSWER.
+
+    `order` is explicit rather than creation order: reordering a gallery
+    is an ordinary edit, and for a spot-the-difference puzzle which
+    image comes first is part of the puzzle.
+    """
+
+    IMAGE = 'IMAGE'
+    AUDIO = 'AUDIO'
+    VIDEO = 'VIDEO'
+    KIND_CHOICES = [
+        (IMAGE, 'Image'),
+        (AUDIO, 'Audio'),
+        (VIDEO, 'Video'),
+    ]
+    # Kinds whose duration is probed and bounded on upload.
+    TIMED_KINDS = (AUDIO, VIDEO)
+
+    challenge = models.ForeignKey(
+        Challenge, on_delete=models.CASCADE, related_name='media',
+    )
+    kind = models.CharField(max_length=8, choices=KIND_CHOICES)
+    file = models.FileField(upload_to='challenge_media')
+    caption = models.CharField(max_length=255, blank=True, default='')
+    # Describes the file itself, for assistive technology.
+    alt_text = models.CharField(max_length=255, blank=True, default='')
+    order = models.PositiveIntegerField(default=0)
+    # Recorded at upload so limits can be reported without re-reading
+    # the file from storage (which may be remote).
+    bytes = models.PositiveIntegerField(default=0)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='challenge_media',
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        return f'{self.kind} #{self.pk} on challenge #{self.challenge_id}'
 
 
 class TeamTowerChallenge(models.Model):
@@ -1846,6 +2128,12 @@ class Trail(models.Model):
     the Tower stays a reusable library asset carrying no trail data.
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     game = models.OneToOneField(
         'organize.Game', on_delete=models.CASCADE, related_name='trail',
     )
@@ -1952,6 +2240,12 @@ class Trail(models.Model):
 class TrailStep(models.Model):
     """A node of the trail, geofenced at a repository Tower."""
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='steps')
     tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='trail_steps')
     order = models.PositiveIntegerField(default=0)
@@ -1980,6 +2274,12 @@ class TrailStep(models.Model):
 
 class TrailEdge(models.Model):
     """Directed clue-bearing link between two steps (GRAPH branches)."""
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='edges')
     from_step = models.ForeignKey(
@@ -2301,6 +2601,12 @@ class ScoreMultiplier(models.Model):
         (TYPE_SCHEDULED, 'Scheduled — Session-relative offset window'),
         (TYPE_RANDOM_BONUS, 'Random bonus — dropped live with an absolute window'),
     ]
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     game = models.ForeignKey(
         'organize.Game',
@@ -3037,3 +3343,76 @@ class BadgeObservationSeen(models.Model):
             f'BadgeObservationSeen({self.badge.badge_id} heard '
             f'{self.seen_badge.badge_id} #{self.counter})'
         )
+
+
+def _generate_overview_token():
+    """Opaque URL-safe token (32 chars) addressing one Session's overview."""
+    return secrets.token_urlsafe(24)
+
+
+class SessionOverviewLinkQuerySet(models.QuerySet):
+    def usable(self, *, at=None):
+        """Links that a request may still be honoured by.
+
+        The single definition of "this link works" — active, and either
+        endless or not yet expired. Views resolve tokens through this so
+        revocation and expiry cannot drift apart between the REST
+        endpoint and the websocket, which is exactly the kind of gap
+        that leaves a revoked screen still updating.
+        """
+        moment = at or datetime.now(timezone.utc)
+        return self.filter(is_active=True).filter(
+            Q(expires_at__isnull=True) | Q(expires_at__gt=moment),
+        )
+
+
+class SessionOverviewLink(models.Model):
+    """A revocable, read-only address for one Session's live overview.
+
+    Threat model: the token IS the credential and it is not a secret.
+    It gets pasted into chats, shown on a projector and photographed, so
+    it is sized not to be guessable (`secrets.token_urlsafe(24)`) and
+    everything else rests on how little it grants — one Session's
+    overview, read-only, no roster, no submissions, no history, no other
+    Session — and on revocation being immediate. Expiry is a
+    convenience; revocation is the control.
+    """
+
+    token = models.CharField(
+        max_length=64, unique=True, default=_generate_overview_token, editable=False,
+    )
+    session = models.ForeignKey(
+        'organize.Session', on_delete=models.CASCADE, related_name='overview_links',
+    )
+    # What this screen is, for the staff member revoking it three hours
+    # later ("tent projector", "parents' TV").
+    label = models.CharField(max_length=255, blank=True, default='')
+    is_active = models.BooleanField(default=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL, on_delete=models.SET_NULL,
+        null=True, blank=True, related_name='overview_links_created',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+
+    objects = SessionOverviewLinkQuerySet.as_manager()
+
+    class Meta:
+        ordering = ['-created_at']
+        indexes = [models.Index(fields=['session', 'is_active'])]
+
+    def __str__(self):
+        state = 'active' if self.is_usable() else 'revoked/expired'
+        return f'SessionOverviewLink({self.label or self.token[:8]}, {state})'
+
+    def is_usable(self, *, at=None):
+        moment = at or datetime.now(timezone.utc)
+        if not self.is_active:
+            return False
+        return self.expires_at is None or self.expires_at > moment
+
+    def revoke(self, *, at=None):
+        self.is_active = False
+        self.revoked_at = at or datetime.now(timezone.utc)
+        self.save(update_fields=['is_active', 'revoked_at'])

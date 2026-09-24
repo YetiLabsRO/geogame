@@ -1,120 +1,188 @@
-// Tower Rush "old-world explorer" design tokens — see docs/design-system.md §1-2.
-// Light values live on :root; Dark values are applied both when the OS
-// prefers dark (and no explicit "light" choice is stored) and when the
-// player explicitly picks dark — `ThemeService` stamps `data-theme` on
-// <html> for the explicit cases and removes it to fall back to `system`.
+// Modern Outdoors / Topographic — CSS custom-property token layer.
+//
+// Emits `:root { --... }` (light, default) and `[data-bs-theme="dark"] { --... }`
+// overrides, self-hosts Inter via @fontsource, and provides a handful of
+// theme utilities (`.topo-bg`, `.tabular-nums`, focus-visible ring).
+//
+// `$radius` / `$radius-sm` / `$radius-lg` are configurable per app:
+//   @use '../../shared/src/lib/theme/tokens' with ($radius: 8px, $radius-sm: 6px, $radius-lg: 12px);
+//
+// See `frontend/THEME.md` for the full token list and usage guide.
 
-// Static tokens (spacing/radius/elevation/safe-area/tap target/fonts) do not
-// change between themes.
+@use 'sass:color';
+@use './bootstrap-overrides' as p;
+@use '@fontsource-variable/inter';
+
+// Staff = denser, player = comfortable. Defaults below are the "comfortable"
+// (player) values; staff's styles.scss configures tighter values.
+$radius: 10px !default;
+$radius-sm: 8px !default;
+$radius-lg: 14px !default;
+
+// Local re-implementation of Bootstrap's `to-rgb()` helper (avoids pulling in
+// the whole `bootstrap/scss/functions` module just for this).
+@function to-rgb($value) {
+  @return color.channel($value, 'red', $space: rgb), color.channel($value, 'green', $space: rgb),
+    color.channel($value, 'blue', $space: rgb);
+}
+
+// Faint concentric-contour-line pattern (tan/green), used by `.topo-bg`.
+// Same trick Bootstrap itself uses for its inline SVG icons: an unescaped
+// `data:image/svg+xml,` URI with single-quoted XML attributes — safe because
+// the colors are expressed as `rgba()` so no `#` character ever appears.
+$topo-bg-light: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300' viewBox='0 0 300 300'><g fill='none' stroke-width='1.4'><path stroke='rgba(47,122,79,0.14)' d='M150 40 C210 45 255 90 255 150 C255 210 210 255 150 255 C90 255 45 210 45 150 C45 90 90 45 150 40 Z'/><path stroke='rgba(180,150,90,0.13)' d='M150 70 C195 74 228 108 228 150 C228 192 195 226 150 226 C105 226 72 192 72 150 C72 108 105 74 150 70 Z'/><path stroke='rgba(47,122,79,0.12)' d='M150 100 C182 103 200 122 200 150 C200 178 182 197 150 197 C118 197 100 178 100 150 C100 122 118 103 150 100 Z'/><path stroke='rgba(180,150,90,0.11)' d='M150 128 C168 130 178 138 178 150 C178 162 168 170 150 170 C132 170 122 162 122 150 C122 138 132 130 150 128 Z'/></g></svg>") !default;
+
+$topo-bg-dark: url("data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' width='300' height='300' viewBox='0 0 300 300'><g fill='none' stroke-width='1.4'><path stroke='rgba(75,165,116,0.20)' d='M150 40 C210 45 255 90 255 150 C255 210 210 255 150 255 C90 255 45 210 45 150 C45 90 90 45 150 40 Z'/><path stroke='rgba(232,147,90,0.16)' d='M150 70 C195 74 228 108 228 150 C228 192 195 226 150 226 C105 226 72 192 72 150 C72 108 105 74 150 70 Z'/><path stroke='rgba(75,165,116,0.16)' d='M150 100 C182 103 200 122 200 150 C200 178 182 197 150 197 C118 197 100 178 100 150 C100 122 118 103 150 100 Z'/><path stroke='rgba(232,147,90,0.14)' d='M150 128 C168 130 178 138 178 150 C178 162 168 170 150 170 C132 170 122 162 122 150 C122 138 132 130 150 128 Z'/></g></svg>") !default;
+
+// Bootstrap keeps `$primary` / `$danger` / etc. constant across color modes
+// by design — only the neutral surfaces and the "subtle" text/bg/border
+// variants shift automatically (driven by the `$*-dark` variables each app
+// configures in its own `with (...)` call). We want our accent colors to
+// shift too, so nudge Bootstrap's own custom properties to match in dark
+// mode. This reaches every component that reads `var(--bs-*)` directly
+// (links, `.text-primary`/`.border-primary`/`.bg-primary` utilities, form
+// checks, the focus ring). Bootstrap's *compiled* variants — `.btn-primary`,
+// `.badge`, `.alert` — bake a shade of the LIGHT color at build time and do
+// NOT follow this override; see `frontend/THEME.md` for the caveat.
+$dark-theme-colors: (
+  'primary': p.$color-primary-dark,
+  'secondary': p.$color-secondary-dark,
+  'success': p.$color-success-dark,
+  'info': p.$color-info-dark,
+  'warning': p.$color-warning-dark,
+  'danger': p.$color-danger-dark,
+);
+
 :root {
-  // Spacing scale (docs/design-system.md §2).
-  --spacing-2xs: 4px;
-  --spacing-xs: 8px;
-  --spacing-sm: 12px;
-  --spacing-md: 16px;
-  --spacing-lg: 20px;
-  --spacing-xl: 24px;
-  --spacing-2xl: 32px;
-  --spacing-3xl: 48px;
+  // ---- Color tokens (light) ------------------------------------------------
+  --bg: #{p.$color-bg};
+  --panel: #{p.$color-panel};
+  --panel-sunken: #{p.$color-panel-sunken};
+  --ink: #{p.$color-ink};
+  --ink-muted: #{p.$color-ink-muted};
+  --border: #{p.$color-border};
 
-  // Radii.
-  --radius-md: 12px;
-  --radius-lg: 16px;
-  --radius-xl: 24px;
-  --radius-full: 9999px;
+  --primary: #{p.$color-primary};
+  --primary-strong: #{p.$color-primary-strong};
+  --secondary: #{p.$color-secondary};
+  --info: #{p.$color-info};
+  --accent: #{p.$color-info}; // alias — "lake blue" is our accent color
+  --success: #{p.$color-success};
+  --warning: #{p.$color-warning};
+  --danger: #{p.$color-danger};
+  --focus: #{p.$color-focus};
 
-  // Elevation.
-  --elevation-card: 0 10px 20px -5px rgba(0, 0, 0, 0.08);
-  --elevation-brand-glow:
-    0 10px 15px -3px rgba(151, 68, 0, 0.2), 0 4px 6px -4px rgba(151, 68, 0, 0.2);
+  // Runtime slot — each Game defines its own team colors at render time
+  // (e.g. `[style.--team-color]="team.color"`). Never hardcode a team color.
+  --team-color: transparent;
 
-  // Safe areas (Capacitor WebView notch/home-indicator insets) and tap target.
-  --safe-top: env(safe-area-inset-top, 0px);
-  --safe-bottom: env(safe-area-inset-bottom, 0px);
-  --tap-min: 44px;
+  // ---- Spacing --------------------------------------------------------------
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --space-7: 48px;
 
-  // Font families (self-hosted via @fontsource-variable/*, see index.scss).
-  --font-display: 'Playfair Display Variable', Georgia, serif;
-  --font-ui: 'Plus Jakarta Sans Variable', system-ui, sans-serif;
+  // ---- Radius -----------------------------------------------------------
+  --radius: #{$radius};
+  --radius-sm: #{$radius-sm};
+  --radius-lg: #{$radius-lg};
+
+  // ---- Shadows (soft cool-gray) -------------------------------------------
+  --shadow-1: 0 1px 2px rgba(16, 24, 32, 0.06);
+  --shadow-2: 0 2px 8px rgba(16, 24, 32, 0.08);
+  --shadow-3: 0 8px 24px rgba(16, 24, 32, 0.12);
+
+  // ---- Type scale (px) ----------------------------------------------------
+  --text-xs: 12px;
+  --text-sm: 13px;
+  --text-base: 14px; // body base
+  --text-md: 16px;
+  --text-lg: 18px;
+  --text-xl: 22px;
+  --text-2xl: 28px;
+  --text-3xl: 36px;
+
+  // ---- Decorative topographic background ----------------------------------
+  --topo-bg: #{$topo-bg-light};
 }
 
-// Light palette (default).
-:root {
-  --color-brand-primary: #974400;
-  --color-brand-onSurface: #974400;
-  --color-brand-deep: #5a1b03;
-  --color-brand-tint: rgba(151, 68, 0, 0.05);
-  --color-text-onBrand: #ffffff;
+[data-bs-theme='dark'] {
+  --bg: #{p.$color-bg-dark};
+  --panel: #{p.$color-panel-dark};
+  --panel-sunken: #{p.$color-panel-sunken-dark};
+  --ink: #{p.$color-ink-dark};
+  --ink-muted: #{p.$color-ink-muted-dark};
+  --border: #{p.$color-border-dark};
 
-  --color-bg-canvas: #fcf9f2;
-  --color-bg-raised: #ffffff;
-  --color-bg-inset: #ebe8e1;
-  --color-bg-surface: #f1eee7;
-  --color-field-bg: rgba(255, 255, 255, 0.5);
+  --primary: #{p.$color-primary-dark};
+  --primary-strong: #{p.$color-primary-dark};
+  --secondary: #{p.$color-secondary-dark};
+  --info: #{p.$color-info-dark};
+  --accent: #{p.$color-info-dark};
+  --success: #{p.$color-success-dark};
+  --warning: #{p.$color-warning-dark};
+  --danger: #{p.$color-danger-dark};
+  --focus: #{p.$color-focus-dark};
 
-  --color-text-primary: #321200;
-  --color-text-secondary: #564338;
-  --color-text-muted: rgba(86, 67, 56, 0.6);
-  --color-text-placeholder: rgba(86, 67, 56, 0.3);
+  --topo-bg: #{$topo-bg-dark};
 
-  --color-border-default: rgba(138, 114, 102, 0.2);
-  --color-border-subtle: rgba(138, 114, 102, 0.1);
-  --color-border-brand: rgba(151, 68, 0, 0.2);
-
-  --color-accent-slate: #446279;
-
-  // Runtime team colour slot — components read this, never a hard-coded hex.
-  --team-color: var(--color-accent-slate);
-
-  // Status colours (not in the Figma export; derived and kept themed).
-  --color-success: #4e7a3a;
-  --color-danger: #a33b2a;
-  --color-warning: #c9812b;
-
-  // Tints derived from whichever palette is active — declared once,
-  // resolved at use-time via the custom-property cascade.
-  --color-success-tint: color-mix(in srgb, var(--color-success) 12%, transparent);
-  --color-danger-tint: color-mix(in srgb, var(--color-danger) 12%, transparent);
-  --color-warning-tint: color-mix(in srgb, var(--color-warning) 12%, transparent);
-}
-
-@mixin dark-palette {
-  --color-brand-primary: #ffb59c;
-  --color-brand-onSurface: #ffb59c;
-  --color-brand-deep: #5a1b03;
-  --color-brand-tint: rgba(255, 181, 156, 0.12);
-  --color-text-onBrand: #5a1b03;
-
-  --color-bg-canvas: #121416;
-  --color-bg-raised: #1e2022;
-  --color-bg-inset: #333537;
-  --color-bg-surface: #1a1c1e;
-  --color-field-bg: rgba(51, 53, 55, 0.5);
-
-  --color-text-primary: #e2e2e5;
-  --color-text-secondary: #d0c4bc;
-  --color-text-muted: #6b7280;
-  --color-text-placeholder: #6b7280;
-
-  --color-border-default: rgba(77, 69, 63, 0.3);
-  --color-border-subtle: rgba(77, 69, 63, 0.3);
-  --color-border-brand: rgba(77, 69, 63, 0.5);
-
-  --color-accent-slate: #446279;
-
-  --color-success: #9ccb86;
-  --color-danger: #ff9d8f;
-  --color-warning: #f0b86a;
-}
-
-// System preference, unless the player explicitly chose "light".
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme='light']) {
-    @include dark-palette;
+  @each $name, $value in $dark-theme-colors {
+    --bs-#{$name}: #{$value};
+    --bs-#{$name}-rgb: #{to-rgb($value)};
   }
+
+  --bs-focus-ring-color: var(--focus);
 }
 
-// Explicit "dark" choice always wins, regardless of the OS preference.
-:root[data-theme='dark'] {
-  @include dark-palette;
+// ---- Utilities ----------------------------------------------------------
+
+// Data/scoreboard tables — fixed-width digits so columns line up.
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+// Faint concentric-contour topographic wash for page headers, empty states,
+// hero areas. Compose with a panel/bg color underneath.
+.topo-bg {
+  background-image: var(--topo-bg);
+  background-repeat: repeat;
+  background-size: 300px 300px;
+}
+
+// Headings: weight comes from Bootstrap's `$headings-font-weight` (set per
+// app); Bootstrap has no variable for letter-spacing, so it's set here.
+h1,
+h2,
+h3,
+h4,
+h5,
+h6,
+.h1,
+.h2,
+.h3,
+.h4,
+.h5,
+.h6 {
+  letter-spacing: -0.01em;
+}
+
+// Consistent focus-visible ring for plain interactive elements. Bootstrap's
+// own form controls/buttons already render a themed box-shadow ring (via
+// `$focus-ring-color`, sourced from the same palette) — suppress the extra
+// outline there so the two rings don't double up.
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+.btn:focus-visible,
+.form-control:focus-visible,
+.form-select:focus-visible,
+.form-check-input:focus-visible,
+.nav-link:focus-visible,
+.page-link:focus-visible {
+  outline: none;
 }

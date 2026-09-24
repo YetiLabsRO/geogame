@@ -98,6 +98,26 @@ def _consenting_user_ids(session):
     ).values_list('user_id', flat=True)
 
 
+
+def parse_window_bound(raw, name):
+    """Parse an ISO-datetime query bound, or explain why it was rejected.
+
+    Returns `(value, error)`. An unparseable bound is an error rather
+    than a silently ignored filter: a caller who asked for a window and
+    quietly got the whole series has no way to notice. The usual cause
+    is a `+00:00` offset left unencoded, which arrives as a space.
+    """
+    if not raw:
+        return None, None
+    parsed = parse_datetime(raw)
+    if parsed is None:
+        return None, (
+            f"Could not parse '{name}' as an ISO datetime. "
+            f'Percent-encode the value — a "+00:00" offset arrives as a space otherwise.'
+        )
+    return parsed, None
+
+
 def _ping_payload(ping):
     return {
         'user_id': ping.user_id,
@@ -373,16 +393,15 @@ class StaffLocationHistoryView(APIView):
         team_id = request.query_params.get('team')
         if team_id:
             pings = pings.filter(team_id=team_id)
-        window_from = request.query_params.get('from')
-        if window_from:
-            parsed = parse_datetime(window_from)
-            if parsed is not None:
-                pings = pings.filter(recorded_at__gte=parsed)
-        window_to = request.query_params.get('to')
-        if window_to:
-            parsed = parse_datetime(window_to)
-            if parsed is not None:
-                pings = pings.filter(recorded_at__lte=parsed)
+        window_from, error = parse_window_bound(request.query_params.get('from'), 'from')
+        if error is None:
+            window_to, error = parse_window_bound(request.query_params.get('to'), 'to')
+        if error:
+            return Response({'detail': error}, status=status.HTTP_400_BAD_REQUEST)
+        if window_from is not None:
+            pings = pings.filter(recorded_at__gte=window_from)
+        if window_to is not None:
+            pings = pings.filter(recorded_at__lte=window_to)
         return Response({
             'session': session.id,
             'retention_days': session.effective('location_retention_days'),
