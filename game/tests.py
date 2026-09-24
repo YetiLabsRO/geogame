@@ -86,6 +86,7 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     BadgeDevice,
     BadgeTelemetry,
     Challenge,
+    ChallengeMedia,
     Collection,
     DementorFlip,
     DementorState,
@@ -11869,3 +11870,424 @@ class SessionReplayBundleTest(TestCase):
         self.assertEqual(
             response.data['window']['from'], self.start + timedelta(minutes=30),
         )
+
+
+# ---------------------------------------------------------------------------
+# challenge-media — media as a challenge's own content (tasks 7.1–7.9)
+# ---------------------------------------------------------------------------
+
+
+def _png_bytes(size=(4, 4)):
+    import io
+
+    from PIL import Image
+
+    buf = io.BytesIO()
+    Image.new('RGB', size, color=(0, 128, 255)).save(buf, format='PNG')
+    return buf.getvalue()
+
+
+def _wav_bytes(seconds=1.0, rate=8000):
+    """A real PCM WAV whose duration mutagen reads from the header."""
+    import struct
+
+    frames = int(rate * seconds)
+    data = b'\x00\x00' * frames  # 16-bit mono silence
+    byte_rate = rate * 2
+    header = (
+        b'RIFF' + struct.pack('<I', 36 + len(data)) + b'WAVE'
+        + b'fmt ' + struct.pack('<IHHIIHH', 16, 1, 1, rate, byte_rate, 2, 16)
+        + b'data' + struct.pack('<I', len(data))
+    )
+    return header + data
+
+
+def _mp4_bytes(seconds=1.0):
+    """A minimal MP4: ftyp + moov/mvhd. mutagen reads length from mvhd."""
+    import struct
+
+    def box(kind, payload):
+        return struct.pack('>I', 8 + len(payload)) + kind + payload
+
+    timescale = 1000
+    mvhd = struct.pack(
+        '>IIIII', 0, 0, 0, timescale, int(seconds * timescale),
+    ) + b'\x00' * 80
+    return (
+        box(b'ftyp', b'isom' + struct.pack('>I', 512) + b'isomiso2mp41')
+        + box(b'moov', box(b'mvhd', mvhd))
+    )
+
+
+def _upload(name, content, content_type):
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, content, content_type=content_type)
+
+
+def _media_url(challenge):
+    return f'/api/staff/challenges/{challenge.id}/media/'
+
+
+class ChallengeMediaUploadTest(TestCase):
+    """Task 7.1 — every kind uploads; anything over a limit is refused."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def _post(self, **fields):
+        return self.staff_client.post(
+            _media_url(self.challenge), fields, format='multipart',
+        )
+
+    def test_image_upload(self):
+        resp = self._post(
+            kind='IMAGE',
+            file=_upload('a.png', _png_bytes(), 'image/png'),
+            alt_text='the square before',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertEqual(item.challenge, self.challenge)
+        self.assertEqual(item.kind, 'IMAGE')
+        self.assertEqual(item.alt_text, 'the square before')
+        self.assertEqual(item.uploaded_by, self.staff)
+        self.assertGreater(item.bytes, 0)
+        # Images are untimed.
+        self.assertIsNone(item.duration_seconds)
+
+    def test_audio_upload_records_duration(self):
+        resp = self._post(
+            kind='AUDIO',
+            file=_upload('bells.wav', _wav_bytes(seconds=2.0), 'audio/wav'),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertAlmostEqual(item.duration_seconds, 2.0, places=1)
+
+    def test_video_upload_records_duration(self):
+        resp = self._post(
+            kind='VIDEO',
+            file=_upload('clip.mp4', _mp4_bytes(seconds=3.0), 'video/mp4'),
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        item = ChallengeMedia.objects.get(pk=resp.json()['id'])
+        self.assertAlmostEqual(item.duration_seconds, 3.0, places=1)
+
+    def test_oversized_file_is_refused_naming_the_limit(self):
+        with self.settings(CHALLENGE_MEDIA_MAX_BYTES={
+            'IMAGE': 100, 'AUDIO': 100, 'VIDEO': 100,
+        }):
+            resp = self._post(
+                kind='IMAGE',
+                file=_upload('big.png', _png_bytes(size=(64, 64)), 'image/png'),
+            )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('the limit is', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_over_long_audio_is_refused_naming_the_limit(self):
+        with self.settings(CHALLENGE_MEDIA_MAX_SECONDS={'AUDIO': 1, 'VIDEO': 1}):
+            resp = self._post(
+                kind='AUDIO',
+                file=_upload('long.wav', _wav_bytes(seconds=4.0), 'audio/wav'),
+            )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('4s long', detail)
+        self.assertIn('the limit is 1s', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_disallowed_mime_is_refused_listing_accepted_types(self):
+        resp = self._post(
+            kind='IMAGE',
+            file=_upload('x.tiff', b'II*\x00junk', 'image/tiff'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        detail = str(resp.json())
+        self.assertIn('not an accepted image type', detail)
+        self.assertIn('image/png', detail)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_undeterminable_duration_is_refused(self):
+        # Right MIME, but not a container mutagen can read.
+        resp = self._post(
+            kind='VIDEO',
+            file=_upload('broken.mp4', b'not really an mp4', 'video/mp4'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('Could not read the duration', str(resp.json()))
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_unknown_kind_is_refused(self):
+        resp = self._post(
+            kind='HOLOGRAM',
+            file=_upload('a.png', _png_bytes(), 'image/png'),
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+
+class ChallengeMediaOrderingTest(TestCase):
+    """Tasks 7.2, 7.3 — order is explicit, editable, and kind-agnostic."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def _upload_image(self, name):
+        resp = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload(name, _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        return resp.json()['id']
+
+    def test_uploads_append_in_order(self):
+        first = self._upload_image('before.png')
+        second = self._upload_image('after.png')
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [first, second])
+        self.assertEqual([m['order'] for m in listed], [0, 1])
+
+    def test_reorder_persists_without_reupload(self):
+        first = self._upload_image('before.png')
+        second = self._upload_image('after.png')
+        resp = self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [second, first]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [second, first])
+        # Same rows — nothing was re-uploaded.
+        self.assertEqual(ChallengeMedia.objects.count(), 2)
+
+    def test_reorder_rejects_a_partial_list(self):
+        first = self._upload_image('before.png')
+        self._upload_image('after.png')
+        resp = self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [first]},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_order_is_preserved_across_mixed_kinds(self):
+        image = self._upload_image('before.png')
+        audio = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'AUDIO', 'file': _upload('b.wav', _wav_bytes(), 'audio/wav')},
+            format='multipart',
+        ).json()['id']
+        video = self.staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'VIDEO', 'file': _upload('c.mp4', _mp4_bytes(), 'video/mp4')},
+            format='multipart',
+        ).json()['id']
+        self.staff_client.post(
+            f'{_media_url(self.challenge)}reorder/',
+            {'order': [video, image, audio]},
+            format='json',
+        )
+        listed = self.staff_client.get(_media_url(self.challenge)).json()
+        self.assertEqual([m['id'] for m in listed], [video, image, audio])
+        self.assertEqual(
+            [m['kind'] for m in listed], ['VIDEO', 'IMAGE', 'AUDIO'],
+        )
+
+    def test_patch_edits_caption_and_alt_text(self):
+        media_id = self._upload_image('before.png')
+        resp = self.staff_client.patch(
+            f'{_media_url(self.challenge)}{media_id}/',
+            {'caption': 'the square in 1940', 'alt_text': 'a market square'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 200, resp.content)
+        item = ChallengeMedia.objects.get(pk=media_id)
+        self.assertEqual(item.caption, 'the square in 1940')
+        self.assertEqual(item.alt_text, 'a market square')
+
+    def test_delete_removes_the_item(self):
+        media_id = self._upload_image('before.png')
+        resp = self.staff_client.delete(
+            f'{_media_url(self.challenge)}{media_id}/',
+        )
+        self.assertEqual(resp.status_code, 204)
+        self.assertFalse(ChallengeMedia.objects.filter(pk=media_id).exists())
+
+
+class ChallengeMediaScopeTest(TestCase):
+    """Tasks 7.4, 7.5 — authoring is creator-scoped; deletion cascades."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game, difficulty=1,
+        )
+
+    def test_non_author_cannot_upload(self):
+        other_client, other = _staff_client(
+            session=self.team.session, username='stranger',
+        )
+        self.game.created_by = User.objects.create_user(
+            username='owner', password='pw', is_staff=True,
+        )
+        self.game.save(update_fields=['created_by'])
+        resp = other_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload('a.png', _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+    def test_deleting_a_challenge_deletes_its_media(self):
+        staff_client, staff = _staff_client(
+            session=self.team.session, username='author',
+        )
+        staff_client.post(
+            _media_url(self.challenge),
+            {'kind': 'IMAGE', 'file': _upload('a.png', _png_bytes(), 'image/png')},
+            format='multipart',
+        )
+        self.assertEqual(ChallengeMedia.objects.count(), 1)
+        self.challenge.delete()
+        self.assertEqual(ChallengeMedia.objects.count(), 0)
+
+
+class ChallengeMediaPlayerPayloadTest(TestCase):
+    """Tasks 7.6, 7.7, 7.8 — delivery, visibility, and unchanged behaviour."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.challenge = Challenge.objects.create(
+            text='Spot five differences', game=self.game,
+            tower=self.tower, difficulty=1,
+        )
+        self.team = _make_team(self.game, self.group)
+        self.client, self.user = _authed_client(self.team, username='athlete')
+
+    def _attach(self, **kwargs):
+        from django.core.files.base import ContentFile
+        defaults = {
+            'challenge': self.challenge, 'kind': 'IMAGE',
+            'caption': '', 'alt_text': '', 'order': 0, 'bytes': 10,
+        }
+        defaults.update(kwargs)
+        item = ChallengeMedia(**defaults)
+        item.file.save('shot.png', ContentFile(_png_bytes()), save=False)
+        item.save()
+        return item
+
+    def test_media_is_served_in_order_with_its_fields(self):
+        self._attach(order=1, caption='after', alt_text='square, edited')
+        self._attach(order=0, caption='before', alt_text='square')
+        body = self.client.get(f'/api/towers/{self.tower.id}/state/').json()
+        media = body['next_challenge']['media']
+        self.assertEqual([m['caption'] for m in media], ['before', 'after'])
+        self.assertEqual(media[0]['alt_text'], 'square')
+        # Absolute, not a bare /media/ path: the player SPA and the
+        # Capacitor app are served from a different origin than the API.
+        self.assertTrue(media[0]['url'].startswith('http'), media[0]['url'])
+
+    def test_hidden_challenge_leaks_no_media_anywhere_in_the_response(self):
+        self._attach(caption='before')
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        resp = self.client.get(f'/api/towers/{self.tower.id}/state/')
+        body = resp.json()
+        self.assertTrue(body['challenge_hidden'])
+        self.assertIsNone(body['next_challenge'])
+        # The whole serialized response, not just the media field: a URL
+        # surfacing anywhere is a spoiler that defeats hidden-until-arrival.
+        raw = resp.content.decode()
+        self.assertNotIn('challenge_media', raw)
+        self.assertNotIn('before', raw)
+
+    def test_media_appears_once_the_challenge_does(self):
+        self._attach(caption='before')
+        self.tower.challenge_visibility = CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL
+        self.tower.save()
+        body = self.client.get(
+            f'/api/towers/{self.tower.id}/state/',
+            {'lat': 46.5, 'lng': 23.5},
+        ).json()
+        self.assertFalse(body['challenge_hidden'])
+        self.assertEqual(len(body['next_challenge']['media']), 1)
+
+    def test_challenge_without_media_reports_an_empty_list(self):
+        body = self.client.get(f'/api/towers/{self.tower.id}/state/').json()
+        self.assertEqual(body['next_challenge']['media'], [])
+        self.assertEqual(body['next_challenge']['text'], 'Spot five differences')
+
+    def test_media_challenge_obeys_the_same_proximity_rules(self):
+        """A self-contained puzzle is still submitted at the tower."""
+        self._attach()
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.6,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 400)
+        # On site, the same submission is accepted.
+        resp = self.client.post(
+            '/api/team_tower_challenges/',
+            {
+                'tower': self.tower.pk,
+                'challenge': self.challenge.pk,
+                'lat': 46.5,
+                'lng': 23.5,
+            },
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+
+
+class ExistingBase64UploadsStillWorkTest(TestCase):
+    """Task 7.9 — the base64 paths this change deliberately did not touch."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.staff_client, self.staff = _staff_client(
+            session=self.team.session, username='curator',
+        )
+
+    def test_tower_photo_base64_upload_still_works(self):
+        tower = _make_tower(self.game, name='T1')
+        resp = self.staff_client.post(
+            f'/api/staff/towers/{tower.id}/photos/',
+            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)

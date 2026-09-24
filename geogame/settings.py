@@ -214,6 +214,28 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8200")
 
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# --- challenge-media -------------------------------------------------------
+# Per-kind upload limits for media that is part of a Challenge. The MIME
+# allowlists are deliberately narrow: every listed type is one the
+# duration probe can actually read, so the allowlist and the probe agree
+# and no file is ever stored with an unknown duration. WebM is absent for
+# that reason — see docs/deployment.md.
+CHALLENGE_MEDIA_MIME_TYPES = {
+    'IMAGE': ['image/jpeg', 'image/png', 'image/webp', 'image/gif'],
+    'AUDIO': ['audio/mpeg', 'audio/mp4', 'audio/ogg', 'audio/flac', 'audio/wav', 'audio/x-wav'],
+    'VIDEO': ['video/mp4', 'video/quicktime'],
+}
+CHALLENGE_MEDIA_MAX_BYTES = {
+    'IMAGE': 10 * 1024 * 1024,
+    'AUDIO': 25 * 1024 * 1024,
+    'VIDEO': 100 * 1024 * 1024,
+}
+# Only the timed kinds are bounded by duration.
+CHALLENGE_MEDIA_MAX_SECONDS = {
+    'AUDIO': 300,
+    'VIDEO': 180,
+}
+
 try:
     from .local_settings import *
 except ImportError:

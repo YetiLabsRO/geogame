@@ -246,6 +246,25 @@ export interface AdminChallenge {
   require_holders_present: boolean;
   /** presence-rules: null = no presence requirement. */
   presence_requirement: number | null;
+  /** challenge-media: the challenge's own media, in creator order. */
+  media: AdminChallengeMedia[];
+}
+
+/** A media item belonging to a Challenge (challenge-media capability).
+ *  The file is write-once: editing changes caption/alt text/order, never
+ *  the bytes, so a challenge a team is looking at cannot be swapped out
+ *  from under them. Replacing means delete + upload. */
+export interface AdminChallengeMedia {
+  id: number;
+  challenge: number;
+  kind: 'IMAGE' | 'AUDIO' | 'VIDEO';
+  url: string;
+  caption: string;
+  alt_text: string;
+  order: number;
+  bytes: number;
+  duration_seconds: number | null;
+  uploaded_at: string;
 }
 
 // ---- presence-rules ---------------------------------------------------------
@@ -749,7 +768,11 @@ export class StaffApiService {
     return this.http.get<AdminChallenge[]>('/api/staff/challenges/');
   }
 
-  createChallenge(payload: Omit<AdminChallenge, 'id'>): Observable<AdminChallenge> {
+  /** `media` is server-managed: attach it after creation through the
+   *  media endpoints, since an item needs a challenge to hang off. */
+  createChallenge(
+    payload: Omit<AdminChallenge, 'id' | 'media'>,
+  ): Observable<AdminChallenge> {
     return this.http.post<AdminChallenge>('/api/staff/challenges/', payload);
   }
 
@@ -759,6 +782,60 @@ export class StaffApiService {
 
   deleteChallenge(id: number): Observable<void> {
     return this.http.delete<void>(`/api/staff/challenges/${id}/`);
+  }
+
+  // ---- challenge-media -----------------------------------------------------
+
+  listChallengeMedia(challengeId: number): Observable<AdminChallengeMedia[]> {
+    return this.http.get<AdminChallengeMedia[]>(
+      `/api/staff/challenges/${challengeId}/media/`,
+    );
+  }
+
+  /** Multipart, never base64: a 50MB clip would become ~67MB of JSON. */
+  uploadChallengeMedia(
+    challengeId: number,
+    kind: AdminChallengeMedia['kind'],
+    file: File,
+    fields: { caption?: string; alt_text?: string } = {},
+  ): Observable<AdminChallengeMedia> {
+    const body = new FormData();
+    body.append('kind', kind);
+    body.append('file', file);
+    if (fields.caption) body.append('caption', fields.caption);
+    if (fields.alt_text) body.append('alt_text', fields.alt_text);
+    return this.http.post<AdminChallengeMedia>(
+      `/api/staff/challenges/${challengeId}/media/`,
+      body,
+    );
+  }
+
+  updateChallengeMedia(
+    challengeId: number,
+    mediaId: number,
+    patch: Partial<Pick<AdminChallengeMedia, 'caption' | 'alt_text' | 'order'>>,
+  ): Observable<AdminChallengeMedia> {
+    return this.http.patch<AdminChallengeMedia>(
+      `/api/staff/challenges/${challengeId}/media/${mediaId}/`,
+      patch,
+    );
+  }
+
+  deleteChallengeMedia(challengeId: number, mediaId: number): Observable<void> {
+    return this.http.delete<void>(
+      `/api/staff/challenges/${challengeId}/media/${mediaId}/`,
+    );
+  }
+
+  /** `order` must list every media id of the challenge exactly once. */
+  reorderChallengeMedia(
+    challengeId: number,
+    order: number[],
+  ): Observable<AdminChallengeMedia[]> {
+    return this.http.post<AdminChallengeMedia[]>(
+      `/api/staff/challenges/${challengeId}/media/reorder/`,
+      { order },
+    );
   }
 
   // ---- team-roles: role definitions + roster assignment --------------------

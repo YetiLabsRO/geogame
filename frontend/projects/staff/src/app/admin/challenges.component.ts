@@ -4,6 +4,7 @@ import { FormsModule } from '@angular/forms';
 
 import {
   AdminChallenge,
+  AdminChallengeMedia,
   AdminGameRole,
   AdminPresenceRequirement,
   AdminTower,
@@ -19,6 +20,13 @@ interface Row {
   dirty: boolean;
   saving: boolean;
   error: string | null;
+  /** challenge-media: the expandable media panel for this challenge. */
+  mediaOpen: boolean;
+  media: AdminChallengeMedia[];
+  mediaBusy: boolean;
+  /** Per-file upload rejections, kept beside the row so a bad file never
+   *  costs the creator the rest of their edits. */
+  mediaErrors: string[];
 }
 
 @Component({
@@ -406,6 +414,18 @@ interface Row {
                   <div class="d-flex gap-2 justify-content-end">
                     <button
                       type="button"
+                      class="btn btn-sm btn-outline-secondary"
+                      (click)="toggleMedia(row)"
+                    >
+                      Media
+                      @if (row.media.length) {
+                        <span class="badge text-bg-secondary ms-1">
+                          {{ row.media.length }}
+                        </span>
+                      }
+                    </button>
+                    <button
+                      type="button"
                       class="btn btn-sm btn-primary"
                       [disabled]="!row.dirty || row.saving"
                       (click)="save(row)"
@@ -429,6 +449,90 @@ interface Row {
                   }
                 </td>
               </tr>
+              <!-- challenge-media: the challenge's own media. A
+                   tower-bound challenge need not be ABOUT its tower —
+                   two pictures to compare are the puzzle itself. -->
+              @if (row.mediaOpen) {
+                <tr>
+                  <td colspan="7" class="bg-body-tertiary">
+                    <div class="small text-body-secondary mb-2">
+                      Media shown with this challenge, in order. Order matters:
+                      for a spot-the-difference puzzle, which image comes first
+                      is part of the puzzle.
+                    </div>
+
+                    @for (m of row.media; track m.id) {
+                      <div class="d-flex gap-2 align-items-start mb-2">
+                        <div style="width: 7rem" class="flex-shrink-0">
+                          @if (m.kind === 'IMAGE') {
+                            <img [src]="m.url" [alt]="m.alt_text"
+                                 class="img-fluid rounded border" />
+                          } @else {
+                            <span class="badge text-bg-secondary">{{ m.kind }}</span>
+                            @if (m.duration_seconds) {
+                              <div class="small text-body-secondary">
+                                {{ wholeSeconds(m.duration_seconds) }}s
+                              </div>
+                            }
+                          }
+                        </div>
+                        <div class="flex-grow-1">
+                          <input
+                            class="form-control form-control-sm mb-1"
+                            placeholder="Caption (shown to players)"
+                            [ngModel]="m.caption"
+                            (ngModelChange)="editMedia(row, m, 'caption', $event)"
+                          />
+                          <input
+                            class="form-control form-control-sm"
+                            placeholder="Alt text (for screen readers)"
+                            [ngModel]="m.alt_text"
+                            (ngModelChange)="editMedia(row, m, 'alt_text', $event)"
+                          />
+                        </div>
+                        <div class="d-flex flex-column gap-1">
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-outline-secondary"
+                            [disabled]="$first || row.mediaBusy"
+                            (click)="moveMedia(row, m, -1)"
+                          >↑</button>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-outline-secondary"
+                            [disabled]="$last || row.mediaBusy"
+                            (click)="moveMedia(row, m, 1)"
+                          >↓</button>
+                          <button
+                            type="button"
+                            class="btn btn-sm btn-outline-danger"
+                            [disabled]="row.mediaBusy"
+                            (click)="removeMedia(row, m)"
+                          >✕</button>
+                        </div>
+                      </div>
+                    }
+
+                    <div class="d-flex gap-2 align-items-center flex-wrap">
+                      <input
+                        type="file"
+                        class="form-control form-control-sm"
+                        style="max-width: 24rem"
+                        multiple
+                        accept="image/*,audio/*,video/*"
+                        [disabled]="row.mediaBusy"
+                        (change)="uploadMedia(row, $event)"
+                      />
+                      @if (row.mediaBusy) {
+                        <span class="spinner-border spinner-border-sm"></span>
+                      }
+                    </div>
+                    @for (msg of row.mediaErrors; track msg) {
+                      <div class="small text-danger mt-1">{{ msg }}</div>
+                    }
+                  </td>
+                </tr>
+              }
             }
           </tbody>
         </table>
@@ -586,6 +690,10 @@ export class ChallengesComponent {
             dirty: false,
             saving: false,
             error: null,
+            mediaOpen: false,
+            media: challenge.media ?? [],
+            mediaBusy: false,
+            mediaErrors: [],
           })),
         );
         this.loading.set(false);
@@ -666,11 +774,15 @@ export class ChallengesComponent {
           rows.map((r) =>
             r.challenge.id === row.challenge.id
               ? {
+                  // Spread `r` first: saving a challenge must not collapse
+                  // the media panel or discard its loaded items.
+                  ...r,
                   challenge: updated,
                   draft: { ...updated },
                   dirty: false,
                   saving: false,
                   error: null,
+                  media: updated.media ?? r.media,
                 }
               : r,
           ),
@@ -695,6 +807,124 @@ export class ChallengesComponent {
       error: (err) => {
         this.patch(row, { saving: false, error: extractErrorMessage(err) });
       },
+    });
+  }
+
+  // --- challenge-media ------------------------------------------------
+
+  protected wholeSeconds(value: number): number {
+    return Math.round(value);
+  }
+
+  protected toggleMedia(row: Row): void {
+    const opening = !row.mediaOpen;
+    this.patch(row, { mediaOpen: opening, mediaErrors: [] });
+    if (opening) this.refreshMedia(row);
+  }
+
+  private refreshMedia(row: Row): void {
+    this.api.listChallengeMedia(row.challenge.id).subscribe({
+      next: (media) => this.patch(row, { media }),
+      error: (err) =>
+        this.patch(row, { mediaErrors: [extractErrorMessage(err)] }),
+    });
+  }
+
+  private kindFor(file: File): AdminChallengeMedia['kind'] | null {
+    if (file.type.startsWith('image/')) return 'IMAGE';
+    if (file.type.startsWith('audio/')) return 'AUDIO';
+    if (file.type.startsWith('video/')) return 'VIDEO';
+    return null;
+  }
+
+  protected uploadMedia(row: Row, event: Event): void {
+    const input = event.target as HTMLInputElement;
+    const files = Array.from(input.files ?? []);
+    if (!files.length) return;
+    input.value = '';
+    this.patch(row, { mediaBusy: true, mediaErrors: [] });
+
+    // Sequential, so `order` appends predictably and one rejection is
+    // reported against its own file rather than the batch.
+    const errors: string[] = [];
+    const next = (index: number): void => {
+      if (index >= files.length) {
+        this.patch(row, { mediaBusy: false, mediaErrors: errors });
+        this.refreshMedia(row);
+        return;
+      }
+      const file = files[index];
+      const kind = this.kindFor(file);
+      if (!kind) {
+        errors.push(`${file.name}: not an image, audio or video file.`);
+        next(index + 1);
+        return;
+      }
+      this.api.uploadChallengeMedia(row.challenge.id, kind, file).subscribe({
+        next: () => next(index + 1),
+        error: (err) => {
+          errors.push(`${file.name}: ${extractErrorMessage(err)}`);
+          next(index + 1);
+        },
+      });
+    };
+    next(0);
+  }
+
+  protected editMedia(
+    row: Row,
+    media: AdminChallengeMedia,
+    field: 'caption' | 'alt_text',
+    value: string,
+  ): void {
+    this.patch(row, {
+      media: row.media.map((m) =>
+        m.id === media.id ? { ...m, [field]: value } : m,
+      ),
+    });
+    this.api
+      .updateChallengeMedia(row.challenge.id, media.id, { [field]: value })
+      .subscribe({
+        error: (err) =>
+          this.patch(row, { mediaErrors: [extractErrorMessage(err)] }),
+      });
+  }
+
+  protected moveMedia(row: Row, media: AdminChallengeMedia, delta: number): void {
+    const current = [...row.media];
+    const from = current.findIndex((m) => m.id === media.id);
+    const to = from + delta;
+    if (from < 0 || to < 0 || to >= current.length) return;
+    const [moved] = current.splice(from, 1);
+    current.splice(to, 0, moved);
+    this.patch(row, { media: current, mediaBusy: true });
+    this.api
+      .reorderChallengeMedia(row.challenge.id, current.map((m) => m.id))
+      .subscribe({
+        next: (media) => this.patch(row, { media, mediaBusy: false }),
+        error: (err) =>
+          this.patch(row, {
+            mediaBusy: false,
+            mediaErrors: [extractErrorMessage(err)],
+          }),
+      });
+  }
+
+  protected removeMedia(row: Row, media: AdminChallengeMedia): void {
+    if (!confirm('Remove this media from the challenge?')) return;
+    this.patch(row, { mediaBusy: true, mediaErrors: [] });
+    this.api.deleteChallengeMedia(row.challenge.id, media.id).subscribe({
+      next: () => {
+        this.patch(row, {
+          media: row.media.filter((m) => m.id !== media.id),
+          mediaBusy: false,
+        });
+      },
+      error: (err) =>
+        this.patch(row, {
+          mediaBusy: false,
+          mediaErrors: [extractErrorMessage(err)],
+        }),
     });
   }
 

@@ -11,6 +11,7 @@ from game.challenge_types import TYPE_RFID
 from game.models import (
     ROLE_REQUIREMENT_NONE,
     Challenge,
+    ChallengeMedia,
     TeamTowerChallenge,
     Tower,
     TowerLock,
@@ -21,22 +22,49 @@ from game.scoping import SessionScopedViewSetMixin
 from organize.models import CHALLENGE_VIS_HIDDEN_UNTIL_ARRIVAL, TOWER_LOCK_ON_INITIATE
 
 
+class ChallengeMediaSummarySerializer(serializers.ModelSerializer):
+    """Player-facing media on a challenge (challenge-media capability).
+
+    Only ever reached through `ChallengeSummarySerializer`, which the
+    caller omits entirely for a challenge the team may not see — so a
+    withheld challenge emits no media and, crucially, no media URL.
+    """
+
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChallengeMedia
+        fields = ('id', 'kind', 'url', 'caption', 'alt_text', 'order')
+
+    def get_url(self, media):
+        request = self.context.get('request')
+        url = media.file.url
+        return request.build_absolute_uri(url) if request is not None else url
+
+
 class ChallengeSummarySerializer(serializers.ModelSerializer):
     """Player-facing challenge summary (tower state / next challenge).
 
     Reports the challenge `type`, effective review mode and the payload
     a submission must supply so the client can render the matching
     submission UI — never the raw `validation_code`.
+
+    Carries the challenge's media in creator order. This serializer is
+    only invoked when the challenge is visible to the team, so media
+    inherits challenge visibility for free — but see the
+    `challenge-media` spec: a media URL surfacing on a hidden challenge
+    is a silent spoiler, so it is covered by an explicit test.
     """
 
     effective_review_mode = serializers.SerializerMethodField()
     required_payload = serializers.SerializerMethodField()
+    media = ChallengeMediaSummarySerializer(many=True, read_only=True)
 
     class Meta:
         model = Challenge
         fields = (
             'id', 'text', 'difficulty', 'tower', 'type',
-            'effective_review_mode', 'required_payload',
+            'effective_review_mode', 'required_payload', 'media',
         )
 
     def get_effective_review_mode(self, obj):
@@ -186,7 +214,13 @@ class TowerStateView(APIView):
         next_challenge = tower.get_next_challenge(team) if not pending else None
         next_challenge_payload = None
         if next_challenge is not None and not challenge_hidden:
-            next_challenge_payload = ChallengeSummarySerializer(next_challenge).data
+            # Context carries the request so media URLs come back absolute:
+            # the player SPA and the Capacitor app are served from a
+            # different origin than the API, where a relative /media/ path
+            # would resolve against the app and 404.
+            next_challenge_payload = ChallengeSummarySerializer(
+                next_challenge, context={'request': request},
+            ).data
             next_challenge_payload['role_requirement'] = _role_requirement_payload(
                 next_challenge, team,
             )
@@ -279,7 +313,9 @@ class TowerIdentifyView(APIView):
         challenge = tower.get_next_challenge(team)
         payload = None
         if challenge is not None:
-            payload = ChallengeSummarySerializer(challenge).data
+            payload = ChallengeSummarySerializer(
+                challenge, context={'request': request},
+            ).data
             payload['role_requirement'] = _role_requirement_payload(challenge, team)
         return Response({
             'id': tower.id,
