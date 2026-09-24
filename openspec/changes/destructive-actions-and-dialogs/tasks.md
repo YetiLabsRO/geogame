@@ -2,14 +2,14 @@
 
 ## 1. The deletion gate on the server
 
-- [ ] 1.1 An `IsSuperUser` DRF permission in `game/admin_api.py`, alongside the existing `IsAdminUser` use.
-- [ ] 1.2 A `DeletionBlocked` refusal carrying machine-readable `blockers`, in the shape `IllegalTransition` already gives the start gate, so one client-side reader serves both.
-- [ ] 1.3 `Session.deletion_blockers()` — empty for draft and finished; for a live state, one blocker naming the state and the action that would settle it.
-- [ ] 1.4 `Game.deletion_blockers()` — one blocker per live Session, each naming that session and its settling action.
-- [ ] 1.5 `AdminSessionViewSet.perform_destroy`: superuser or 403; no blockers or 409.
-- [ ] 1.6 `AdminGameViewSet.perform_destroy`: superuser or 403 — replacing the creator/collaborator check, which stays for update — then no blockers or 409.
-- [ ] 1.7 `UserProfileSerializer` exposes `is_superuser`.
-- [ ] 1.8 Tests: each refusal and each success, for both models; that a game's Collections, Towers and Zones survive it; that a clone survives its parent with empty ancestry; that a deleted session leaves no dangling `current_session`.
+- [x] 1.1 An `IsSuperUser` DRF permission in `game/admin_api.py`, alongside the existing `IsAdminUser` use.
+- [x] 1.2 A `DeletionBlocked` refusal carrying machine-readable `blockers`, in the shape `IllegalTransition` already gives the start gate, so one client-side reader serves both.
+- [x] 1.3 `Session.deletion_blockers()` — empty for draft and finished; for a live state, one blocker naming the state and the action that would settle it.
+- [x] 1.4 `Game.deletion_blockers()` — one blocker per live Session, each naming that session and its settling action.
+- [x] 1.5 `AdminSessionViewSet.perform_destroy`: superuser or 403; no blockers or 409.
+- [x] 1.6 `AdminGameViewSet.perform_destroy`: superuser or 403 — replacing the creator/collaborator check, which stays for update — then no blockers or 409.
+- [x] 1.7 `UserProfileSerializer` exposes `is_superuser`.
+- [x] 1.8 Tests: each refusal and each success, for both models; that a game's Collections, Towers and Zones survive it; that a clone survives its parent with empty ancestry; that a deleted session leaves no dangling `current_session`.
 
 ## 2. The delete controls
 

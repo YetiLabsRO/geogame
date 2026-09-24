@@ -130,6 +130,9 @@ class UserProfileSerializer(serializers.Serializer):
     active_team_id = serializers.SerializerMethodField()
     active_roles = serializers.SerializerMethodField()
     is_staff = serializers.BooleanField(source='user.is_staff', read_only=True)
+    # Superadmin — gates the irreversible operations (deleting a Game or
+    # a Session). The SPA reads it to hide a control it would be refused.
+    is_superuser = serializers.BooleanField(source='user.is_superuser', read_only=True)
     allow_player_team_creation = serializers.SerializerMethodField()
     captain_of_team_id = serializers.SerializerMethodField()
 

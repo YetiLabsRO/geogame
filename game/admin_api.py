@@ -62,6 +62,42 @@ class RosterClosedError(APIException):
     default_code = 'roster_closed'
 
 
+class IsSuperUser(IsAdminUser):
+    """Reserved to superusers — the irreversible operations.
+
+    Deleting a Game or a Session destroys runs and their history, so
+    it sits above the staff bar that `IsAdminUser` sets and above the
+    creator/collaborator rights that govern *editing* a template.
+    """
+
+    def has_permission(self, request, view):
+        return bool(
+            super().has_permission(request, view)
+            and request.user.is_superuser,
+        )
+
+
+def _deletion_blocked_response(blockers):
+    """409 for a delete refused because a run is still live.
+
+    Built as a Response rather than raised as an APIException because
+    DRF coerces every leaf of an exception's detail to a string, and
+    the console reads `session_id` as a number. Same payload shape the
+    lifecycle gate returns for `IllegalTransition`, so one client-side
+    blocker reader serves both.
+    """
+    return Response(
+        {
+            'detail': (
+                'Cannot delete while a run is live. '
+                + ' '.join(b['message'] for b in blockers)
+            ),
+            'blockers': blockers,
+        },
+        status=status.HTTP_409_CONFLICT,
+    )
+
+
 class GeometryUsageMixin(serializers.Serializer):
     """Usage reporting for repository assets (spec: usage visibility).
 
@@ -1606,9 +1642,25 @@ class AdminGameViewSet(viewsets.ModelViewSet):
         self._require_edit(serializer.instance)
         serializer.save()
 
-    def perform_destroy(self, instance):
-        self._require_edit(instance)
-        instance.delete()
+    def get_permissions(self):
+        # Deleting a Game destroys its Sessions and their history, so
+        # it is reserved to superusers — creator/collaborator rights
+        # govern editing the template, not removing it.
+        if self.action == 'destroy':
+            return [IsSuperUser()]
+        return super().get_permissions()
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete the Game and its Sessions, unless a run is live.
+
+        Shared Collections, Towers and Zones are referenced rather
+        than owned, so they survive; clones survive too, with their
+        `cloned_from` ancestry emptied by the FK's SET_NULL.
+        """
+        blockers = self.get_object().deletion_blockers()
+        if blockers:
+            return _deletion_blocked_response(blockers)
+        return super().destroy(request, *args, **kwargs)
 
     @action(detail=True, methods=['post'])
     def clone(self, request, pk=None):
@@ -1787,6 +1839,21 @@ class AdminSessionViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         serializer.save(created_by=self.request.user)
+
+    def get_permissions(self):
+        # Deleting a Session destroys its roster and its recorded run,
+        # so it is reserved to superusers. Finishing remains the
+        # reversible way to put a run away.
+        if self.action == 'destroy':
+            return [IsSuperUser()]
+        return super().get_permissions()
+
+    def destroy(self, request, *args, **kwargs):
+        """Delete a settled Session; refuse one that is still live."""
+        blockers = self.get_object().deletion_blockers()
+        if blockers:
+            return _deletion_blocked_response(blockers)
+        return super().destroy(request, *args, **kwargs)
 
     # ---- Lifecycle transition actions (session-lifecycle) ------------------
 
