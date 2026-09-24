@@ -1,26 +1,47 @@
 ## ADDED Requirements
 
-### Requirement: Challenge media library
+### Requirement: Media on a challenge
 
-The system SHALL provide a per-Game library of media items — images, audio clips, and video clips — that a creator uploads once and attaches to any number of Challenges in that Game.
+The system SHALL let a Challenge carry one or more media items — images, audio clips, or video clips — as its own content, in an explicit display order.
 
-#### Scenario: Uploading to the library
+#### Scenario: Attaching media to a challenge
 
-- **WHEN** a creator uploads a media file to a Game's library
-- **THEN** the system SHALL store it with its `kind` (`IMAGE`, `AUDIO`, or `VIDEO`), an optional `alt_text` describing the file, and the uploading user and timestamp
-- **AND** the item SHALL be available to attach to any Challenge of that Game
+- **WHEN** a creator adds media to a Challenge
+- **THEN** the system SHALL store each item with its `kind` (`IMAGE`, `AUDIO`, or `VIDEO`), its file, an optional caption, optional alt text, an explicit order, and the uploading user and timestamp
+- **AND** the media SHALL belong to that Challenge
 
-#### Scenario: One item serves many challenges
+#### Scenario: A self-contained puzzle
 
-- **WHEN** the same library item is attached to several Challenges
-- **THEN** the system SHALL store the file once and reference it from each Challenge
-- **AND** each attachment SHALL carry its own display order and its own optional caption
+- **WHEN** a creator authors a challenge whose content is the media itself, such as two images to compare
+- **THEN** the Challenge SHALL present those items in the creator's order alongside its text
+- **AND** the Challenge MAY be bound to a tower without its content referring to that tower
 
-#### Scenario: Library is creator-scoped
+#### Scenario: Ordering is explicit and editable
 
-- **WHEN** a user lists or attaches media for a Game
-- **THEN** the system SHALL return and accept only items of Games that user is permitted to author
-- **AND** an attempt to attach an item from another creator's Game SHALL be refused
+- **WHEN** a creator reorders the media on a Challenge
+- **THEN** the system SHALL persist the new order
+- **AND** subsequent reads SHALL return the media in that order
+- **AND** reordering SHALL NOT require removing or re-uploading any item
+
+#### Scenario: Mixed kinds on one challenge
+
+- **WHEN** a Challenge carries media of more than one kind
+- **THEN** the system SHALL preserve the creator's order across kinds rather than grouping by kind
+
+#### Scenario: Deleting a challenge removes its media
+
+- **WHEN** a Challenge carrying media is deleted
+- **THEN** its media items SHALL be deleted with it
+
+### Requirement: Media authoring is creator-scoped
+
+The system SHALL permit media on a Challenge to be added, changed, reordered, or removed only by a user permitted to author that Challenge's Game.
+
+#### Scenario: Out-of-scope media authoring is refused
+
+- **WHEN** a user attempts to add or modify media on a Challenge whose Game they may not author
+- **THEN** the system SHALL refuse the operation
+- **AND** the Challenge and its media SHALL be left unchanged
 
 ### Requirement: Multipart upload for every media kind
 
@@ -28,7 +49,7 @@ The system SHALL accept media uploads over a multipart endpoint for all three ki
 
 #### Scenario: Uploading a video
 
-- **WHEN** a creator uploads a video through the media endpoint
+- **WHEN** a creator uploads a video
 - **THEN** the system SHALL accept it as a multipart file part and stream it to storage
 - **AND** SHALL NOT require the file to be base64-encoded
 
@@ -46,12 +67,17 @@ The system SHALL validate each upload against a per-kind MIME allowlist, a per-k
 - **WHEN** a creator uploads a file larger than its kind's byte ceiling, or longer than its kind's duration ceiling
 - **THEN** the system SHALL reject the upload
 - **AND** the error SHALL name the limit that was exceeded and the actual value
-- **AND** no library item SHALL be created
+- **AND** no media item SHALL be created
 
 #### Scenario: A disallowed format
 
 - **WHEN** a creator uploads a file whose type is not in its kind's allowlist
 - **THEN** the system SHALL reject the upload and report the accepted types
+
+#### Scenario: An unreadable container
+
+- **WHEN** an uploaded audio or video file's duration cannot be determined
+- **THEN** the system SHALL reject it rather than storing it with an unknown duration
 
 #### Scenario: Limits are configurable
 
@@ -72,22 +98,6 @@ The system SHALL write and read media through Django's storage API, defaulting t
 
 - **WHEN** an operator configures an S3-compatible storage backend
 - **THEN** uploads and delivery SHALL use it with no change to models, views, or serializers
-
-### Requirement: Ordered media on a challenge
-
-The system SHALL let a creator attach one or more media items to a Challenge in an explicit display order, with a per-attachment caption.
-
-#### Scenario: Ordering is explicit and editable
-
-- **WHEN** a creator reorders the media on a Challenge
-- **THEN** the system SHALL persist the new order
-- **AND** subsequent reads SHALL return the media in that order
-- **AND** reordering SHALL NOT require removing or re-uploading any item
-
-#### Scenario: Mixed kinds on one challenge
-
-- **WHEN** a Challenge carries media of more than one kind
-- **THEN** the system SHALL preserve the creator's order across kinds rather than grouping by kind
 
 ### Requirement: Media delivery inherits challenge visibility
 
@@ -111,8 +121,7 @@ The staff app SHALL let a creator attach, reorder, caption, describe, and remove
 #### Scenario: Attaching media while editing a challenge
 
 - **WHEN** a creator edits a Challenge in the staff app
-- **THEN** they SHALL be able to upload a new file or pick an existing item from the Game's library
-- **AND** set its caption and alt text, change its position, and remove it from the Challenge
+- **THEN** they SHALL be able to upload one or more files, set each item's caption and alt text, change its position, and remove it
 
 #### Scenario: Upload feedback
 
@@ -139,18 +148,3 @@ The player app SHALL render a Challenge's media inline on the challenge card, in
 
 - **WHEN** a player views a challenge that carries no media
 - **THEN** the card SHALL render exactly as it did before this capability
-
-### Requirement: Removing library items in use
-
-The system SHALL refuse to delete a library item while any Challenge still uses it, and SHALL report which Challenges those are.
-
-#### Scenario: Deleting an item in use
-
-- **WHEN** a creator deletes a library item that is attached to one or more Challenges
-- **THEN** the system SHALL refuse the deletion and name the Challenges using it
-- **AND** the item and those Challenges SHALL be left unchanged
-
-#### Scenario: Deleting a challenge detaches rather than deletes
-
-- **WHEN** a Challenge carrying media is deleted
-- **THEN** its attachments SHALL be removed and the library items SHALL be retained for reuse

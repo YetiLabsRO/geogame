@@ -1,57 +1,53 @@
 ## Context
 
-`game.Challenge` carries `text`, `difficulty`, a tower binding, and the type-system fields. Media appears twice elsewhere in the codebase and both are useful precedent:
+`game.Challenge` carries `text`, `difficulty`, a tower binding, and the type-system fields. Media appears twice elsewhere in the codebase, and both are instructive:
 
 - `TowerPhoto` — a related model with an `ImageField`, a caption, and `ordering`, so a Tower can have many reference photos. This is the shape challenge media wants.
 - `TeamTowerChallenge.photo` — a player's *answer*, uploaded through `Base64ImageField`. Explicitly not what this change touches.
 
 The player-facing payload is `ChallengeSummarySerializer` in `game/api.py`, which already withholds `validation_code` from players and is skipped entirely when `challenge_hidden` is set by the tower-visibility rules. Both facts constrain how media is delivered.
 
-The MCP authoring server's governing principle, already in the `mcp-authoring` spec, is that the LLM "composes new games only from valid existing options" — read tools enumerate what exists, and staged operations reference it. Media attachment is designed to obey that principle rather than carve an exception in it.
+The motivating case is a challenge assigned to a tower whose content is not about that tower — spot the difference between two pictures. The player still travels to the tower and still submits from there; only the puzzle is self-contained. Nothing about proximity, presence, or tower locking changes.
 
 ## Goals / Non-Goals
 
 **Goals:**
 
 - A Challenge can present one or more images, audio clips, or video clips, in a creator-controlled order.
-- Media uploaded once can be reused across challenges in the same Game.
-- An LLM can compose multi-modal challenges from a catalog of what the creator already uploaded.
+- A challenge's media is its own content, authored and edited with it.
 - Storage is swappable to object storage by configuration, with no code change and no new infrastructure required to ship.
 
 **Non-Goals:**
 
-- Transcoding, thumbnailing, or any media processing beyond probing and validating.
-- Captions/subtitle tracks (distinct from the `caption` text label) and audio descriptions.
+- Transcoding, thumbnailing, or any processing beyond probing and validating.
+- Captions/subtitle tracks (distinct from the `caption` label) and audio descriptions.
 - Media on submissions — answers already carry a photo.
-- Any path where an LLM supplies a URL the server then fetches.
+- Any change to proximity, presence, or tower-locking rules.
+- MCP authoring of media (see below).
 
 ## Decisions
 
-### A related `ChallengeMedia` model, not fields on Challenge
+### Media belongs to the Challenge
 
-"One or more" rules out `image`/`audio`/`video` columns. `ChallengeMedia` carries `kind`, `file`, `caption`, `alt_text`, `order`, and provenance (`uploaded_by`, `uploaded_at`), mirroring `TowerPhoto`.
+`ChallengeMedia` has an FK to `Challenge`, exactly as `TowerPhoto` has one to `Tower`. A challenge's media is its content: the two pictures in a spot-the-difference puzzle *are* the challenge, and they will never be used by another one.
 
-`order` is explicit and integer, not creation order: a creator reordering a gallery is a normal edit, and relying on `id` would make reordering impossible without deleting and re-uploading.
+*Alternative considered and rejected:* a per-Game media **library** with a through model, so one recording could be attached to many challenges. This was the first design here, and it was wrong. It optimised for a reuse case that nobody asked for, and it made the primary case worse — authoring a two-picture puzzle would mean uploading two files into a Game-wide catalog, attaching them, and leaving behind two entries that clutter that catalog forever despite never being reused. The indirection cost every challenge something to benefit a case that may not exist.
 
-### A library keyed to the Game, with a many-to-many to Challenge
+If reuse turns out to matter later, a `reusable` flag or a copy-from-existing affordance can be added without changing this model. Starting from the simple shape leaves that open; starting from the library did not leave the simple shape open.
 
-*Alternative considered:* a straight FK from `ChallengeMedia` to `Challenge`, exactly like `TowerPhoto`→`Tower`. Simpler, and it was the first design. Rejected because the MCP case breaks it: an LLM staging twelve challenges that all reference one recording of the town bells would otherwise need twelve copies of the file, and the reviewer would have to approve twelve uploads of the same bytes.
-
-So media belongs to a **Game**, and Challenge↔media is a through-model carrying `order` and the optional per-use `caption`. The same recording can mean different things in two challenges, so the caption lives on the *use*, not the file; `alt_text` describes the file itself and lives with it.
-
-This also makes the MCP read tool coherent: `list_media(game_id)` is a catalog of reusable assets, which is precisely the "valid existing options" shape the spec already requires.
+`order` is an explicit integer, not creation order: reordering a gallery is a normal edit, and relying on `id` would make it impossible without deleting and re-uploading. For spot-the-difference specifically, which image is first is part of the puzzle.
 
 ### Multipart upload, and base64 stays where it is
 
 Audio and video make base64 untenable: a 50MB clip becomes ~67MB of JSON held in memory to decode. A multipart endpoint streams to storage instead.
 
-The existing `Base64ImageField` path is left alone rather than migrated. It serves tower photos and submission photos, both of which are small, both of which work, and neither of which is in this change's scope. Two upload mechanisms is a real cost, but it is smaller than a migration of working code this change has no other reason to touch.
+The existing `Base64ImageField` path is left alone rather than migrated. It serves tower photos and submission photos, both small, both working, neither in this change's scope. Two upload mechanisms is a real cost, but smaller than migrating working code this change has no other reason to touch.
 
 ### Validate and reject; never transcode
 
-Per-kind MIME allowlist, byte ceiling, and (audio/video) duration ceiling, all settings. An oversized or wrong-format file is rejected at upload with a message naming the limit.
+Per-kind MIME allowlist, byte ceiling, and (audio/video) duration ceiling, all settings. An oversized or wrong-format file is rejected at upload with a message naming the limit and the actual value.
 
-*Alternative considered:* transcoding on upload to normalize formats. Rejected for this change — it needs ffmpeg in the deployment, a job queue, and a pending/ready state machine on every media item, none of which the game needs before it has any media at all. Rejecting with a clear limit is honest and cheap; transcoding can come later without changing the model.
+*Alternative considered:* transcoding on upload to normalise formats. Rejected for this change — it needs ffmpeg in the deployment, a job queue, and a pending/ready state machine on every media item, none of which the game needs before it has any media at all. Rejecting with a clear limit is honest and cheap; transcoding can be added later without changing the model.
 
 Duration probing still needs to read container metadata. This is the one new dependency, and it is read-only.
 
@@ -61,41 +57,37 @@ Files go through `default_storage`, so `MEDIA_ROOT` today and an S3-compatible b
 
 The trade-off worth stating: local `MEDIA_ROOT` on a container filesystem does not survive a rebuild without a mounted volume, and video makes that hurt sooner than photos did. The deployment note belongs with this change even though the default does not change.
 
-### The LLM references library ids and nothing else
+### No MCP media authoring in this change
 
-`suggest_challenge` accepts `media=[<library id>, …]`. Staging validates that every id exists in the target Game's library and is inside the creator's scope; the apply engine re-checks, as it does for every other reference.
+`suggest_challenge` stays text-only. An LLM cannot produce a real image or recording, so every option for giving it media authority is a workaround: referencing a shared library (which this change no longer has), staging a brief for a human to fill (which leaves every staged challenge carrying homework), or supplying a URL the server fetches (which turns the apply engine into an SSRF sink driven by model output, behind an approval a human may rubber-stamp).
 
-*Alternatives considered and rejected:*
-
-- **LLM supplies a URL, engine fetches.** The most autonomous option and the most dangerous: it turns the apply engine into a server-side fetcher driven by model output — an SSRF sink pointed at whatever the model emits, reachable through an approval flow a human may well rubber-stamp. It also introduces failure states (unreachable, wrong type, moved) at *apply* time, long after review. Not worth it.
-- **LLM stages a media brief a human fills.** Safe, and genuinely useful as a future addition, but on its own it means no staged challenge is ever complete — every one carries homework. Library references produce finished, playable challenges immediately.
+None of those is worth building before the human authoring flow exists and there is something real to learn from. The LLM keeps staging text-only challenge banks exactly as it does today, and a creator adds media afterwards.
 
 ### Media inherits challenge visibility
 
-When `challenge_hidden` is set, the server already omits the whole challenge payload, so media is withheld with it and no URL is emitted. The requirement is stated explicitly anyway, because the failure mode is silent and severe: a file URL in an unhidden field is a spoiler that leaks the challenge to anyone watching network traffic, defeating hidden-until-arrival without any visible symptom.
+When `challenge_hidden` is set, the server already omits the whole challenge payload, so media is withheld with it and no URL is emitted. The requirement is stated explicitly anyway, because the failure mode is silent and severe: a file URL in an unhidden field is a spoiler that leaks the challenge to anyone watching network traffic, defeating hidden-until-arrival with no visible symptom.
 
 ## Risks / Trade-offs
 
-- **Video on a phone over rural data** → media is delivered by URL with native player controls and `preload="none"`, so a clip is fetched when the player chooses to play it rather than on card render. Size ceilings keep the worst case bounded.
+- **Video on a phone over rural data** → media is delivered by URL with native controls and `preload="none"`, so a clip is fetched when the player chooses to play it rather than on card render. Size ceilings keep the worst case bounded.
 
-- **A creator uploads a 200MB video and hits the ceiling mid-game-prep** → the limit is enforced and named at upload time with the actual ceiling in the message, not discovered at play time.
+- **A creator uploads a 200MB video and hits the ceiling mid-prep** → the limit is enforced and named at upload with the actual value, not discovered at play time.
 
-- **Deleting a library item that challenges still use** → deletion is refused while uses exist, and the error names the challenges. Detaching is a separate, explicit action. Silently cascading would empty challenges mid-session.
+- **Deleting a challenge deletes its media** → correct here, since the media is that challenge's content, but it means an accidental challenge deletion loses the files. Ordinary deletion confirmation covers it; nothing is shared, so nothing else breaks.
 
-- **Orphaned files after a challenge is deleted** → the file belongs to the Game's library, not the Challenge, so deleting a challenge detaches rather than deletes. Reclaiming unused library items is a deliberate creator action.
+- **No reuse path at all** → a creator who genuinely wants one clip on three challenges must upload it three times. Accepted deliberately; see the library discussion above. If this becomes a real complaint it is an additive change, not a rewrite.
 
-- **Two upload mechanisms in the codebase** (base64 for the old paths, multipart for media) → accepted, and documented above. The alternative was migrating working code outside this change's scope.
+- **Two upload mechanisms in the codebase** → accepted and documented above.
 
-- **Alt text is optional, so most media will ship without it** → the authoring form prompts for it per item and the player renders it when present. Making it mandatory would be the stronger choice; it is not made here because it would block a creator mid-flow on a field they cannot always write meaningfully for audio. Worth revisiting.
+- **Alt text is optional, so most media will ship without it** → the authoring form prompts per item and the player renders it when present. Mandatory would be the stronger choice; it is not made here because it would block a creator mid-flow on a field they cannot always write meaningfully for audio. Worth revisiting.
 
 ## Migration Plan
 
-One migration creating the library table and the through table. Nothing on `Challenge` changes, and a challenge with no media serializes and renders exactly as it does today, so the change is additive and needs no backfill.
+One migration creating the media table. Nothing on `Challenge` changes, and a challenge with no media serialises and renders exactly as today, so the change is additive and needs no backfill.
 
-Rollback drops both tables; challenges revert to text-only with no data loss on `Challenge` itself. Uploaded files under `MEDIA_ROOT` are not removed by the rollback and would need a manual sweep.
+Rollback drops the table; challenges revert to text-only with no data loss on `Challenge` itself. Uploaded files under `MEDIA_ROOT` are not removed by the rollback and would need a manual sweep.
 
 ## Open Questions
 
-- Should the per-use `caption` fall back to the library item's own label when the creator leaves it blank, or render nothing? Falling back is friendlier; rendering nothing is more predictable. Leaning fallback.
-- Is a per-Game library the right scope, or should media be shareable across a creator's Games (like Collections are for geometry)? Per-Game is simpler and matches how challenges are scoped today; a creator running the same course in two towns would want the wider scope. Starting per-Game.
-- Should `suggest_challenge` be allowed to attach media the LLM has not "seen" via `list_media` in the same session? No mechanism enforces that today, and it is probably not worth building one.
+- Should a blank `caption` render nothing, or fall back to something derived (filename, kind)? Rendering nothing is more predictable and probably right for a puzzle where a stray label could give the answer away.
+- Should there be a per-challenge cap on the number of media items, separate from the per-file ceilings? A challenge with forty images is a broken challenge, but the number is arbitrary and easy to add later.

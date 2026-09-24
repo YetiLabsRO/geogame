@@ -2,7 +2,7 @@
 
 ### Requirement: Challenge definition
 
-The system SHALL model a `game.Challenge` with text content and a difficulty level, either bound to a specific tower or reusable as a generic challenge, and optionally carrying ordered media drawn from its Game's media library.
+The system SHALL model a `game.Challenge` with text content and a difficulty level, either bound to a specific tower or reusable as a generic challenge, and optionally carrying its own ordered media.
 
 #### Scenario: Creating a challenge
 
@@ -14,8 +14,14 @@ The system SHALL model a `game.Challenge` with text content and a difficulty lev
 #### Scenario: A challenge may carry media
 
 - **WHEN** an administrator attaches media to a challenge
-- **THEN** the challenge SHALL carry one or more ordered media items from its Game's library (see the `challenge-media` capability)
+- **THEN** the challenge SHALL carry one or more ordered media items as its own content (see the `challenge-media` capability)
 - **AND** a challenge with no media SHALL behave exactly as a text-only challenge does
+
+#### Scenario: A tower-bound challenge need not be about its tower
+
+- **WHEN** a challenge is bound to a tower and its content is carried by its media
+- **THEN** the challenge SHALL be served at that tower as any tower-specific challenge is
+- **AND** the team SHALL remain subject to the same proximity and presence rules as any other challenge at that tower
 
 ### Requirement: Challenges API
 
