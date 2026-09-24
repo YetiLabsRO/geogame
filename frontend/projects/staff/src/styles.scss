@@ -95,3 +95,14 @@ $app-radius-lg: 12px;
     0 0 0 4px var(--primary),
     inset 0 0 0 1px rgb(0 0 0 / 25%);
 }
+
+/* field mode: the pin being placed. Same shape as the muted ones around
+   it, so it is recognisably a tower, but ringed and lifted so the one
+   decision on screen is the loudest thing on it. */
+.tower-pin.pending span {
+  box-shadow:
+    0 0 0 2px #fff,
+    0 0 0 5px var(--primary),
+    inset 0 0 0 1px rgb(0 0 0 / 25%);
+  transform: scale(1.1);
+}

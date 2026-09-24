@@ -5875,6 +5875,83 @@ class MediaAssetModelTest(TestCase):
         self.assertEqual(note.subject, self.zone)
 
 
+class TowerTypeStarterSetTest(TransactionTestCase):
+    """Task 5.3 — the seed fills an empty vocabulary and touches nothing else.
+
+    The emptiness check is the whole safety property of this migration,
+    so it is tested from both sides: a bare install gets the set, and an
+    install that has its own keeps exactly what it had.
+    """
+
+    migrate_from = [('game', '0043_media_assets')]
+    migrate_to = [('game', '0044_tower_type_starter_set')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def test_an_empty_install_gets_the_starting_set(self):
+        old_apps = self._migrate(self.migrate_from)
+        old_apps.get_model('game', 'TowerType').objects.all().delete()
+
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+
+        names = list(TowerType.objects.order_by('order').values_list('name', flat=True))
+        self.assertEqual(
+            names,
+            ['Building', 'Place', 'Square', 'Statue', 'Art installation',
+             'Fountain', 'Church'],
+        )
+        # Usable as it stands: every one paints, and none is left on the
+        # untyped default, which would make the chips indistinguishable.
+        for row in TowerType.objects.all():
+            self.assertTrue(row.icon)
+            self.assertTrue(row.color)
+        self.assertEqual(
+            len({row.color for row in TowerType.objects.all()}), len(names),
+        )
+
+    def test_an_install_with_its_own_vocabulary_is_left_alone(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldType = old_apps.get_model('game', 'TowerType')
+        OldType.objects.all().delete()
+        OldType.objects.create(
+            name='Bunker', slug='bunker', icon='bi-bricks', color='#333333',
+        )
+
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+
+        self.assertEqual(
+            list(TowerType.objects.values_list('name', flat=True)), ['Bunker'],
+        )
+
+    def test_the_reverse_leaves_a_curator_edited_type_behind(self):
+        old_apps = self._migrate(self.migrate_from)
+        old_apps.get_model('game', 'TowerType').objects.all().delete()
+        new_apps = self._migrate(self.migrate_to)
+        TowerType = new_apps.get_model('game', 'TowerType')
+        # Someone decides a square is worth 60 m in their town.
+        TowerType.objects.filter(slug='square').update(proximity_meters=60)
+
+        back_apps = self._migrate(self.migrate_from)
+        BackType = back_apps.get_model('game', 'TowerType')
+
+        # The untouched six go; the edited one is theirs now.
+        self.assertEqual(
+            list(BackType.objects.values_list('slug', flat=True)), ['square'],
+        )
+
+
 class MediaCarryOverMigrationTest(TransactionTestCase):
     """Task 1.5 — every existing reference photo survives the widening.
 
@@ -12925,8 +13002,12 @@ class TowerTypeTest(TestCase):
         self.session = _default_session(self.game)
         self.zone = _make_zone(self.game)
         self.staff_client, _staff = _staff_client(session=self.session)
+        # A fixture of this test's own. `fountain` belongs to the
+        # starter vocabulary an install is now seeded with, and a test
+        # that borrows a slug the system ships is a test that breaks the
+        # day the system ships one.
         self.fountain = TowerType.objects.create(
-            name='Fountain', slug='fountain', icon='bi-droplet-fill',
+            name='Fountain', slug='types-fountain', icon='bi-droplet-fill',
             color='#1F6FEB', proximity_meters=25,
         )
 
@@ -13044,16 +13125,19 @@ class TowerTypeTest(TestCase):
         self.assertEqual(self.staff_client.get(url).status_code, 200)
 
     def test_creating_a_type(self):
+        # Not one of the starter vocabulary's slugs: this is about a
+        # curator extending the set, which is the case that has to keep
+        # working once the set exists.
         response = self.staff_client.post(
             reverse('admin-tower-type-list'),
             {
-                'name': 'Church', 'slug': 'Church', 'icon': 'bi-building',
+                'name': 'Bunker', 'slug': 'Bunker', 'icon': 'bi-bricks',
                 'color': '#8E44AD', 'proximity_meters': 40,
             },
             format='json',
         )
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data['slug'], 'church')
+        self.assertEqual(response.data['slug'], 'bunker')
         self.assertEqual(response.data['tower_count'], 0)
 
     def test_tower_payload_carries_both_the_choice_and_the_resolution(self):
@@ -14141,8 +14225,10 @@ class StaffLibraryFeedTest(TestCase):
         self.client_plain = APIClient()
         self.url = reverse('api-staff-library')
 
+        # Named for this test, not for the starter vocabulary the
+        # install ships with — see `TowerTypeTest`.
         self.fountain = TowerType.objects.create(
-            name='Fountain', slug='fountain', icon='bi-droplet-fill',
+            name='Fountain', slug='library-fountain', icon='bi-droplet-fill',
             color='#1F6FEB', proximity_meters=25,
         )
         self.zone = _make_zone(self.game, name='Old town')
@@ -14202,7 +14288,7 @@ class StaffLibraryFeedTest(TestCase):
         collections = {c['slug']: c for c in data['collections']}
         self.assertEqual(collections['riverside']['tower_count'], 1)
         self.assertEqual(collections['riverside']['zone_count'], 1)
-        self.assertIn('fountain', {t['slug'] for t in data['tower_types']})
+        self.assertIn('library-fountain', {t['slug'] for t in data['tower_types']})
 
     def test_zone_geometry_is_serialized(self):
         zones = {z['name']: z for z in self.staff_client.get(self.url).data['zones']}

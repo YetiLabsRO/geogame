@@ -89,7 +89,7 @@ const VIDEO_MAX_SECONDS = 30;
  * Field authoring mode (field-authoring-mode tasks 3.1–3.6, 4.2).
  *
  * Mobile, one-handed on-site authoring: drop a tower at the device GPS
- * fix (live accuracy, re-read / averaging / nudge), walk or tap a zone
+ * fix, then tapped or dragged to exactly where it belongs, walk or tap a zone
  * boundary, attach a challenge, and attach reference media — photos,
  * spoken notes and short clips — to whichever of the two is in hand
  * (tower-zone-media). All filed into a target Collection, drafts by
@@ -129,19 +129,35 @@ const VIDEO_MAX_SECONDS = 30;
     </div>
 
     <div class="row g-2 align-items-center mb-2">
-      <div class="col-8">
-        <select
-          class="form-select"
-          [ngModel]="collectionId()"
-          (ngModelChange)="onCollectionChange($event)"
-        >
-          <option [ngValue]="null">— target collection —</option>
-          @for (c of collections(); track c.id) {
-            <option [ngValue]="c.id">{{ c.name }}</option>
-          }
-        </select>
+      <div class="col">
+        <div class="input-group">
+          <select
+            class="form-select"
+            aria-label="Target collection"
+            [ngModel]="collectionId()"
+            (ngModelChange)="onCollectionChange($event)"
+          >
+            <option [ngValue]="null">— target collection —</option>
+            @for (c of collections(); track c.id) {
+              <option [ngValue]="c.id">{{ c.name }}</option>
+            }
+          </select>
+          <button
+            type="button"
+            class="btn btn-outline-secondary"
+            aria-label="Start a new collection"
+            [attr.aria-expanded]="newCollectionOpen()"
+            (click)="toggleNewCollection()"
+          >
+            <i
+              class="bi"
+              [class.bi-plus-lg]="!newCollectionOpen()"
+              [class.bi-x-lg]="newCollectionOpen()"
+            ></i>
+          </button>
+        </div>
       </div>
-      <div class="col-4">
+      <div class="col-auto">
         <div class="form-check form-switch">
           <input
             id="draft-toggle"
@@ -156,6 +172,38 @@ const VIDEO_MAX_SECONDS = 30;
       </div>
     </div>
 
+    <!-- A trip can begin here, rather than with a detour to another
+         screen to make somewhere to put things. -->
+    @if (newCollectionOpen()) {
+      <div class="card mb-2">
+        <div class="card-body py-2 d-grid gap-2">
+          <input
+            class="form-control form-control-lg"
+            type="text"
+            placeholder="New collection name"
+            [ngModel]="newCollectionName()"
+            (ngModelChange)="newCollectionName.set($event)"
+            (keyup.enter)="createCollection()"
+          />
+          <div class="form-text mt-0">
+            A collection is a map: the towers and zones you gather here can be composed into a game
+            later, at home.
+          </div>
+          <button
+            type="button"
+            class="btn btn-primary"
+            [disabled]="saving() || !newCollectionName().trim()"
+            (click)="createCollection()"
+          >
+            @if (saving()) {
+              <span class="spinner-border spinner-border-sm me-1"></span>
+            }
+            Create and use it
+          </button>
+        </div>
+      </div>
+    }
+
     @if (notice(); as msg) {
       <div class="alert alert-success py-2 mb-2">{{ msg }}</div>
     }
@@ -167,71 +215,82 @@ const VIDEO_MAX_SECONDS = 30;
     <div class="map-shell mb-2">
       <div class="map" #mapContainer></div>
 
-      <!-- Placement crosshair. The point stays fixed at the centre of
-           the screen and the MAP moves under it: the target becomes the
-           whole map instead of a 20px marker, and the thing being
-           positioned is never under the thumb doing the positioning. -->
       @if (mode() === 'tower') {
-        <div class="placement-crosshair" aria-hidden="true">
-          <span class="ring"></span>
-          <span class="dot"></span>
-        </div>
+        <!-- The pin is the placement, so this chip is a report on it,
+             not a second way to set it. -->
         <div class="offset-chip" role="status">
           @if (offsetMeters(); as d) {
             <i class="bi bi-arrows-move"></i> {{ d.toFixed(0) }} m from you
-            <button type="button" class="btn btn-link btn-sm p-0 ms-2" (click)="centreOnMe()">
-              centre on me
+            <button type="button" class="btn btn-link btn-sm p-0 ms-2" (click)="useMyLocation()">
+              use my location
             </button>
           } @else {
-            <i class="bi bi-person-fill"></i> at your position
+            <i class="bi bi-person-fill"></i> at your position · tap the map to move
           }
         </div>
       }
 
-      @if (fix(); as f) {
-        <div
-          class="gps-chip"
-          [class.text-bg-danger]="f.accuracy > accuracyWarnM"
-          [class.text-bg-light]="f.accuracy <= accuracyWarnM"
-        >
+      <!-- The accuracy badge is the only thing claiming to know where
+           the curator is, so it is also the control that asks again. -->
+      <button
+        type="button"
+        class="gps-chip"
+        [class.text-bg-danger]="(shownFix()?.accuracy ?? 0) > accuracyWarnM"
+        [class.text-bg-light]="(shownFix()?.accuracy ?? 0) <= accuracyWarnM"
+        [disabled]="reading()"
+        [attr.aria-label]="'Re-read the position from this device'"
+        (click)="reRead()"
+      >
+        @if (reading()) {
+          <span class="spinner-border spinner-border-sm"></span>
+          Reading…
+        } @else if (shownFix(); as f) {
           <i class="bi bi-crosshair"></i>
           ±{{ f.accuracy.toFixed(0) }} m
           @if (mode() === 'tower' && readings().length > 1) {
             · avg of {{ readings().length }}
           }
-        </div>
-      }
+          <i class="bi bi-arrow-repeat ms-1"></i>
+        } @else {
+          <i class="bi bi-crosshair"></i> locate me
+        }
+      </button>
     </div>
 
-    <!-- Idle: the two big entry actions -->
+    <!-- Idle: two ways to record a place, weighted the same. Walking a
+         boundary is not a lesser act of authoring than dropping a pin. -->
     @if (mode() === 'idle') {
       <div class="d-grid gap-2">
-        <button type="button" class="btn btn-primary btn-lg" (click)="startTower()">
-          <i class="bi bi-geo-alt-fill me-1"></i> Drop tower here
-        </button>
         <div class="row g-2">
           <div class="col-6">
             <button
               type="button"
-              class="btn btn-outline-primary btn-lg w-100"
-              (click)="startZone(null)"
+              class="btn btn-primary btn-lg w-100 entry-action"
+              (click)="startTower()"
             >
-              <i class="bi bi-bounding-box me-1"></i> New zone
+              <i class="bi bi-geo-alt-fill"></i>
+              <span>New tower</span>
             </button>
           </div>
           <div class="col-6">
-            <select
-              class="form-select form-select-lg h-100"
-              [ngModel]="null"
-              (ngModelChange)="startZone($event)"
+            <button
+              type="button"
+              class="btn btn-primary btn-lg w-100 entry-action"
+              (click)="startZone(null)"
             >
-              <option [ngValue]="null">Adjust zone…</option>
-              @for (z of zones(); track z.id) {
-                <option [ngValue]="z">{{ z.name }}</option>
-              }
-            </select>
+              <i class="bi bi-bounding-box"></i>
+              <span>New zone</span>
+            </button>
           </div>
         </div>
+        @if (zones().length) {
+          <select class="form-select" [ngModel]="null" (ngModelChange)="startZone($event)">
+            <option [ngValue]="null">Adjust an existing zone…</option>
+            @for (z of zones(); track z.id) {
+              <option [ngValue]="z">{{ z.name }}</option>
+            }
+          </select>
+        }
         @if (currentSubject(); as s) {
           <div class="card">
             <div class="card-body py-2 d-grid gap-2">
@@ -378,8 +437,8 @@ const VIDEO_MAX_SECONDS = 30;
           @if (fix(); as f) {
             @if (f.accuracy > accuracyWarnM) {
               <div class="alert alert-warning py-2 mb-0">
-                Accuracy ±{{ f.accuracy.toFixed(0) }} m is poor — add readings to average, or nudge
-                the marker on the map.
+                Accuracy ±{{ f.accuracy.toFixed(0) }} m is poor — add readings to average, or tap
+                the map where the tower actually goes.
               </div>
             }
           }
@@ -425,19 +484,22 @@ const VIDEO_MAX_SECONDS = 30;
               <div class="alert alert-warning py-2 mb-0">
                 This type captures within {{ impliedRadius() }} m but the fix is only accurate to
                 ±{{ fix()?.accuracy?.toFixed(0) }} m — players may not be able to reach it. Add
-                readings or nudge the marker before saving.
+                readings, or place the pin by hand, before saving.
               </div>
             }
           }
           <div class="row g-2">
             <div class="col-6">
+              <!-- Re-reading lives on the accuracy badge; this is the
+                   other half of it — give the point back to the device
+                   after having moved it by hand. -->
               <button
                 type="button"
                 class="btn btn-outline-secondary btn-lg w-100"
-                [disabled]="reading()"
-                (click)="reRead()"
+                [disabled]="reading() || offsetMeters() === null"
+                (click)="useMyLocation()"
               >
-                <i class="bi bi-arrow-repeat me-1"></i> Re-read
+                <i class="bi bi-person-fill me-1"></i> Use my location
               </button>
             </div>
             <div class="col-6">
@@ -476,7 +538,7 @@ const VIDEO_MAX_SECONDS = 30;
             </div>
           </div>
           <div class="form-text">
-            Pan the map to place the crosshair. Saved
+            Tap the map or drag the pin to place it. Saved
             {{ draft() ? 'as inactive draft' : 'active' }}.
           </div>
         </div>
@@ -778,37 +840,19 @@ const VIDEO_MAX_SECONDS = 30;
       width: 100%;
       border-radius: 0.375rem;
     }
-    .placement-crosshair {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      transform: translate(-50%, -50%);
-      z-index: 900;
-      /* Never intercepts a gesture: the map underneath has to keep
-         receiving every pan. */
-      pointer-events: none;
-      width: 44px;
-      height: 44px;
+    /* Two entry actions of equal weight: same size, same emphasis,
+       stacked icon over label so neither needs to be shorter. */
+    .entry-action {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 0.25rem;
+      min-height: 4.5rem;
     }
-    .placement-crosshair .ring {
-      position: absolute;
-      inset: 0;
-      border: 2px solid rgba(255, 255, 255, 0.9);
-      border-radius: 50%;
-      box-shadow:
-        0 0 0 2px rgba(0, 0, 0, 0.45),
-        inset 0 0 0 2px rgba(0, 0, 0, 0.45);
-    }
-    .placement-crosshair .dot {
-      position: absolute;
-      top: 50%;
-      left: 50%;
-      width: 6px;
-      height: 6px;
-      margin: -3px 0 0 -3px;
-      border-radius: 50%;
-      background: #fff;
-      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+    .entry-action i {
+      font-size: 1.5rem;
+      line-height: 1;
     }
     .offset-chip {
       position: absolute;
@@ -827,16 +871,26 @@ const VIDEO_MAX_SECONDS = 30;
       color: var(--ink);
       box-shadow: var(--shadow-2);
     }
+    /* A button, so it can be asked again — sized for a thumb, and
+       placed clear of Leaflet's zoom control in the other corner. */
     .gps-chip {
       position: absolute;
       top: 0.5rem;
       right: 0.5rem;
       z-index: 1000;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      min-height: 2.25rem;
       border: 1px solid rgba(0, 0, 0, 0.15);
       border-radius: 999px;
       padding: 0.25rem 0.75rem;
       font-size: 0.9rem;
       font-weight: 600;
+      box-shadow: var(--shadow-2);
+    }
+    .gps-chip:disabled {
+      opacity: 1; /* it is reporting, not unavailable */
     }
     .sheet-backdrop {
       position: fixed;
@@ -877,6 +931,8 @@ export class FieldModeComponent {
   protected readonly existingTowers = signal<AdminTower[]>([]);
   protected readonly existingZones = signal<AdminZone[]>([]);
   protected readonly collectionId = signal<number | null>(null);
+  protected readonly newCollectionOpen = signal(false);
+  protected readonly newCollectionName = signal('');
   protected readonly draft = signal(true);
   protected readonly notice = signal<string | null>(null);
   protected readonly error = signal<string | null>(null);
@@ -885,29 +941,51 @@ export class FieldModeComponent {
   // Geolocation
   protected readonly reading = signal(false);
   protected readonly readings = signal<Fix[]>([]);
-  private readonly nudge = signal<{ lat: number; lng: number } | null>(null);
+  /**
+   * The last reading the device gave us, whatever we were doing.
+   *
+   * Distinct from `readings`, which is the averaging set for one
+   * capture: outside a capture there is no set, and the accuracy badge
+   * still has to be able to say where the curator is and how well it
+   * knows. Without this the badge read "locate me" forever on the idle
+   * screen, and refreshing it did nothing visible.
+   */
+  private readonly deviceFix = signal<Fix | null>(null);
+  /**
+   * A point the curator put somewhere themselves, or null for "wherever
+   * the device says I am".
+   *
+   * Null is the default and the thing that makes averaging work: while
+   * nothing has been placed, the pin tracks the running fix, so adding
+   * readings visibly improves where the tower will land. The moment
+   * someone taps the map or drags the pin, the point is theirs and
+   * stops moving under them.
+   */
+  private readonly placed = signal<{ lat: number; lng: number } | null>(null);
   /** Displayed fix: the running average of this capture's readings. */
   protected readonly fix = computed<Fix | null>(() => average(this.readings()));
-  /** Where the crosshair currently sits — the live map centre. */
-  private readonly mapCentre = signal<{ lat: number; lng: number } | null>(null);
+  /** What the accuracy badge reports: the capture's average, else the last reading. */
+  protected readonly shownFix = computed<Fix | null>(() => this.fix() ?? this.deviceFix());
   /**
-   * Position that will be saved.
+   * The point that will be saved: the pin, and only the pin.
    *
-   * In tower mode that is the crosshair, full stop: pin, crosshair and
-   * saved point are one thing, so no two of them can disagree about
-   * where the tower goes. `nudge` survives only as the marker-drag
-   * path, and dragging recentres the map so the crosshair follows.
+   * It used to be the map centre, drawn as a crosshair, which meant the
+   * only way to place a tower on the doorway you were looking at was to
+   * drag the whole map until the doorway was dead centre — and, before
+   * you had dragged anything, put three indicators on one pixel. The
+   * map is now tapped to place, which is what tapping the map already
+   * meant while drawing a zone.
    */
-  protected readonly towerPos = computed<{ lat: number; lng: number } | null>(() => {
-    if (this.mode() === 'tower') return this.mapCentre() ?? this.nudge() ?? this.fix();
-    return this.nudge() ?? this.fix();
-  });
+  protected readonly towerPos = computed<{ lat: number; lng: number } | null>(
+    () => this.placed() ?? this.fix(),
+  );
   /**
-   * How far the chosen point has drifted from the device's own reading.
+   * How far the chosen point lies from the device's own reading.
    *
-   * Null at (or within a metre of) the fix. Panning the map is
-   * invisible otherwise — a curator who walked while the map was open
-   * needs to be told the point is no longer where they are standing.
+   * Null at (or within a metre of) the fix. Otherwise it is the only
+   * thing on screen saying the tower is not going where the curator is
+   * standing, which is exactly what they asked for and exactly what
+   * they might have done by accident.
    */
   protected readonly offsetMeters = computed<number | null>(() => {
     const fix = this.fix();
@@ -995,10 +1073,7 @@ export class FieldModeComponent {
     this.api.listCollections().subscribe({
       next: (list) => {
         this.collections.set(list);
-        if (list.length === 1) {
-          this.collectionId.set(list[0].id);
-          this.loadExisting();
-        }
+        this.chooseInitialCollection(list);
       },
       error: () => {},
     });
@@ -1028,18 +1103,16 @@ export class FieldModeComponent {
     // Beneath everything being created: existing work is context, not
     // the live decision.
     this.existingLayer = L.layerGroup().addTo(this.map);
+    // One meaning for a tap: it puts the thing you are making where you
+    // tapped. A zone collects vertices; a tower has one point, so the
+    // tap moves it.
     this.map.on('click', (e: L.LeafletMouseEvent) => {
       if (this.mode() === 'zone') {
         this.appendVertex([e.latlng.lng, e.latlng.lat]);
+      } else if (this.mode() === 'tower') {
+        this.placeAt(e.latlng.lat, e.latlng.lng);
       }
     });
-    // The crosshair is the map centre, so the centre is state.
-    const syncCentre = () => {
-      const c = this.map?.getCenter();
-      if (c) this.mapCentre.set({ lat: c.lat, lng: c.lng });
-    };
-    this.map.on('move', syncCentre);
-    syncCentre();
     // 3.1 — ask for the device position up front and center on it.
     void this.readFix()
       .then((f) => {
@@ -1051,6 +1124,16 @@ export class FieldModeComponent {
           'Location unavailable — enable GPS/location permission to author in the field.',
         );
       });
+    // The map can show the target collection before a fix arrives; it
+    // is drawn from what the server knows, not from where the curator
+    // happens to be standing.
+    this.loadExisting();
+  }
+
+  /** Put the point here, because the curator said so. */
+  private placeAt(lat: number, lng: number): void {
+    this.placed.set({ lat, lng });
+    this.placeTowerMarker();
   }
 
   /** One-shot high-accuracy geolocation fix (per capture, no tracking). */
@@ -1084,14 +1167,24 @@ export class FieldModeComponent {
   }
 
   private showDevice(f: Fix): void {
+    this.deviceFix.set(f);
     if (!this.map) return;
     const pos: [number, number] = [f.lat, f.lng];
     if (!this.deviceMarker) {
+      // A hollow ring, deliberately: the tower's pin is a filled
+      // teardrop, and the two sit on the same pixel until the curator
+      // moves one. Different shape survives that; different colour
+      // alone does not.
       this.deviceMarker = L.circleMarker(pos, {
-        radius: 6,
+        radius: 7,
         color: '#0d6efd',
-        fillOpacity: 0.9,
-      }).addTo(this.map);
+        weight: 3,
+        fillColor: '#ffffff',
+        fillOpacity: 1,
+        interactive: false,
+      })
+        .addTo(this.map)
+        .bindTooltip('You are here');
       this.accuracyCircle = L.circle(pos, {
         radius: f.accuracy,
         color: '#0d6efd',
@@ -1106,8 +1199,68 @@ export class FieldModeComponent {
 
   // ---- The target collection's existing elements ---------------------------
 
+  /**
+   * Start with a target rather than with none.
+   *
+   * A curator who opens field mode and sees bare streets has no way to
+   * tell whether they already recorded this fountain last month, which
+   * is the exact thing the field map was given memory to prevent. The
+   * device remembers the last target, because a scouting trip is one
+   * collection over several sessions and re-picking it every time is a
+   * tax on the person least able to pay it.
+   */
+  private chooseInitialCollection(list: AdminCollection[]): void {
+    if (!list.length) return;
+    if (this.collectionId() !== null) return;
+    const remembered = readRememberedCollection();
+    const target = list.find((c) => c.id === remembered) ?? list[0];
+    this.collectionId.set(target.id);
+    this.loadExisting();
+  }
+
+  protected toggleNewCollection(): void {
+    this.newCollectionOpen.update((open) => !open);
+    if (!this.newCollectionOpen()) this.newCollectionName.set('');
+  }
+
+  /**
+   * Begin a map here, rather than sending someone back indoors for one.
+   *
+   * Offline this is refused rather than queued: everything a curator
+   * saves afterwards is filed into this collection by id, and an id the
+   * server has not issued yet cannot be that. Queuing it would mean
+   * inventing a second kind of local reference for the one thing that
+   * every other queued item depends on.
+   */
+  protected createCollection(): void {
+    const name = this.newCollectionName().trim();
+    if (!name || this.saving()) return;
+    if (!this.queue.online()) {
+      this.error.set('A new collection needs a connection — it has to be given an id.');
+      return;
+    }
+    this.saving.set(true);
+    this.api.createCollection({ name }).subscribe({
+      next: (created) => {
+        this.saving.set(false);
+        this.collections.update((list) =>
+          [...list, created].sort((a, b) => a.name.localeCompare(b.name)),
+        );
+        this.newCollectionOpen.set(false);
+        this.newCollectionName.set('');
+        this.onCollectionChange(created.id);
+        this.notice.set(`${created.name} is the target — everything you add lands there.`);
+      },
+      error: (err) => {
+        this.saving.set(false);
+        this.error.set(extractErrorMessage(err));
+      },
+    });
+  }
+
   protected onCollectionChange(id: number | null): void {
     this.collectionId.set(id);
+    rememberCollection(id);
     this.loadExisting();
   }
 
@@ -1178,49 +1331,60 @@ export class FieldModeComponent {
     this.error.set(null);
     this.notice.set(null);
     this.readings.set([]);
-    this.nudge.set(null);
+    this.placed.set(null);
     this.typeId.set(null);
     void this.readFix().then((f) => {
       this.readings.set([f]);
       this.map?.setView([f.lat, f.lng], 18);
-      this.mapCentre.set({ lat: f.lat, lng: f.lng });
-      this.placeTowerMarker();
-    });
-  }
-
-  protected reRead(): void {
-    this.nudge.set(null);
-    void this.readFix().then((f) => {
-      this.readings.set([f]);
-      this.centreOnFix();
       this.placeTowerMarker();
     });
   }
 
   protected addReading(): void {
-    this.nudge.set(null);
+    // Averaging is about the device's reading, so it releases a point
+    // the curator placed — otherwise "add reading" would keep improving
+    // a fix that no longer decides anything.
+    this.placed.set(null);
     void this.readFix().then((f) => {
       this.readings.update((r) => [...r, f]);
-      // Averaging moved the fix, so move the crosshair with it —
-      // otherwise "add reading" would silently stop affecting where
-      // the tower actually lands.
       this.centreOnFix();
       this.placeTowerMarker();
     });
   }
 
-  /** Put the crosshair back on the device's own reading. */
-  protected centreOnMe(): void {
-    this.nudge.set(null);
+  /**
+   * Ask the device again, wherever we are.
+   *
+   * Available outside a capture too: the accuracy badge is the only
+   * thing on screen claiming to know where the curator is, and a badge
+   * that cannot be refreshed is a badge that quietly goes stale while
+   * someone walks half a block.
+   */
+  protected reRead(): void {
+    void this.readFix().then((f) => {
+      if (this.mode() === 'tower') {
+        this.placed.set(null);
+        this.readings.set([f]);
+        this.centreOnFix();
+        this.placeTowerMarker();
+      } else {
+        this.map?.setView([f.lat, f.lng], this.map.getZoom());
+      }
+    });
+  }
+
+  /** Give the point back to the device's own reading. */
+  protected useMyLocation(): void {
+    this.placed.set(null);
     this.centreOnFix();
     this.placeTowerMarker();
+    if (!this.fix()) this.reRead();
   }
 
   private centreOnFix(): void {
     const f = this.fix();
     if (!f || !this.map) return;
     this.map.setView([f.lat, f.lng], this.map.getZoom());
-    this.mapCentre.set({ lat: f.lat, lng: f.lng });
   }
 
   /** The chosen type's paint, or the untyped default. */
@@ -1229,7 +1393,10 @@ export class FieldModeComponent {
     const icon = type?.icon || DEFAULT_TOWER_ICON;
     const color = type?.color || DEFAULT_TOWER_COLOR;
     return L.divIcon({
-      className: 'tower-pin',
+      // `pending` distinguishes it from the muted pins of what is
+      // already in the collection — they are the same shape, and only
+      // one of them is the decision being made.
+      className: 'tower-pin pending',
       html: `<span style="background:${color}"><i class="bi ${icon}"></i></span>`,
       iconSize: [32, 32],
       iconAnchor: [16, 16],
@@ -1246,13 +1413,11 @@ export class FieldModeComponent {
       }).addTo(this.map);
       this.towerMarker.on('dragend', () => {
         const p = this.towerMarker!.getLatLng();
-        this.nudge.set({ lat: p.lat, lng: p.lng });
-        // Keep pin, crosshair and saved point coincident: with a mouse
-        // the drag is the nicer gesture, and it must not create a
-        // second candidate position.
-        this.map?.setView([p.lat, p.lng], this.map.getZoom());
-        this.mapCentre.set({ lat: p.lat, lng: p.lng });
+        // The pin is the point, so a drag needs no follow-up: nothing
+        // else has an opinion about where the tower goes.
+        this.placed.set({ lat: p.lat, lng: p.lng });
       });
+      this.towerMarker.bindTooltip('Drag me, or tap the map, to move the tower');
     } else {
       this.towerMarker.setLatLng([pos.lat, pos.lng]);
       this.towerMarker.setIcon(this.towerIcon());
@@ -1799,7 +1964,7 @@ export class FieldModeComponent {
   protected cancelCapture(): void {
     this.mode.set('idle');
     this.readings.set([]);
-    this.nudge.set(null);
+    this.placed.set(null);
     this.editingZone.set(null);
     this.vertices.set([]);
     this.towerMarker?.remove();
@@ -1868,6 +2033,35 @@ function average(readings: Fix[]): Fix | null {
 
 function round1(value: number): number {
   return Math.round(value * 10) / 10;
+}
+
+/**
+ * The last target collection, per device.
+ *
+ * A per-viewer convenience and nothing more: it is fine for it to come
+ * back empty, and everything works if it does — the first collection is
+ * picked instead. Hence `localStorage` rather than anything the server
+ * has to remember on a curator's behalf.
+ */
+export const COLLECTION_KEY = 'cercetador.field.collection';
+
+export function readRememberedCollection(): number | null {
+  try {
+    const raw = localStorage.getItem(COLLECTION_KEY);
+    const id = raw === null ? Number.NaN : Number(raw);
+    return Number.isFinite(id) ? id : null;
+  } catch {
+    return null;
+  }
+}
+
+export function rememberCollection(id: number | null): void {
+  try {
+    if (id === null) localStorage.removeItem(COLLECTION_KEY);
+    else localStorage.setItem(COLLECTION_KEY, String(id));
+  } catch {
+    // Private window, blocked storage: the default still works.
+  }
 }
 
 /**
