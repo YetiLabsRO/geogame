@@ -4,9 +4,12 @@ Covers auth/scope, the suggest-only guarantee, the human approval gate,
 temp-ref dependency apply, partial apply, staff-API parity,
 append-only audit, and stage→apply re-authorization.
 """
+from datetime import timedelta
+
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
 from django.test import TestCase
+from django.utils import timezone
 from rest_framework.test import APIClient
 
 from authoring.engine import RefError, apply_proposal, topological_order
@@ -25,7 +28,7 @@ from authoring.models import (
 )
 from authoring.tools import AuthoringTools
 from game.models import Challenge, Collection, Tower
-from organize.models import Game
+from organize.models import Game, Session, Team
 
 User = get_user_model()
 
@@ -618,3 +621,267 @@ class McpTransportTests(TestCase):
         self.assertIn('suggest_challenge', names)
         self.assertIn('propose_config', names)
         self.assertGreaterEqual(len(names), 20)
+
+
+# --- Session & team authoring (mcp-session-authoring) ----------------------
+
+def _session(game, slug='run-1', **kwargs):
+    fields = {
+        'name': kwargs.pop('name', 'Run 1'),
+        'start_time': timezone.now() + timedelta(days=1),
+        'end_time': timezone.now() + timedelta(days=1, hours=4),
+    }
+    fields.update(kwargs)
+    return Session.objects.create(game=game, slug=slug, **fields)
+
+
+def _window():
+    """A valid future session window as ISO strings, as an LLM would send."""
+    start = timezone.now() + timedelta(days=2)
+    return start.isoformat(), (start + timedelta(hours=3)).isoformat()
+
+
+class SessionReadToolTests(TestCase):
+    """Tasks 7.1, 7.2 — session reads are creator-scoped and show provenance."""
+
+    def test_list_sessions_is_creator_scoped(self):
+        alice, bob = _staff('alice'), _staff('bob')
+        mine = _session(_game(alice, 'Alba Run'))
+        _session(_game(bob, 'Bob Town'), slug='theirs')
+        listed = _tools(alice).list_sessions()
+        self.assertEqual({s['id'] for s in listed}, {mine.id})
+
+    def test_list_sessions_filtered_by_out_of_scope_game_denied(self):
+        alice, bob = _staff('alice'), _staff('bob')
+        theirs = _game(bob, 'Bob Town')
+        with self.assertRaises(PermissionDenied):
+            _tools(alice).list_sessions(game_id=theirs.id)
+
+    def test_get_session_out_of_scope_denied(self):
+        alice, bob = _staff('alice'), _staff('bob')
+        theirs = _session(_game(bob, 'Bob Town'))
+        with self.assertRaises(PermissionDenied):
+            _tools(alice).get_session(theirs.id)
+
+    def test_get_session_reports_override_versus_inherited(self):
+        alice = _staff('alice')
+        game = _game(alice, 'Alba Run')
+        game.max_teams = 8
+        game.save(update_fields=['max_teams'])
+        session = _session(game, max_teams=4)
+
+        config = _tools(alice).get_session(session.id)['config']
+
+        # Overridden on the session: reported as an override, not inherited.
+        self.assertEqual(config['max_teams']['override'], 4)
+        self.assertEqual(config['max_teams']['effective'], 4)
+        self.assertFalse(config['max_teams']['inherited'])
+        # Left null: no override, effective value falls back to the game.
+        self.assertIsNone(config['min_teams']['override'])
+        self.assertTrue(config['min_teams']['inherited'])
+        self.assertEqual(config['min_teams']['effective'], game.min_teams)
+
+    def test_config_schema_declares_session_scope(self):
+        knobs = _tools(_staff('alice')).describe_config_schema()['knobs']
+        self.assertTrue(all(k['scopes'] == ['game', 'session'] for k in knobs))
+
+
+class ProposeSessionTests(TestCase):
+    """Tasks 7.3, 7.5, 7.10 — staging a session stays suggest-only."""
+
+    def setUp(self):
+        self.alice = _staff('alice')
+        self.game = _game(self.alice, 'Alba Run')
+        self.tools = _tools(self.alice)
+
+    def test_propose_session_stages_without_writing(self):
+        start, end = _window()
+        op = self.tools.propose_session(
+            self.game.id, name='Saturday', slug='saturday',
+            start_time=start, end_time=end, rationale='Weekend run.',
+        )
+        self.assertEqual(op['entity_type'], 'SESSION')
+        self.assertEqual(Session.objects.count(), 0)
+
+    def test_applied_session_lands_in_draft(self):
+        start, end = _window()
+        self.tools.propose_session(
+            self.game.id, name='Saturday', slug='saturday',
+            start_time=start, end_time=end, rationale='Weekend run.',
+        )
+        proposal = self.tools._current_proposal()
+        self.tools.submit_for_approval(proposal.id)
+        _approve_and_apply(self.alice, proposal)
+
+        session = Session.objects.get(slug='saturday')
+        self.assertEqual(session.state, Session.DRAFT)
+        self.assertEqual(session.created_by, self.alice)
+
+    def test_proposed_state_is_never_written(self):
+        start, end = _window()
+        self.tools.propose_session(
+            self.game.id, name='Saturday', slug='saturday',
+            start_time=start, end_time=end, rationale='Weekend run.',
+            state=Session.RUNNING,
+        )
+        op = self.tools._current_proposal().operations.get()
+        self.assertNotIn('state', op.payload)
+
+        proposal = self.tools._current_proposal()
+        self.tools.submit_for_approval(proposal.id)
+        _approve_and_apply(self.alice, proposal)
+        self.assertEqual(Session.objects.get(slug='saturday').state, Session.DRAFT)
+
+    def test_colliding_slug_fails_the_operation(self):
+        _session(self.game, slug='saturday')
+        start, end = _window()
+        self.tools.propose_session(
+            self.game.id, name='Saturday', slug='saturday',
+            start_time=start, end_time=end, rationale='Duplicate.',
+        )
+        proposal = self.tools._current_proposal()
+        self.tools.submit_for_approval(proposal.id)
+        _approve_and_apply(self.alice, proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.status, PROPOSAL_FAILED)
+        op = proposal.operations.get()
+        self.assertEqual(op.status, OP_FAILED)
+        self.assertTrue(op.error)
+        self.assertEqual(Session.objects.filter(game=self.game).count(), 1)
+
+    def test_out_of_scope_session_staging_refused(self):
+        bob = _staff('bob')
+        theirs = _game(bob, 'Bob Town')
+        start, end = _window()
+        with self.assertRaises(PermissionDenied):
+            self.tools.propose_session(
+                theirs.id, name='Nope', slug='nope',
+                start_time=start, end_time=end, rationale='Not mine.',
+            )
+
+
+class ProposeTeamTests(TestCase):
+    """Tasks 7.4, 7.7 — teams stage under a session and apply empty."""
+
+    def setUp(self):
+        self.alice = _staff('alice')
+        self.tools = _tools(self.alice)
+
+    def test_game_session_team_chain_applies_in_order(self):
+        start, end = _window()
+        self.tools.propose_game(
+            'Chain Town', slug='chain-town', temp_ref='g1', rationale='New town.',
+        )
+        self.tools.propose_session(
+            '@new:g1', name='Saturday', slug='saturday',
+            start_time=start, end_time=end, temp_ref='s1', rationale='Weekend.',
+        )
+        self.tools.propose_team(
+            '@new:s1', name='Vulturii', color='#ff0000', rationale='One patrol.',
+        )
+        proposal = self.tools._current_proposal()
+        self.tools.submit_for_approval(proposal.id)
+        _approve_and_apply(self.alice, proposal)
+
+        proposal.refresh_from_db()
+        self.assertEqual(
+            proposal.status, PROPOSAL_APPLIED,
+            [(op.entity_type, op.status, op.error) for op in proposal.operations.all()],
+        )
+        team = Team.objects.get(name='Vulturii')
+        self.assertEqual(team.session.slug, 'saturday')
+        self.assertEqual(team.session.game.name, 'Chain Town')
+
+    def test_applied_team_has_no_members(self):
+        game = _game(self.alice, 'Alba Run')
+        session = _session(game)
+        self.tools.propose_team(
+            session.id, name='Vulturii', color='#ff0000', rationale='One patrol.',
+        )
+        proposal = self.tools._current_proposal()
+        self.tools.submit_for_approval(proposal.id)
+        _approve_and_apply(self.alice, proposal)
+
+        team = Team.objects.get(name='Vulturii')
+        self.assertEqual(team.members.count(), 0)
+        self.assertIsNone(team.captain)
+
+    def test_membership_in_payload_is_refused_and_audited(self):
+        game = _game(self.alice, 'Alba Run')
+        session = _session(game)
+        before = AuthoringAuditEvent.objects.count()
+        with self.assertRaises(PermissionDenied):
+            self.tools.propose_team(
+                session.id, name='Vulturii', color='#ff0000',
+                rationale='Roster.', members=[1, 2],
+            )
+        self.assertEqual(Team.objects.filter(name='Vulturii').count(), 0)
+        self.assertGreater(AuthoringAuditEvent.objects.count(), before)
+
+    def test_out_of_scope_team_staging_refused(self):
+        bob = _staff('bob')
+        theirs = _session(_game(bob, 'Bob Town'))
+        with self.assertRaises(PermissionDenied):
+            self.tools.propose_team(
+                theirs.id, name='Nope', color='#ff0000', rationale='Not mine.',
+            )
+
+
+class SessionConfigScopeTests(TestCase):
+    """Task 7.9 — session-scoped config is checked against the knob list."""
+
+    def setUp(self):
+        self.alice = _staff('alice')
+        self.game = _game(self.alice, 'Alba Run')
+        self.session = _session(self.game)
+        self.tools = _tools(self.alice)
+
+    def test_session_scoped_override_stages(self):
+        op = self.tools.propose_config(
+            self.session.id, {'max_teams': 6}, scope='session',
+            rationale='Smaller field.',
+        )
+        self.assertEqual(op['entity_type'], 'CONFIG')
+
+    def test_non_overridable_knob_rejected_with_scopes(self):
+        with self.assertRaises(ValueError) as caught:
+            self.tools.propose_config(
+                self.session.id, {'slug': 'nope'}, scope='session',
+                rationale='Bad knob.',
+            )
+        self.assertIn('scope "game" only', str(caught.exception))
+
+
+class LifecycleIsNotAuthorableTests(TestCase):
+    """Task 7.6 — no tool stages or performs a lifecycle transition."""
+
+    def test_no_transition_tool_is_published(self):
+        from asgiref.sync import async_to_sync
+
+        from authoring.mcp_server import _build_server
+        names = {t.name for t in async_to_sync(_build_server().list_tools)()}
+        self.assertIn('propose_session', names)
+        self.assertIn('propose_team', names)
+        self.assertIn('list_sessions', names)
+        for action, _from, _to in Session.TRANSITIONS:
+            self.assertNotIn(action, names)
+            self.assertNotIn(f'propose_{action}', names)
+
+    def test_tools_expose_no_transition_method(self):
+        for action, _from, _to in Session.TRANSITIONS:
+            self.assertFalse(hasattr(AuthoringTools, action))
+
+    def test_apply_cannot_transition_an_existing_session(self):
+        alice = _staff('alice')
+        game = _game(alice, 'Alba Run')
+        session = _session(game)
+        tools = _tools(alice)
+        # A CONFIG update naming `state` is not an overridable knob.
+        with self.assertRaises(ValueError):
+            tools.propose_config(
+                session.id, {'state': Session.RUNNING}, scope='session',
+                rationale='Sneaky start.',
+            )
+        session.refresh_from_db()
+        self.assertEqual(session.state, Session.DRAFT)

@@ -97,6 +97,17 @@ import { extractErrorMessage } from '../auth/form-error';
                     </div>
                   }
                   <pre class="small bg-body-tertiary p-2 mb-1 rounded">{{ op.payload | json }}</pre>
+                  @if (op.action === 'CREATE' && op.entity_type === 'SESSION') {
+                    <div class="small text-body-secondary mb-1">
+                      Created in DRAFT — open participation and start it from the
+                      session runner.
+                    </div>
+                  }
+                  @if (op.action === 'CREATE' && op.entity_type === 'TEAM') {
+                    <div class="small text-body-secondary mb-1">
+                      Empty shell — players join through an invite or the join code.
+                    </div>
+                  }
                   @if (op.current) {
                     <div class="small text-body-secondary">Current: {{ op.current | json }}</div>
                   }

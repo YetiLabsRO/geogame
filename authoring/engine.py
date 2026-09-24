@@ -15,6 +15,8 @@ from game.admin_api import (
     AdminCollectionSerializer,
     AdminGameRoleSerializer,
     AdminGameSerializer,
+    AdminSessionSerializer,
+    AdminTeamSerializer,
     AdminTowerSerializer,
     AdminZoneSerializer,
 )
@@ -24,6 +26,7 @@ from organize.models import (
     Game,
     GameRole,
     Session,
+    Team,
 )
 
 from .models import (
@@ -35,6 +38,8 @@ from .models import (
     ENTITY_CONFIG,
     ENTITY_GAME,
     ENTITY_GAME_ROLE,
+    ENTITY_SESSION,
+    ENTITY_TEAM,
     ENTITY_TOWER,
     ENTITY_ZONE,
     EVENT_APPLY,
@@ -158,6 +163,16 @@ def _game_from_payload(payload):
     return None  # still a temp ref → parent CREATE carries authorization
 
 
+def _session_from_payload(payload):
+    """Resolve an already-substituted session reference to a Session, or None."""
+    ref = payload.get('session')
+    if isinstance(ref, int):
+        return Session.objects.filter(pk=ref).select_related('game').first()
+    if isinstance(ref, str) and ref.isdigit():
+        return Session.objects.filter(pk=int(ref)).select_related('game').first()
+    return None  # still a temp ref → parent CREATE carries authorization
+
+
 def authorize_operation(user, op, *, target=None, payload=None):
     """Raise `PermissionDenied` when `op` falls outside `user`'s scope.
 
@@ -213,6 +228,19 @@ def authorize_operation(user, op, *, target=None, payload=None):
             raise PermissionDenied('Not authorised to edit this game.')
         return
 
+    if entity == ENTITY_SESSION:
+        game = target.game if target is not None else _game_from_payload(payload)
+        if game is not None and not game.can_edit(user):
+            raise PermissionDenied('Not authorised to author this game\'s sessions.')
+        return
+
+    if entity == ENTITY_TEAM:
+        session = target.session if target is not None else _session_from_payload(payload)
+        game = session.game if session is not None else None
+        if game is not None and not game.can_edit(user):
+            raise PermissionDenied('Not authorised to author this session\'s teams.')
+        return
+
     if entity == ENTITY_CONFIG:
         game = target.game if isinstance(target, Session) else target
         if isinstance(game, Game) and not game.can_edit(user):
@@ -231,6 +259,10 @@ _CREATE_SERIALIZERS = {
     ENTITY_CHALLENGE: AdminChallengeSerializer,
     ENTITY_GAME_ROLE: AdminGameRoleSerializer,
     ENTITY_GAME: AdminGameSerializer,
+    # `state` is read-only on AdminSessionSerializer, so reusing it is what
+    # keeps a staged Session in DRAFT — no second check to drift.
+    ENTITY_SESSION: AdminSessionSerializer,
+    ENTITY_TEAM: AdminTeamSerializer,
 }
 _MODELS = {
     ENTITY_COLLECTION: Collection,
@@ -239,9 +271,11 @@ _MODELS = {
     ENTITY_CHALLENGE: Challenge,
     ENTITY_GAME_ROLE: GameRole,
     ENTITY_GAME: Game,
+    ENTITY_SESSION: Session,
+    ENTITY_TEAM: Team,
 }
 # Entities whose row records its author.
-_CREATED_BY = {ENTITY_COLLECTION, ENTITY_GAME}
+_CREATED_BY = {ENTITY_COLLECTION, ENTITY_GAME, ENTITY_SESSION}
 
 
 def _resolve_target(op, tempmap):
