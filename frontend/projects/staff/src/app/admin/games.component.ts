@@ -1,7 +1,14 @@
+import { HttpErrorResponse } from '@angular/common/http';
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { RouterLink } from '@angular/router';
 
-import { AdminGame, PageHeaderComponent, StaffApiService } from 'shared';
+import {
+  AdminGame,
+  AuthService,
+  DialogService,
+  PageHeaderComponent,
+  StaffApiService,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -10,6 +17,8 @@ interface Row {
   busy: boolean;
   error: string | null;
   notice: string | null;
+  /** Deletion-gate blockers from a refused 409 — one per live session. */
+  blockers: string[];
 }
 
 @Component({
@@ -108,12 +117,30 @@ interface Row {
                     >
                       Pause all sessions
                     </button>
+                    @if (isSuperuser()) {
+                      <button
+                        type="button"
+                        class="btn btn-sm btn-outline-danger"
+                        [disabled]="row.busy"
+                        [attr.aria-label]="'Delete game ' + row.game.name"
+                        (click)="remove(row)"
+                      >
+                        <i class="bi bi-trash"></i>
+                      </button>
+                    }
                   </div>
                   @if (row.error; as msg) {
                     <div class="small text-danger mt-1">{{ msg }}</div>
                   }
                   @if (row.notice; as msg) {
                     <div class="small text-body-secondary mt-1">{{ msg }}</div>
+                  }
+                  @if (row.blockers.length > 0) {
+                    <ul class="small text-danger text-start mt-1 mb-0">
+                      @for (b of row.blockers; track $index) {
+                        <li>{{ b }}</li>
+                      }
+                    </ul>
                   }
                 </td>
               </tr>
@@ -126,6 +153,11 @@ interface Row {
 })
 export class GamesComponent {
   private readonly api = inject(StaffApiService);
+  private readonly auth = inject(AuthService);
+  private readonly dialogs = inject(DialogService);
+
+  /** Deleting a game is superadmin-only; others do not see the control. */
+  protected readonly isSuperuser = this.auth.isSuperuser;
 
   protected readonly rows = signal<Row[]>([]);
   protected readonly loading = signal(false);
@@ -140,7 +172,9 @@ export class GamesComponent {
     this.loadError.set(null);
     this.api.listGames().subscribe({
       next: (list) => {
-        this.rows.set(list.map((game) => ({ game, busy: false, error: null, notice: null })));
+        this.rows.set(
+          list.map((game) => ({ game, busy: false, error: null, notice: null, blockers: [] })),
+        );
         this.loading.set(false);
       },
       error: (err) => {
@@ -155,7 +189,7 @@ export class GamesComponent {
     this.api.updateGame(row.game.id, { is_active: !row.game.is_active }).subscribe({
       next: (updated) => {
         this.rows.update((rows) =>
-          rows.map((r) => (r.game.id === row.game.id ? { game: updated, busy: false, error: null, notice: null } : r)),
+          rows.map((r) => (r.game.id === row.game.id ? { game: updated, busy: false, error: null, notice: null, blockers: [] } : r)),
         );
       },
       error: (err) => this.patch(row, { busy: false, error: extractErrorMessage(err) }),
@@ -168,7 +202,13 @@ export class GamesComponent {
       next: (created) => {
         this.rows.update((rows) => [
           ...rows,
-          { game: created, busy: false, error: null, notice: `Cloned as "${created.name}" (${created.slug}).` },
+          {
+            game: created,
+            busy: false,
+            error: null,
+            notice: `Cloned as "${created.name}" (${created.slug}).`,
+            blockers: [],
+          },
         ]);
         this.patch(row, { busy: false, notice: null });
       },
@@ -190,7 +230,72 @@ export class GamesComponent {
     });
   }
 
+  /**
+   * Delete this game and everything it is made of.
+   *
+   * A game is its configuration plus its runs, so deleting it takes its
+   * sessions — which is a great deal more than the row on screen shows.
+   * The dialog says how many, and asks for the slug to be typed: friction
+   * in proportion to what goes. Collections, towers and zones are shared by
+   * reference and stay.
+   */
+  protected async remove(row: Row): Promise<void> {
+    if (row.busy) return;
+    const sessions = await this.sessionCount(row.game.id);
+    const carries =
+      sessions === null
+        ? 'Every session on it goes with it, along with their teams and history. '
+        : sessions === 0
+          ? 'It has no sessions. '
+          : `Its ${sessions} session${sessions === 1 ? '' : 's'} go with it, ` +
+            'along with their teams, scores and history. ';
+    const ok = await this.dialogs.confirm({
+      title: `Delete "${row.game.name}"?`,
+      message:
+        `${carries}The towers, zones and collections it draws on are shared ` +
+        'and stay in the repository. This cannot be undone.',
+      confirmLabel: 'Delete game',
+      danger: true,
+      requireTyping: row.game.slug,
+    });
+    if (!ok) return;
+
+    this.patch(row, { busy: true, error: null, notice: null, blockers: [] });
+    this.api.deleteGame(row.game.id).subscribe({
+      next: () => this.rows.update((rows) => rows.filter((r) => r.game.id !== row.game.id)),
+      error: (err) =>
+        this.patch(row, {
+          busy: false,
+          error: extractErrorMessage(err),
+          blockers: extractBlockerMessages(err),
+        }),
+    });
+  }
+
+  /** How many sessions the dialog should warn about; null if we cannot say. */
+  private sessionCount(gameId: number): Promise<number | null> {
+    return new Promise((resolve) => {
+      this.api.listSessions(gameId).subscribe({
+        next: (sessions) => resolve(sessions.length),
+        // Never let a failed count stop someone deleting; the dialog falls
+        // back to naming the consequence without the number.
+        error: () => resolve(null),
+      });
+    });
+  }
+
   private patch(row: Row, patch: Partial<Row>): void {
     this.rows.update((rows) => rows.map((r) => (r.game.id === row.game.id ? { ...r, ...patch } : r)));
   }
+}
+
+/**
+ * Pull the deletion-gate `blockers` messages out of a 409 body — one per
+ * live session standing between this game and deletion.
+ */
+function extractBlockerMessages(err: unknown): string[] {
+  if (!(err instanceof HttpErrorResponse)) return [];
+  const blockers = (err.error as { blockers?: { message?: string }[] } | null)?.blockers;
+  if (!Array.isArray(blockers)) return [];
+  return blockers.map((b) => b.message).filter((m): m is string => typeof m === 'string');
 }

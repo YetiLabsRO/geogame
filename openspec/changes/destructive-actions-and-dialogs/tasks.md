@@ -14,13 +14,13 @@
 ## 2. The delete controls
 
 - [x] 2.1 `deleteGame` / `deleteSession` on `StaffApiService`; `is_superuser` on the `UserProfile` type and an `isSuperuser` signal on `AuthService`.
-- [ ] 2.2 A delete control on each Games row, present only for a superadmin.
-- [ ] 2.3 A delete control on each Sessions row, on the same terms.
-- [ ] 2.4 The Game dialog names the game, its session count, and that the sessions and their history go too; it requires the slug typed.
-- [ ] 2.5 The Session dialog names the session and what goes with it.
-- [ ] 2.6 A 409's blockers render as a list on the row, which stays put; a 403 renders as its message.
-- [ ] 2.7 A success removes the row without a reload, and clears the current-session selection when that was what went.
-- [ ] 2.8 Tests: the control's visibility follows `is_superuser`; a blocked delete leaves the row and shows its blockers.
+- [x] 2.2 A delete control on each Games row, present only for a superadmin.
+- [x] 2.3 A delete control on each Sessions row, on the same terms.
+- [x] 2.4 The Game dialog names the game, its session count, and that the sessions and their history go too; it requires the slug typed.
+- [x] 2.5 The Session dialog names the session and what goes with it.
+- [x] 2.6 A 409's blockers render as a list on the row, which stays put; a 403 renders as its message.
+- [x] 2.7 A success removes the row without a reload, and clears the current-session selection when that was what went.
+- [x] 2.8 Tests: the control's visibility follows `is_superuser`; a blocked delete leaves the row and shows its blockers.
 
 ## 3. Dialogs the app owns
 
@@ -60,9 +60,9 @@
 
 ## 7. The session list's game filter
 
-- [ ] 7.1 A game filter on the session list, defaulting to every game, working alongside the lifecycle filter.
-- [ ] 7.2 The empty state names the filters in force.
-- [ ] 7.3 Tests: the two filters compose; clearing the game filter restores every game.
+- [x] 7.1 A game filter on the session list, defaulting to every game, working alongside the lifecycle filter.
+- [x] 7.2 The empty state names the filters in force.
+- [x] 7.3 Tests: the two filters compose; clearing the game filter restores every game.
 
 ## 8. Closing out
 
