@@ -13,3 +13,7 @@ channels>=4.3
 channels-redis>=4.3
 pywebpush>=2.0
 mcp>=1.2
+# challenge-media: read-only duration probe for uploaded audio/video.
+# Pure Python — deliberately not ffmpeg, which would put a binary in the
+# deployment just to read container metadata.
+mutagen>=1.47

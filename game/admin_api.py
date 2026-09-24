@@ -4,22 +4,26 @@ import secrets
 from django.contrib.gis.geos import GEOSException, Point, Polygon
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers, status, viewsets
 from rest_framework.decorators import action
 from rest_framework.exceptions import APIException, PermissionDenied
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import IsAdminUser
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.challenge_types import REVIEW_MANUAL, TYPE_NFC_QR, TYPE_TEXT
 from game.media_api import MediaAssetSerializer, MediaSubjectMixin
+from game.media_validation import validate_upload
 from game.models import (
     NFC_MODE_LEGACY_URL,
     NFC_MODE_SECURE_TOKEN,
     ROLE_REQUIREMENT_NONE,
     Challenge,
+    ChallengeMedia,
     Collection,
     NfcTag,
     PresenceRequirement,
@@ -437,12 +441,39 @@ class AdminTeamGroupSerializer(serializers.ModelSerializer):
         fields = ('id', 'name', 'game', 'slug')
 
 
+class AdminChallengeMediaSerializer(serializers.ModelSerializer):
+    """Staff-side challenge media payload (challenge-media capability).
+
+    `file` is write-once through the multipart upload endpoint; editing
+    an item changes its caption, alt text, or order, never its bytes.
+    """
+
+    url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ChallengeMedia
+        fields = (
+            'id', 'challenge', 'kind', 'url', 'caption', 'alt_text',
+            'order', 'bytes', 'duration_seconds', 'uploaded_at',
+        )
+        read_only_fields = (
+            'challenge', 'kind', 'bytes', 'duration_seconds', 'uploaded_at',
+        )
+
+    def get_url(self, media):
+        request = self.context.get('request')
+        url = media.file.url
+        return request.build_absolute_uri(url) if request is not None else url
+
+
 class AdminChallengeSerializer(serializers.ModelSerializer):
     """Staff-side challenge payload.
 
     Unlike the player serializers this DOES expose `validation_code` —
     staff author it and hand it to the venue (printable handout).
     """
+
+    media = AdminChallengeMediaSerializer(many=True, read_only=True)
 
     class Meta:
         model = Challenge
@@ -452,6 +483,8 @@ class AdminChallengeSerializer(serializers.ModelSerializer):
             'role_requirement_mode', 'required_roles', 'require_holders_present',
             # presence-rules: null = no presence requirement.
             'presence_requirement',
+            # challenge-media: the challenge's own media, in creator order.
+            'media',
         )
 
     def validate(self, attrs):
@@ -801,6 +834,117 @@ class AdminChallengeViewSet(GameScopedViewSetMixin, viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         self._require_edit(instance.game)
         instance.delete()
+
+    # --- challenge-media -------------------------------------------------
+
+    @action(detail=True, methods=['get', 'post'], parser_classes=[
+        MultiPartParser, FormParser, JSONParser,
+    ])
+    def media(self, request, pk=None):
+        """GET lists this challenge's media; POST uploads one item.
+
+        POST is multipart only — audio and video never travel as base64,
+        because a 50MB clip would become ~67MB of JSON buffered in
+        memory. The file streams to `default_storage` instead.
+        """
+        challenge = self.get_object()
+        if request.method == 'POST':
+            self._require_edit(challenge.game)
+            kind = request.data.get('kind')
+            upload = request.data.get('file')
+            if not upload:
+                raise serializers.ValidationError({'file': 'No file supplied.'})
+            try:
+                size, duration = validate_upload(kind, upload)
+            except DjangoValidationError as exc:
+                raise serializers.ValidationError({'file': exc.messages})
+            # Append to the end unless the client placed it explicitly.
+            order = request.data.get('order')
+            if order in (None, ''):
+                order = challenge.media.count()
+            item = ChallengeMedia.objects.create(
+                challenge=challenge,
+                kind=kind,
+                file=upload,
+                caption=request.data.get('caption', '') or '',
+                alt_text=request.data.get('alt_text', '') or '',
+                order=int(order),
+                bytes=size,
+                duration_seconds=duration,
+                uploaded_by=request.user,
+            )
+            return Response(
+                AdminChallengeMediaSerializer(
+                    item, context=self.get_serializer_context(),
+                ).data,
+                status=status.HTTP_201_CREATED,
+            )
+        return Response(
+            AdminChallengeMediaSerializer(
+                challenge.media.all(), many=True,
+                context=self.get_serializer_context(),
+            ).data,
+        )
+
+    @action(
+        detail=True, methods=['patch', 'delete'],
+        url_path=r'media/(?P<media_id>[0-9]+)',
+    )
+    def media_detail(self, request, pk=None, media_id=None):
+        """PATCH edits caption/alt text/order; DELETE removes the item.
+
+        The file itself is write-once: re-uploading is a delete plus a
+        POST, so an edit can never silently swap the bytes under a
+        challenge a team is already looking at.
+        """
+        challenge = self.get_object()
+        self._require_edit(challenge.game)
+        item = get_object_or_404(ChallengeMedia, pk=media_id, challenge=challenge)
+        if request.method == 'DELETE':
+            item.delete()
+            return Response(status=status.HTTP_204_NO_CONTENT)
+        serializer = AdminChallengeMediaSerializer(
+            item, data=request.data, partial=True,
+            context=self.get_serializer_context(),
+        )
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='media/reorder')
+    def media_reorder(self, request, pk=None):
+        """Set the display order of this challenge's media in one call.
+
+        Body: {"order": [<media id>, ...]}. Reordering must not require
+        re-uploading anything, and for a spot-the-difference puzzle which
+        image comes first is part of the puzzle.
+        """
+        challenge = self.get_object()
+        self._require_edit(challenge.game)
+        ids = request.data.get('order')
+        if not isinstance(ids, list):
+            raise serializers.ValidationError(
+                {'order': 'Expected a list of media ids.'},
+            )
+        items = {item.id: item for item in challenge.media.all()}
+        unknown = [i for i in ids if int(i) not in items]
+        if unknown or len(ids) != len(items):
+            raise serializers.ValidationError({
+                'order': (
+                    'Must list every media id of this challenge exactly once.'
+                ),
+            })
+        with transaction.atomic():
+            for position, media_id in enumerate(ids):
+                item = items[int(media_id)]
+                item.order = position
+                item.save(update_fields=['order'])
+        return Response(
+            AdminChallengeMediaSerializer(
+                challenge.media.all(), many=True,
+                context=self.get_serializer_context(),
+            ).data,
+        )
 
 
 # ---------------------------------------------------------------------------

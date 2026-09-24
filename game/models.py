@@ -1223,6 +1223,60 @@ class Challenge(models.Model):
         return not missing, missing
 
 
+class ChallengeMedia(models.Model):
+    """An image, audio clip, or video clip that is part of a Challenge.
+
+    This is the challenge's own content — the two pictures in a
+    spot-the-difference puzzle ARE the challenge — so it hangs off
+    `Challenge` the way `TowerPhoto` hangs off `Tower`, and dies with it.
+    Explicitly distinct from `TeamTowerChallenge.photo`, which is a
+    player's ANSWER.
+
+    `order` is explicit rather than creation order: reordering a gallery
+    is an ordinary edit, and for a spot-the-difference puzzle which
+    image comes first is part of the puzzle.
+    """
+
+    IMAGE = 'IMAGE'
+    AUDIO = 'AUDIO'
+    VIDEO = 'VIDEO'
+    KIND_CHOICES = [
+        (IMAGE, 'Image'),
+        (AUDIO, 'Audio'),
+        (VIDEO, 'Video'),
+    ]
+    # Kinds whose duration is probed and bounded on upload.
+    TIMED_KINDS = (AUDIO, VIDEO)
+
+    challenge = models.ForeignKey(
+        Challenge, on_delete=models.CASCADE, related_name='media',
+    )
+    kind = models.CharField(max_length=8, choices=KIND_CHOICES)
+    file = models.FileField(upload_to='challenge_media')
+    caption = models.CharField(max_length=255, blank=True, default='')
+    # Describes the file itself, for assistive technology.
+    alt_text = models.CharField(max_length=255, blank=True, default='')
+    order = models.PositiveIntegerField(default=0)
+    # Recorded at upload so limits can be reported without re-reading
+    # the file from storage (which may be remote).
+    bytes = models.PositiveIntegerField(default=0)
+    duration_seconds = models.FloatField(null=True, blank=True)
+    uploaded_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='challenge_media',
+    )
+    uploaded_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['order', 'id']
+
+    def __str__(self):
+        return f'{self.kind} #{self.pk} on challenge #{self.challenge_id}'
+
+
 class TeamTowerChallenge(models.Model):
     PENDING = 0
     CONFIRMED = 1

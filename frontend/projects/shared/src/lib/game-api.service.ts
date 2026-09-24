@@ -38,6 +38,18 @@ export interface TowerLockInfo {
   expires_at: string;
   remaining_seconds: number;
 }
+/** A media item belonging to a Challenge (challenge-media capability). */
+export type ChallengeMediaKind = 'IMAGE' | 'AUDIO' | 'VIDEO';
+
+export interface ChallengeMedia {
+  id: number;
+  kind: ChallengeMediaKind;
+  url: string;
+  caption: string;
+  alt_text: string;
+  order: number;
+}
+
 export interface TowerState {
   id: number;
   name: string;
@@ -56,6 +68,10 @@ export interface TowerState {
     /** Payload keys a submission must supply ('photo', 'submitted_code'). */
     required_payload: string[];
     role_requirement: RoleRequirementInfo | null;
+    /** challenge-media: the challenge's own media, in creator order.
+     *  Absent entirely when the challenge is withheld, because the
+     *  whole `next_challenge` is withheld with it. */
+    media: ChallengeMedia[];
   } | null;
   /** null = no presence requirement (presence-rules capability). */
   presence: PresenceStatus | null;

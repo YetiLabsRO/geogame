@@ -170,6 +170,48 @@ interface Position {
                   }
                 </div>
                 <div class="fs-5" style="white-space: pre-line">{{ c.text }}</div>
+                <!-- challenge-media: the challenge's own media, in creator
+                     order. A tower-bound challenge need not be ABOUT its
+                     tower — two pictures to compare are the puzzle itself. -->
+                @if (c.media?.length) {
+                  <div class="mt-3 d-flex flex-column gap-3">
+                    @for (m of c.media; track m.id) {
+                      <figure class="mb-0">
+                        @switch (m.kind) {
+                          @case ('IMAGE') {
+                            <img
+                              [src]="m.url"
+                              [alt]="m.alt_text"
+                              class="img-fluid rounded border w-100"
+                            />
+                          }
+                          @case ('AUDIO') {
+                            <audio
+                              [src]="m.url"
+                              controls
+                              preload="none"
+                              class="w-100"
+                            ></audio>
+                          }
+                          @case ('VIDEO') {
+                            <video
+                              [src]="m.url"
+                              controls
+                              preload="none"
+                              playsinline
+                              class="img-fluid rounded border w-100"
+                            ></video>
+                          }
+                        }
+                        @if (m.caption) {
+                          <figcaption class="small text-body-secondary mt-1">
+                            {{ m.caption }}
+                          </figcaption>
+                        }
+                      </figure>
+                    }
+                  </div>
+                }
                 @if (s.presence; as p) {
                   <hr class="my-2" />
                   <div class="small text-body-secondary mb-1">
