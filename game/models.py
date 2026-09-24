@@ -63,10 +63,40 @@ def effective_conquest_rule(zone, session=None, game=None):
 
 
 def effective_proximity(tower, game):
-    """Capture radius in meters: Tower override when set, else the Game default."""
+    """Capture radius in metres: tower override, else its type, else the Game.
+
+    Paired with `proximity_radius_expression`, which is the same
+    fallback written as SQL for nearby-tower filtering. They MUST agree:
+    if one learns a layer and the other does not, a tower appears in a
+    player's "near me" list under one radius and refuses capture under
+    another — which reads as flaky GPS rather than as a bug. Change one,
+    change the other, and `test_python_and_sql_radius_agree` will say so
+    if you forget.
+    """
     if tower.proximity_meters is not None:
         return tower.proximity_meters
+    if tower.tower_type_id is not None and tower.tower_type.proximity_meters is not None:
+        return tower.tower_type.proximity_meters
     return game.proximity_meters
+
+
+def proximity_radius_expression(default_radius):
+    """`effective_proximity` as a queryset expression over Tower rows.
+
+    Lives here rather than at its call site so the Python and SQL
+    fallbacks are one definition in one file, read together. The caller
+    supplies the Game default because a queryset spanning one Session
+    has exactly one.
+    """
+    from django.db.models import FloatField, Value
+    from django.db.models.functions import Cast, Coalesce
+
+    return Coalesce(
+        Cast('proximity_meters', FloatField()),
+        Cast('tower_type__proximity_meters', FloatField()),
+        Value(float(default_radius), output_field=FloatField()),
+        output_field=FloatField(),
+    )
 
 
 def effective_time_unit(session):
@@ -246,6 +276,56 @@ class Zone(models.Model):
         return score_functions[self.scoring_type](units)
 
 
+# tower-types: what an untyped tower is drawn as. Named constants rather
+# than literals at call sites, because four surfaces draw towers and a
+# drifting default is the kind of bug nobody reports — it just looks
+# slightly wrong on one screen.
+DEFAULT_TOWER_ICON = 'bi-geo-alt-fill'
+DEFAULT_TOWER_COLOR = '#5F6B7A'
+
+
+class TowerType(models.Model):
+    """A kind of place, described once: icon, colour, and its defaults.
+
+    The taxonomy field `Tower.category` looks like it should be and is
+    not — that one is NORMAL/RFID, the *capture method*, branched on by
+    NFC provisioning and the RFID landing flow. Putting "Fountain" there
+    would break RFID capture, so kinds of place live here instead.
+
+    A type carries styling and the capture radius, and deliberately
+    nothing else. Every default a type carries is another resolution
+    chain to keep consistent across a Python path and a SQL path (see
+    `effective_proximity`), and the radius is the one that earns it:
+    it is physical, a fountain being a smaller target than a hilltop.
+    """
+
+    name = models.CharField(max_length=255)
+    slug = models.SlugField(max_length=80, unique=True)
+    # A Bootstrap Icons class name, the icon vocabulary the staff app
+    # already speaks. Not an upload: per-type SVG would mean sanitising
+    # user SVG and having no sensible fallback for a broken file.
+    icon = models.CharField(
+        max_length=64, default=DEFAULT_TOWER_ICON,
+        help_text='Bootstrap Icons class name, e.g. bi-droplet-fill.',
+    )
+    color = ColorField(default=DEFAULT_TOWER_COLOR, max_length=18)
+    # Default capture radius for towers of this kind. NULL means the
+    # type has no opinion and the Game default applies.
+    proximity_meters = models.PositiveIntegerField(
+        null=True, blank=True,
+        help_text='Default capture radius for this kind of place. '
+                  'Blank falls through to the Game default.',
+    )
+    description = models.TextField(blank=True, default='')
+    order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ['order', 'name']
+
+    def __str__(self):
+        return self.name
+
+
 class Tower(models.Model):
     CATEGORY_NORMAL = 1
     CATEGORY_RFID = 2
@@ -263,6 +343,22 @@ class Tower(models.Model):
     zones = models.ManyToManyField(Zone, related_name='towers', blank=True)
     category = models.PositiveSmallIntegerField(choices=CATEGORY_CHOICES)
     is_active = models.BooleanField()
+
+    # --- tower-types: what kind of place this is, and how it is drawn. ---
+    # The type supplies defaults; the two override fields let one tower
+    # disagree per facet without leaving the type, because the common
+    # case is "this one is special in exactly one way" and an
+    # all-or-nothing override would push curators to abandon the type —
+    # which is how a library stops being queryable.
+    tower_type = models.ForeignKey(
+        TowerType, on_delete=models.SET_NULL, null=True, blank=True,
+        related_name='towers',
+    )
+    # NULL means "inherit", which is why these are nullable rather than
+    # defaulted: there has to be a difference between "no colour chosen"
+    # and "this colour, which happens to equal the type's".
+    icon = models.CharField(max_length=64, blank=True, default='')
+    color = ColorField(max_length=18, null=True, blank=True)
 
     # Per-tower capture-radius override (zone-conquest-and-scoring-config).
     # NULL falls back to the game-wide Game.proximity_meters default.
@@ -294,6 +390,24 @@ class Tower(models.Model):
         blank=True,
         help_text='GPS accuracy in metres of the field capture that placed this tower (provenance).',
     )
+
+    @property
+    def resolved_icon(self):
+        """Icon to draw: this tower's override, else its type's, else the default."""
+        if self.icon:
+            return self.icon
+        if self.tower_type_id is not None:
+            return self.tower_type.icon
+        return DEFAULT_TOWER_ICON
+
+    @property
+    def resolved_color(self):
+        """Colour to draw, resolved per facet independently of the icon."""
+        if self.color:
+            return self.color
+        if self.tower_type_id is not None:
+            return self.tower_type.color
+        return DEFAULT_TOWER_COLOR
 
     def __init__(self, *args, **kwargs):
         super(Tower, self).__init__(*args, **kwargs)
