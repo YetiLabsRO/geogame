@@ -658,9 +658,18 @@ export interface FailCounterInfo {
 }
 
 /** One reason a Session may not start (machine `code` + human `message`). */
-export interface StartBlocker {
-  code: 'too_few_teams' | 'too_many_teams' | 'team_below_minimum' | 'team_above_maximum';
+/**
+ * The common shape of every blocker the API refuses an action with: a
+ * machine-readable code and a sentence naming what would unblock it. Both
+ * the start gate and the deletion gate send this, so one reader serves both.
+ */
+export interface Blocker {
+  code: string;
   message: string;
+}
+
+export interface StartBlocker extends Blocker {
+  code: 'too_few_teams' | 'too_many_teams' | 'team_below_minimum' | 'team_above_maximum';
   required?: number;
   allowed?: number;
   current?: number;

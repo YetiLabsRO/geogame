@@ -5,6 +5,7 @@ import { RouterLink } from '@angular/router';
 import {
   AdminGame,
   AuthService,
+  Blocker,
   DialogService,
   PageHeaderComponent,
   StaffApiService,
@@ -295,7 +296,7 @@ export class GamesComponent {
  */
 function extractBlockerMessages(err: unknown): string[] {
   if (!(err instanceof HttpErrorResponse)) return [];
-  const blockers = (err.error as { blockers?: { message?: string }[] } | null)?.blockers;
+  const blockers = (err.error as { blockers?: Blocker[] } | null)?.blockers;
   if (!Array.isArray(blockers)) return [];
   return blockers.map((b) => b.message).filter((m): m is string => typeof m === 'string');
 }

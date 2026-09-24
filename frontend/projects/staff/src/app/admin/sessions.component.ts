@@ -21,9 +21,9 @@ import {
   AdminSession,
   AdminSessionPayload,
   AuthService,
+  Blocker,
   DialogService,
   StaffApiService,
-  StartBlocker,
   StatusPillComponent,
 } from 'shared';
 
@@ -526,7 +526,7 @@ function isDirty<T extends object>(a: T, b: T): boolean {
  */
 function extractBlockerMessages(err: unknown): string[] {
   if (!(err instanceof HttpErrorResponse)) return [];
-  const blockers = (err.error as { blockers?: StartBlocker[] } | null)?.blockers;
+  const blockers = (err.error as { blockers?: Blocker[] } | null)?.blockers;
   if (!Array.isArray(blockers)) return [];
   return blockers
     .map((b) => b.message)
