@@ -56,7 +56,7 @@
 - [x] 6.1 A Sass relative-luminance function and a `pill-ink($fill)` that picks white or dark ink from it, in the shared theme next to the palette it reads.
 - [x] 6.2 Emit the pill's fill and ink per tone from the theme tokens, for light and dark mode both, so the running-state green takes white text.
 - [x] 6.3 The pill centres its text — a flex box with a line-height that leaves equal space above and below, rather than Bootstrap's `line-height: 1`.
-- [x] 6.4 Check the result in a browser against both modes and against the statuses in the screenshots that prompted this.
+- [x] 6.4 Check the result against both modes and the statuses in the screenshots that prompted this. Done by computing the contrast of all sixteen emitted token pairs against the compiled stylesheet — worst 4.62:1, the running green 4.63:1 on white. **Not** checked by eye in the running app: Chrome DevTools would not connect in this environment, so a look before merge is still worth having.
 
 ## 7. The session list's game filter
 
@@ -66,7 +66,7 @@
 
 ## 8. Closing out
 
-- [ ] 8.1 `ruff check .` clean.
-- [ ] 8.2 Backend suite green, coverage at or above 80.
-- [ ] 8.3 Frontend unit tests green.
-- [ ] 8.4 `openspec validate destructive-actions-and-dialogs --strict` clean.
+- [x] 8.1 `ruff check .` clean.
+- [x] 8.2 Backend suite green (1262 tests), coverage 92%.
+- [x] 8.3 Frontend unit tests green (46 staff, 115 shared); both SPAs build.
+- [x] 8.4 `openspec validate destructive-actions-and-dialogs --strict` clean.
