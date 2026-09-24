@@ -130,10 +130,39 @@ export interface AdminTower {
   rfid_code: string | null;
   location: { type: 'Point'; coordinates: [number, number] } | null;
   authored_accuracy_m: number | null;
+  /** tower-types: the chosen kind of place; null means untyped. */
+  tower_type: number | null;
+  tower_type_name: string | null;
+  /** Per-tower overrides. Empty/null means "inherit from the type". */
+  icon: string;
+  color: string | null;
+  /**
+   * What to actually paint — tower override, else type, else default,
+   * resolved server-side so no client re-implements the chain.
+   */
+  resolved_icon: string;
+  resolved_color: string;
   photos: TowerPhotoInfo[];
   collections: UsageRef[];
   games: UsageRef[];
 }
+
+/** A kind of place: icon, colour, and the defaults it carries. */
+export interface AdminTowerType {
+  id: number;
+  name: string;
+  slug: string;
+  /** Bootstrap Icons class name, e.g. `bi-droplet-fill`. */
+  icon: string;
+  color: string;
+  /** Default capture radius; null means the type has no opinion. */
+  proximity_meters: number | null;
+  description: string;
+  order: number;
+  tower_count: number;
+}
+
+export type TowerTypePayload = Partial<Omit<AdminTowerType, 'id' | 'tower_count'>>;
 
 /** Create-at-GPS payload (field-authoring-mode task 2.1). */
 export interface CreateTowerPayload {
@@ -149,6 +178,8 @@ export interface CreateTowerPayload {
   authored_accuracy_m?: number | null;
   /** Target Collection the new tower is filed into in the same call. */
   collection?: number | null;
+  /** tower-types: the kind of place, applied at capture. */
+  tower_type?: number | null;
 }
 
 export interface AdminZone {
@@ -1096,6 +1127,30 @@ export class StaffApiService {
   }
 
 
+  // ---- library-map: the whole repository in one request -------------------
+
+  library(): Observable<LibraryFeed> {
+    return this.http.get<LibraryFeed>('/api/staff/library/');
+  }
+
+  // ---- tower-types: the kind-of-place lookup ------------------------------
+
+  listTowerTypes(): Observable<AdminTowerType[]> {
+    return this.http.get<AdminTowerType[]>('/api/staff/tower-types/');
+  }
+
+  createTowerType(body: TowerTypePayload): Observable<AdminTowerType> {
+    return this.http.post<AdminTowerType>('/api/staff/tower-types/', body);
+  }
+
+  updateTowerType(id: number, body: TowerTypePayload): Observable<AdminTowerType> {
+    return this.http.patch<AdminTowerType>(`/api/staff/tower-types/${id}/`, body);
+  }
+
+  deleteTowerType(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/tower-types/${id}/`);
+  }
+
   // ---- live-overview: the big-screen view and its share links -------------
 
   /** The overview snapshot for a Session, as staff. */
@@ -1838,6 +1893,8 @@ export interface OverviewLink {
   path: string;
   url: string;
 }
+
+
 // ---- Content bundles (content-portability) ----------------------------------
 
 /** How an import treats content this install already holds. */
@@ -1878,4 +1935,55 @@ export interface BundleImportReport {
   media: number;
   total_created: number;
   total_updated: number;
+}
+
+
+// ---- library-map ---------------------------------------------------------
+
+export interface LibraryTower {
+  id: number;
+  name: string;
+  lat: number | null;
+  lng: number | null;
+  is_active: boolean;
+  tower_type: number | null;
+  tower_type_name: string | null;
+  /** Already resolved: tower override, else type, else default. */
+  icon: string;
+  color: string;
+  media_count: number;
+  /** Every Collection holding this tower — empty when it is in none. */
+  collection_ids: number[];
+}
+
+export interface LibraryZone {
+  id: number;
+  name: string;
+  color: string;
+  shape: string | null;
+  media_count: number;
+  collection_ids: number[];
+}
+
+export interface LibraryCollection {
+  id: number;
+  name: string;
+  slug: string;
+  tower_count: number;
+  zone_count: number;
+}
+
+export interface LibraryTypeRef {
+  id: number;
+  name: string;
+  slug: string;
+  icon: string;
+  color: string;
+}
+
+export interface LibraryFeed {
+  towers: LibraryTower[];
+  zones: LibraryZone[];
+  collections: LibraryCollection[];
+  tower_types: LibraryTypeRef[];
 }

@@ -50,3 +50,48 @@ $app-radius-lg: 12px;
   $radius-sm: $app-radius-sm,
   $radius-lg: $app-radius-lg
 );
+
+/* tower-types: Leaflet builds `divIcon` markup outside Angular's view
+   encapsulation, so a tower pin's paint has to be global. Shared by
+   field mode and the library map so one kind of place looks the same
+   on every surface. */
+.tower-pin {
+  background: none;
+  border: 0;
+
+  span {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 2rem;
+    height: 2rem;
+    border-radius: 50%;
+    color: #fff;
+    font-size: 0.95rem;
+    /* Two rings: a white one to separate the pin from busy map tiles,
+       and a dark one so a pale type colour still has an edge. */
+    box-shadow:
+      0 0 0 2px #fff,
+      inset 0 0 0 1px rgb(0 0 0 / 25%);
+  }
+
+  &.muted span {
+    opacity: 0.55;
+  }
+}
+
+/* library-map: membership state on a tower pin. `muted` is shared with
+   field mode's "already in this collection" overlay. */
+.tower-pin.member span {
+  box-shadow:
+    0 0 0 2px #fff,
+    0 0 0 4px var(--success),
+    inset 0 0 0 1px rgb(0 0 0 / 25%);
+}
+
+.tower-pin.selected span {
+  box-shadow:
+    0 0 0 2px #fff,
+    0 0 0 4px var(--primary),
+    inset 0 0 0 1px rgb(0 0 0 / 25%);
+}

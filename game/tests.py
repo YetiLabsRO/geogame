@@ -44,6 +44,7 @@ from django.core.management.base import CommandError
 from django.db import IntegrityError, connection, transaction  # tower-locking
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
+from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 from django.utils import timezone
 from rest_framework.authtoken.models import Token
@@ -75,6 +76,8 @@ from game.challenge_types import (
 )
 from game.dementors import assign_initial_roles, economy_tick, run_tick
 from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links  # mode-dementors-ble
+    DEFAULT_TOWER_COLOR,  # tower-types
+    DEFAULT_TOWER_ICON,
     FLIP_CAUSE_CONVERSION,
     FLIP_CAUSE_DIED,
     FLIP_CAUSE_DRAINED,
@@ -123,13 +126,15 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     TowerDiscovery,
     TowerLock,
     TowerPhoto,
-    TowerType,  # content-bundles fixture
+    TowerType,  # tower-types
     Trail,
     TrailEdge,
     TrailStep,
     Zone,
+    effective_proximity,
     effective_tower_factor,
     effective_zone_factor,
+    proximity_radius_expression,
 )
 from game.proximity import (
     CONFIDENCE_CORROBORATED,
@@ -12441,6 +12446,184 @@ class OverviewShareSocketTest(TransactionTestCase):
         await communicator.disconnect()
 
 
+class TowerTypeTest(TestCase):
+    """tower-types — the kind-of-place lookup and its resolution order."""
+
+    def setUp(self):
+        self.game = _make_game(name='Types game')
+        self.game.proximity_meters = 50
+        self.game.save()
+        self.session = _default_session(self.game)
+        self.zone = _make_zone(self.game)
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.fountain = TowerType.objects.create(
+            name='Fountain', slug='fountain', icon='bi-droplet-fill',
+            color='#1F6FEB', proximity_meters=25,
+        )
+
+    # -- styling resolution ---------------------------------------------
+
+    def test_untyped_tower_resolves_to_the_documented_defaults(self):
+        tower = _make_tower(self.game, name='Plain', zone=self.zone)
+        self.assertEqual(tower.resolved_icon, DEFAULT_TOWER_ICON)
+        self.assertEqual(tower.resolved_color, DEFAULT_TOWER_COLOR)
+
+    def test_a_type_supplies_icon_and_colour(self):
+        tower = _make_tower(self.game, name='Old Mill', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(tower.resolved_icon, 'bi-droplet-fill')
+        self.assertEqual(tower.resolved_color, '#1F6FEB')
+
+    def test_overrides_resolve_per_facet(self):
+        # The common case is "this one is special in exactly one way",
+        # so overriding the colour must not cost the type's icon.
+        tower = _make_tower(self.game, name='Odd one', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.color = '#C0392B'
+        tower.save()
+        self.assertEqual(tower.resolved_color, '#C0392B')
+        self.assertEqual(tower.resolved_icon, 'bi-droplet-fill')
+        self.assertEqual(tower.tower_type_id, self.fountain.id)
+
+    def test_clearing_an_override_reverts_to_the_type(self):
+        tower = _make_tower(self.game, name='Reverting', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.color = '#C0392B'
+        tower.save()
+        tower.color = None
+        tower.save()
+        self.assertEqual(tower.resolved_color, '#1F6FEB')
+
+    def test_deleting_a_type_leaves_its_towers_resolvable(self):
+        tower = _make_tower(self.game, name='Orphan', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.fountain.delete()
+        tower.refresh_from_db()
+        self.assertIsNone(tower.tower_type_id)
+        self.assertEqual(tower.resolved_icon, DEFAULT_TOWER_ICON)
+        self.assertEqual(tower.resolved_color, DEFAULT_TOWER_COLOR)
+
+    # -- capture radius --------------------------------------------------
+
+    def test_type_radius_applies_when_the_tower_has_none(self):
+        tower = _make_tower(self.game, name='Typed', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 25)
+
+    def test_tower_radius_still_beats_its_type(self):
+        tower = _make_tower(
+            self.game, name='Specific', zone=self.zone, proximity_meters=10,
+        )
+        tower.tower_type = self.fountain
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 10)
+
+    def test_game_default_applies_when_neither_speaks(self):
+        typeless_radius = TowerType.objects.create(
+            name='Unopinionated', slug='unopinionated',
+        )
+        tower = _make_tower(self.game, name='Default', zone=self.zone)
+        tower.tower_type = typeless_radius
+        tower.save()
+        self.assertEqual(effective_proximity(tower, self.game), 50)
+
+    def test_python_and_sql_radius_agree(self):
+        """The pair that must not drift.
+
+        Asserted against *each other* rather than against expected
+        numbers, so the test keeps meaning if a default changes. A
+        disagreement here reaches a player as a tower that shows up in
+        "near me" and then refuses to capture — which reads as flaky
+        GPS, not as a bug, and would cost an evening to find.
+        """
+        combos = [
+            ('own-and-type', 10, self.fountain),
+            ('type-only', None, self.fountain),
+            ('own-only', 15, None),
+            ('neither', None, None),
+        ]
+        towers = {}
+        for label, own, tower_type in combos:
+            tower = _make_tower(
+                self.game, name=f'radius-{label}', zone=self.zone,
+                proximity_meters=own,
+            )
+            tower.tower_type = tower_type
+            tower.save()
+            towers[tower.id] = tower
+
+        annotated = Tower.objects.filter(pk__in=towers).annotate(
+            _radius=proximity_radius_expression(self.game.proximity_meters),
+        )
+        self.assertEqual(annotated.count(), len(combos))
+        for row in annotated:
+            expected = effective_proximity(towers[row.id], self.game)
+            self.assertEqual(
+                row._radius, float(expected),
+                f'SQL and Python disagree for {row.name}',
+            )
+
+    # -- API --------------------------------------------------------------
+
+    def test_type_crud_is_staff_only(self):
+        url = reverse('admin-tower-type-list')
+        anon = APIClient()
+        self.assertIn(anon.get(url).status_code, (401, 403))
+        self.assertEqual(self.staff_client.get(url).status_code, 200)
+
+    def test_creating_a_type(self):
+        response = self.staff_client.post(
+            reverse('admin-tower-type-list'),
+            {
+                'name': 'Church', 'slug': 'Church', 'icon': 'bi-building',
+                'color': '#8E44AD', 'proximity_meters': 40,
+            },
+            format='json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data['slug'], 'church')
+        self.assertEqual(response.data['tower_count'], 0)
+
+    def test_tower_payload_carries_both_the_choice_and_the_resolution(self):
+        tower = _make_tower(self.game, name='Served', zone=self.zone)
+        tower.tower_type = self.fountain
+        tower.save()
+        data = self.staff_client.get(
+            reverse('admin-tower-detail', args=[tower.id]),
+        ).data
+        # What the curator chose (blank = inherit) …
+        self.assertEqual(data['tower_type'], self.fountain.id)
+        self.assertEqual(data['icon'], '')
+        # … and what a map should paint, so no client re-implements the
+        # fallback and drifts from the others.
+        self.assertEqual(data['resolved_icon'], 'bi-droplet-fill')
+        self.assertEqual(data['resolved_color'], '#1F6FEB')
+        self.assertEqual(data['tower_type_name'], 'Fountain')
+
+    def test_untyped_tower_payload_still_carries_resolved_styling(self):
+        tower = _make_tower(self.game, name='Bare', zone=self.zone)
+        data = self.staff_client.get(
+            reverse('admin-tower-detail', args=[tower.id]),
+        ).data
+        self.assertIsNone(data['tower_type'])
+        self.assertEqual(data['resolved_icon'], DEFAULT_TOWER_ICON)
+        self.assertEqual(data['resolved_color'], DEFAULT_TOWER_COLOR)
+
+    def test_assigning_a_type_through_the_api(self):
+        tower = _make_tower(self.game, name='Assignable', zone=self.zone)
+        response = self.staff_client.patch(
+            reverse('admin-tower-detail', args=[tower.id]),
+            {'tower_type': self.fountain.id}, format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['resolved_color'], '#1F6FEB')
+        tower.refresh_from_db()
+        self.assertEqual(effective_proximity(tower, self.game), 25)
+
+
 # ---------------------------------------------------------------------------
 # content-bundles — portable export/import of authored content, and the
 # legacy-dump importer that brings in what predates the format.
@@ -13452,6 +13635,107 @@ class LegacyDumpImportTest(TransactionTestCase):
             report = bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
         self.assertEqual(report.created['towers'], 4)
         self.assertEqual(Game.objects.filter(name='Legacy game').count(), 2)
+
+
+class StaffLibraryFeedTest(TestCase):
+    """library-map — the whole repository, drawable in one request."""
+
+    def setUp(self):
+        self.game = _make_game(name='Library game')
+        self.session = _default_session(self.game)
+        self.staff_client, _staff = _staff_client(session=self.session)
+        self.client_plain = APIClient()
+        self.url = reverse('api-staff-library')
+
+        self.fountain = TowerType.objects.create(
+            name='Fountain', slug='fountain', icon='bi-droplet-fill',
+            color='#1F6FEB', proximity_meters=25,
+        )
+        self.zone = _make_zone(self.game, name='Old town')
+        self.typed = _make_tower(self.game, name='Mill', zone=self.zone)
+        self.typed.tower_type = self.fountain
+        self.typed.save()
+        self.untyped = _make_tower(self.game, name='Well', zone=self.zone, lng=23.6)
+
+        self.riverside = Collection.objects.create(
+            name='Riverside', slug='riverside',
+        )
+        self.riverside.towers.add(self.typed)
+        self.riverside.zones.add(self.zone)
+
+    def test_library_is_staff_only(self):
+        self.assertIn(self.client_plain.get(self.url).status_code, (401, 403))
+        self.assertEqual(self.staff_client.get(self.url).status_code, 200)
+
+    def test_feed_carries_geometry_styling_and_membership(self):
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIn('Mill', towers)
+        self.assertAlmostEqual(towers['Mill']['lat'], 46.5)
+        self.assertEqual(towers['Mill']['icon'], 'bi-droplet-fill')
+        self.assertEqual(towers['Mill']['color'], '#1F6FEB')
+        self.assertEqual(towers['Mill']['tower_type_name'], 'Fountain')
+        # Untyped elements still draw — with the documented defaults.
+        self.assertEqual(towers['Well']['icon'], DEFAULT_TOWER_ICON)
+        self.assertEqual(towers['Well']['color'], DEFAULT_TOWER_COLOR)
+
+    def test_membership_rides_with_each_element(self):
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        self.assertIn(self.riverside.id, towers['Mill']['collection_ids'])
+        self.assertNotIn(self.riverside.id, towers['Well']['collection_ids'])
+        zones = {z['name']: z for z in data['zones']}
+        self.assertIn(self.riverside.id, zones['Old town']['collection_ids'])
+
+    def test_an_element_in_no_collection_reports_an_empty_list(self):
+        # An empty list, not a missing key — the map asks every pin the
+        # same question and must get an answer from all of them.
+        loose = _make_tower(self.game, name='Loose', zone=self.zone, lng=23.9)
+        loose.collections.clear()
+        towers = {t['name']: t for t in self.staff_client.get(self.url).data['towers']}
+        self.assertEqual(towers['Loose']['collection_ids'], [])
+
+    def test_an_element_in_several_collections_reports_all_of_them(self):
+        second = Collection.objects.create(name='Walking tour', slug='walking-tour')
+        second.towers.add(self.typed)
+        data = self.staff_client.get(self.url).data
+        towers = {t['name']: t for t in data['towers']}
+        for expected in (self.riverside.id, second.id):
+            self.assertIn(expected, towers['Mill']['collection_ids'])
+
+    def test_feed_carries_collections_and_types_for_the_side_panel(self):
+        data = self.staff_client.get(self.url).data
+        collections = {c['slug']: c for c in data['collections']}
+        self.assertEqual(collections['riverside']['tower_count'], 1)
+        self.assertEqual(collections['riverside']['zone_count'], 1)
+        self.assertIn('fountain', {t['slug'] for t in data['tower_types']})
+
+    def test_zone_geometry_is_serialized(self):
+        zones = {z['name']: z for z in self.staff_client.get(self.url).data['zones']}
+        self.assertIsNotNone(zones['Old town']['shape'])
+        self.assertIn('Polygon', zones['Old town']['shape'])
+
+    def test_the_whole_library_costs_a_bounded_number_of_queries(self):
+        # The point of one feed is that it does not degrade per element.
+        # Ten more towers in two more collections must not mean ten more
+        # queries, so the count is asserted to be identical.
+        with CaptureQueriesContext(connection) as small:
+            self.staff_client.get(self.url)
+        extra = Collection.objects.create(name='Extra', slug='extra')
+        for index in range(10):
+            tower = _make_tower(
+                self.game, name=f'Bulk {index}', zone=self.zone, lng=23.7 + index / 100,
+            )
+            tower.tower_type = self.fountain
+            tower.save()
+            extra.towers.add(tower)
+        with CaptureQueriesContext(connection) as large:
+            response = self.staff_client.get(self.url)
+        self.assertEqual(len(response.data['towers']), 12)
+        self.assertEqual(
+            len(large.captured_queries), len(small.captured_queries),
+            'the library feed gained a query per element',
+        )
 
 
 class ContentBundleAdoptionTest(TestCase):

@@ -36,6 +36,14 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/towers.component').then((m) => m.TowersComponent),
   },
+  // --- tower-types ---
+  {
+    path: 'tower-types',
+    canActivate: [staffGuard],
+    loadComponent: () =>
+      import('./admin/tower-types.component').then((m) => m.TowerTypesComponent),
+  },
+  // --- end tower-types ---
   {
     path: 'zones',
     canActivate: [staffGuard],
@@ -62,12 +70,17 @@ export const routes: Routes = [
     loadComponent: () =>
       import('./admin/challenges.component').then((m) => m.ChallengesComponent),
   },
+  // --- library-map ---
   {
-    path: 'collections',
+    path: 'library',
     canActivate: [staffGuard],
     loadComponent: () =>
-      import('./admin/collections.component').then((m) => m.CollectionsComponent),
+      import('./library/library.component').then((m) => m.LibraryComponent),
   },
+  // The map-first library replaced the name-list collections page;
+  // keep old links working.
+  { path: 'collections', redirectTo: 'library' },
+  // --- end library-map ---
   // --- content-portability ---
   {
     path: 'bundles',

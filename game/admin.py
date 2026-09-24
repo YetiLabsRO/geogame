@@ -41,6 +41,7 @@ from game.models import (
     TowerDiscovery,
     TowerLock,
     TowerPhoto,
+    TowerType,
     Trail,
     TrailEdge,
     TrailStep,
@@ -119,6 +120,14 @@ class TowerAdminForm(forms.ModelForm):
         return zones
 
 
+@admin.register(TowerType)
+class TowerTypeAdmin(admin.ModelAdmin):
+    list_display = ('name', 'slug', 'icon', 'color', 'proximity_meters', 'order')
+    list_editable = ('order',)
+    prepopulated_fields = {'slug': ('name',)}
+    search_fields = ('name', 'slug')
+
+
 class TowerPhotoInline(admin.TabularInline):
     model = TowerPhoto
     extra = 0
@@ -128,14 +137,18 @@ class TowerPhotoInline(admin.TabularInline):
 class TowerAdmin(LeafletGeoAdmin):
     form = TowerAdminForm
     list_display = [
-        '__str__', 'is_active', 'get_zones', 'category', 'get_tower_control', 'get_rfid_url',
+        '__str__', 'is_active', 'tower_type', 'get_zones', 'category',
+        'get_tower_control', 'get_rfid_url',
         'get_capture_mode', 'get_nfc_payload', 'id',
         'initial_bonus', 'decrease_initial_bonus',
         'discoverability', 'challenge_visibility',
     ]
     # `zones` is the many-to-many membership (tower-zone-topology): the
     # list filters by member zone and the edit form uses a multi-select.
-    list_filter = ['zones', 'is_active', 'category', 'discoverability', 'challenge_visibility']
+    list_filter = [
+        'zones', 'is_active', 'tower_type', 'category',
+        'discoverability', 'challenge_visibility',
+    ]
     filter_horizontal = ['zones']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]

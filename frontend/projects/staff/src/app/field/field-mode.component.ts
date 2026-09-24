@@ -16,6 +16,8 @@ import {
   AdminChallenge,
   AdminCollection,
   AdminGame,
+  AdminTower,
+  AdminTowerType,
   AdminZone,
   FieldSyncService,
   StaffApiService,
@@ -38,6 +40,9 @@ interface TowerContext {
 
 const FALLBACK_CENTER: [number, number] = [46.068374, 23.571797];
 const ACCURACY_WARN_M = 15;
+/** Untyped paint — mirrors game/models.py's DEFAULT_TOWER_* constants. */
+const DEFAULT_TOWER_ICON = 'bi-geo-alt-fill';
+const DEFAULT_TOWER_COLOR = '#5F6B7A';
 const PHOTO_MAX_DIM = 1280;
 const PHOTO_JPEG_QUALITY = 0.75;
 
@@ -87,7 +92,7 @@ const PHOTO_JPEG_QUALITY = 0.75;
         <select
           class="form-select"
           [ngModel]="collectionId()"
-          (ngModelChange)="collectionId.set($event)"
+          (ngModelChange)="onCollectionChange($event)"
         >
           <option [ngValue]="null">— target collection —</option>
           @for (c of collections(); track c.id) {
@@ -120,6 +125,28 @@ const PHOTO_JPEG_QUALITY = 0.75;
     <!-- Map -->
     <div class="map-shell mb-2">
       <div class="map" #mapContainer></div>
+
+      <!-- Placement crosshair. The point stays fixed at the centre of
+           the screen and the MAP moves under it: the target becomes the
+           whole map instead of a 20px marker, and the thing being
+           positioned is never under the thumb doing the positioning. -->
+      @if (mode() === 'tower') {
+        <div class="placement-crosshair" aria-hidden="true">
+          <span class="ring"></span>
+          <span class="dot"></span>
+        </div>
+        <div class="offset-chip" role="status">
+          @if (offsetMeters(); as d) {
+            <i class="bi bi-arrows-move"></i> {{ d.toFixed(0) }} m from you
+            <button type="button" class="btn btn-link btn-sm p-0 ms-2" (click)="centreOnMe()">
+              centre on me
+            </button>
+          } @else {
+            <i class="bi bi-person-fill"></i> at your position
+          }
+        </div>
+      }
+
       @if (fix(); as f) {
         <div
           class="gps-chip"
@@ -231,6 +258,45 @@ const PHOTO_JPEG_QUALITY = 0.75;
             [ngModel]="towerName()"
             (ngModelChange)="towerName.set($event)"
           />
+
+          <!-- tower-types: one tap styles and configures the capture. -->
+          @if (towerTypes().length) {
+            <div class="type-chips" role="group" aria-label="Tower type">
+              @for (t of towerTypes(); track t.id) {
+                <button
+                  type="button"
+                  class="type-chip"
+                  [class.selected]="typeId() === t.id"
+                  [attr.aria-pressed]="typeId() === t.id"
+                  (click)="chooseType(t.id)"
+                >
+                  <span class="chip-dot" [style.background-color]="t.color">
+                    <i class="bi" [class]="t.icon"></i>
+                  </span>
+                  {{ t.name }}
+                </button>
+              }
+            </div>
+            <div class="form-text mt-0">
+              @if (selectedType(); as t) {
+                {{ t.name }} ·
+                {{
+                  impliedRadius() === null
+                    ? 'capture radius from the game'
+                    : 'capture radius ' + impliedRadius() + ' m'
+                }}
+              } @else {
+                No type — neutral styling and the game's capture radius.
+              }
+            </div>
+            @if (radiusBelowAccuracy()) {
+              <div class="alert alert-warning py-2 mb-0">
+                This type captures within {{ impliedRadius() }} m but the fix is only
+                accurate to ±{{ fix()?.accuracy?.toFixed(0) }} m — players may not be able
+                to reach it. Add readings or nudge the marker before saving.
+              </div>
+            }
+          }
           <div class="row g-2">
             <div class="col-6">
               <button
@@ -278,7 +344,7 @@ const PHOTO_JPEG_QUALITY = 0.75;
             </div>
           </div>
           <div class="form-text">
-            Drag the marker to nudge. Saved {{ draft() ? 'as inactive draft' : 'active' }}.
+            Pan the map to place the crosshair. Saved {{ draft() ? 'as inactive draft' : 'active' }}.
           </div>
         </div>
       </div>
@@ -503,11 +569,96 @@ const PHOTO_JPEG_QUALITY = 0.75;
     .map-shell {
       position: relative;
     }
+    /* tower-types: the chip row is the primary control in this panel,
+       so size it for a gloved thumb rather than as a refinement. */
+    .type-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.375rem;
+    }
+    .type-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      min-height: 2.5rem;
+      padding: 0.375rem 0.625rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      background: var(--panel);
+      color: var(--ink);
+      font-size: 0.9375rem;
+    }
+    .type-chip.selected {
+      border-color: var(--primary);
+      box-shadow: inset 0 0 0 1px var(--primary);
+      color: var(--primary-strong);
+      font-weight: 600;
+    }
+    .chip-dot {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.5rem;
+      height: 1.5rem;
+      border-radius: 50%;
+      color: #fff;
+      font-size: 0.8125rem;
+      box-shadow: inset 0 0 0 1px rgb(0 0 0 / 25%);
+    }
     .map {
       height: 45vh;
       min-height: 16rem;
       width: 100%;
       border-radius: 0.375rem;
+    }
+    .placement-crosshair {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 900;
+      /* Never intercepts a gesture: the map underneath has to keep
+         receiving every pan. */
+      pointer-events: none;
+      width: 44px;
+      height: 44px;
+    }
+    .placement-crosshair .ring {
+      position: absolute;
+      inset: 0;
+      border: 2px solid rgba(255, 255, 255, 0.9);
+      border-radius: 50%;
+      box-shadow:
+        0 0 0 2px rgba(0, 0, 0, 0.45),
+        inset 0 0 0 2px rgba(0, 0, 0, 0.45);
+    }
+    .placement-crosshair .dot {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 6px;
+      height: 6px;
+      margin: -3px 0 0 -3px;
+      border-radius: 50%;
+      background: #fff;
+      box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.55);
+    }
+    .offset-chip {
+      position: absolute;
+      left: 50%;
+      bottom: 0.5rem;
+      transform: translateX(-50%);
+      z-index: 1000;
+      display: flex;
+      align-items: center;
+      white-space: nowrap;
+      border: 1px solid rgba(0, 0, 0, 0.15);
+      border-radius: 999px;
+      padding: 0.25rem 0.75rem;
+      font-size: 0.875rem;
+      background: var(--panel);
+      color: var(--ink);
+      box-shadow: var(--shadow-2);
     }
     .gps-chip {
       position: absolute;
@@ -550,6 +701,15 @@ export class FieldModeComponent {
   // Mode + capture state
   protected readonly mode = signal<'idle' | 'tower' | 'zone'>('idle');
   protected readonly collections = signal<AdminCollection[]>([]);
+  /**
+   * What the target Collection already holds, drawn on the field map.
+   *
+   * Without it the map had no memory: it drew where you are and what
+   * you are making, and nothing you had ever made — so a curator could
+   * stand beside a tower they added last month and record it again.
+   */
+  protected readonly existingTowers = signal<AdminTower[]>([]);
+  protected readonly existingZones = signal<AdminZone[]>([]);
   protected readonly collectionId = signal<number | null>(null);
   protected readonly draft = signal(true);
   protected readonly notice = signal<string | null>(null);
@@ -562,14 +722,59 @@ export class FieldModeComponent {
   private readonly nudge = signal<{ lat: number; lng: number } | null>(null);
   /** Displayed fix: the running average of this capture's readings. */
   protected readonly fix = computed<Fix | null>(() => average(this.readings()));
-  /** Position that will be saved: nudged, else the averaged fix. */
-  protected readonly towerPos = computed<{ lat: number; lng: number } | null>(
-    () => this.nudge() ?? this.fix(),
-  );
+  /** Where the crosshair currently sits — the live map centre. */
+  private readonly mapCentre = signal<{ lat: number; lng: number } | null>(null);
+  /**
+   * Position that will be saved.
+   *
+   * In tower mode that is the crosshair, full stop: pin, crosshair and
+   * saved point are one thing, so no two of them can disagree about
+   * where the tower goes. `nudge` survives only as the marker-drag
+   * path, and dragging recentres the map so the crosshair follows.
+   */
+  protected readonly towerPos = computed<{ lat: number; lng: number } | null>(() => {
+    if (this.mode() === 'tower') return this.mapCentre() ?? this.nudge() ?? this.fix();
+    return this.nudge() ?? this.fix();
+  });
+  /**
+   * How far the chosen point has drifted from the device's own reading.
+   *
+   * Null at (or within a metre of) the fix. Panning the map is
+   * invisible otherwise — a curator who walked while the map was open
+   * needs to be told the point is no longer where they are standing.
+   */
+  protected readonly offsetMeters = computed<number | null>(() => {
+    const fix = this.fix();
+    const chosen = this.towerPos();
+    if (!fix || !chosen) return null;
+    const metres = distanceMeters(fix, chosen);
+    return metres < 1 ? null : metres;
+  });
 
   // Tower capture
   protected readonly towerName = signal('');
   protected readonly currentTower = signal<TowerContext | null>(null);
+  // tower-types: one tap applies icon, colour and capture radius.
+  protected readonly towerTypes = signal<AdminTowerType[]>([]);
+  protected readonly typeId = signal<number | null>(null);
+  protected readonly selectedType = computed<AdminTowerType | null>(
+    () => this.towerTypes().find((t) => t.id === this.typeId()) ?? null,
+  );
+  /** Capture radius the chosen type implies; null means the Game default. */
+  protected readonly impliedRadius = computed(
+    () => this.selectedType()?.proximity_meters ?? null,
+  );
+  /**
+   * True when the fix is less precise than the radius the tower will
+   * carry — a tower placed less precisely than its own capture radius
+   * cannot reliably be captured, and that is worth saying before the
+   * curator walks away rather than after the game.
+   */
+  protected readonly radiusBelowAccuracy = computed(() => {
+    const radius = this.impliedRadius();
+    const fix = this.fix();
+    return radius !== null && fix !== null && fix.accuracy > radius;
+  });
   protected readonly photoCount = signal(0);
   protected readonly uploadingPhoto = signal(false);
 
@@ -596,6 +801,7 @@ export class FieldModeComponent {
   );
 
   private map: L.Map | null = null;
+  private existingLayer: L.LayerGroup | null = null;
   private deviceMarker: L.CircleMarker | null = null;
   private accuracyCircle: L.Circle | null = null;
   private towerMarker: L.Marker | null = null;
@@ -606,11 +812,17 @@ export class FieldModeComponent {
     this.api.listCollections().subscribe({
       next: (list) => {
         this.collections.set(list);
-        if (list.length === 1) this.collectionId.set(list[0].id);
+        if (list.length === 1) {
+          this.collectionId.set(list[0].id);
+          this.loadExisting();
+        }
       },
       error: () => {},
     });
     this.api.listZones().subscribe({ next: (l) => this.zones.set(l), error: () => {} });
+    this.api
+      .listTowerTypes()
+      .subscribe({ next: (l) => this.towerTypes.set(l), error: () => {} });
     this.api
       .listChallenges()
       .subscribe({ next: (l) => this.challenges.set(l), error: () => {} });
@@ -629,11 +841,21 @@ export class FieldModeComponent {
       attribution:
         '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
     }).addTo(this.map);
+    // Beneath everything being created: existing work is context, not
+    // the live decision.
+    this.existingLayer = L.layerGroup().addTo(this.map);
     this.map.on('click', (e: L.LeafletMouseEvent) => {
       if (this.mode() === 'zone') {
         this.appendVertex([e.latlng.lng, e.latlng.lat]);
       }
     });
+    // The crosshair is the map centre, so the centre is state.
+    const syncCentre = () => {
+      const c = this.map?.getCenter();
+      if (c) this.mapCentre.set({ lat: c.lat, lng: c.lng });
+    };
+    this.map.on('move', syncCentre);
+    syncCentre();
     // 3.1 — ask for the device position up front and center on it.
     void this.readFix()
       .then((f) => {
@@ -698,6 +920,72 @@ export class FieldModeComponent {
     }
   }
 
+  // ---- The target collection's existing elements ---------------------------
+
+  protected onCollectionChange(id: number | null): void {
+    this.collectionId.set(id);
+    this.loadExisting();
+  }
+
+  private loadExisting(): void {
+    const id = this.collectionId();
+    if (!id) {
+      this.existingTowers.set([]);
+      this.existingZones.set([]);
+      this.renderExisting();
+      return;
+    }
+    this.api.listTowers(id).subscribe({
+      next: (list) => {
+        this.existingTowers.set(list);
+        this.renderExisting();
+      },
+      error: () => {},
+    });
+    this.api.listZones(id).subscribe({
+      next: (list) => {
+        this.existingZones.set(list);
+        this.renderExisting();
+      },
+      error: () => {},
+    });
+  }
+
+  private renderExisting(): void {
+    if (!this.existingLayer) return;
+    this.existingLayer.clearLayers();
+
+    for (const zone of this.existingZones()) {
+      if (!zone.shape) continue;
+      const color = zone.color || '#5F6B7A';
+      L.geoJSON(zone.shape as unknown as GeoJSON.GeoJsonObject, {
+        style: { color, weight: 1, fillColor: color, fillOpacity: 0.08, dashArray: '4 3' },
+      })
+        .bindTooltip(`${zone.name} (in this collection)`)
+        .addTo(this.existingLayer);
+    }
+
+    for (const tower of this.existingTowers()) {
+      if (!tower.location) continue;
+      const [lng, lat] = tower.location.coordinates;
+      L.marker([lat, lng], {
+        icon: L.divIcon({
+          // Muted, so the element being captured stays the loudest
+          // thing on the screen.
+          className: 'tower-pin muted',
+          html: `<span style="background:${tower.resolved_color}">` +
+                `<i class="bi ${tower.resolved_icon}"></i></span>`,
+          iconSize: [32, 32],
+          iconAnchor: [16, 16],
+        }),
+        interactive: true,
+        keyboard: false,
+      })
+        .bindTooltip(`${tower.name} — already in this collection`)
+        .addTo(this.existingLayer);
+    }
+  }
+
   // ---- Tower capture (task 3.2) --------------------------------------------
 
   protected startTower(): void {
@@ -706,10 +994,12 @@ export class FieldModeComponent {
     this.notice.set(null);
     this.readings.set([]);
     this.nudge.set(null);
+    this.typeId.set(null);
     void this.readFix().then((f) => {
       this.readings.set([f]);
-      this.placeTowerMarker();
       this.map?.setView([f.lat, f.lng], 18);
+      this.mapCentre.set({ lat: f.lat, lng: f.lng });
+      this.placeTowerMarker();
     });
   }
 
@@ -717,6 +1007,7 @@ export class FieldModeComponent {
     this.nudge.set(null);
     void this.readFix().then((f) => {
       this.readings.set([f]);
+      this.centreOnFix();
       this.placeTowerMarker();
     });
   }
@@ -725,7 +1016,38 @@ export class FieldModeComponent {
     this.nudge.set(null);
     void this.readFix().then((f) => {
       this.readings.update((r) => [...r, f]);
+      // Averaging moved the fix, so move the crosshair with it —
+      // otherwise "add reading" would silently stop affecting where
+      // the tower actually lands.
+      this.centreOnFix();
       this.placeTowerMarker();
+    });
+  }
+
+  /** Put the crosshair back on the device's own reading. */
+  protected centreOnMe(): void {
+    this.nudge.set(null);
+    this.centreOnFix();
+    this.placeTowerMarker();
+  }
+
+  private centreOnFix(): void {
+    const f = this.fix();
+    if (!f || !this.map) return;
+    this.map.setView([f.lat, f.lng], this.map.getZoom());
+    this.mapCentre.set({ lat: f.lat, lng: f.lng });
+  }
+
+  /** The chosen type's paint, or the untyped default. */
+  private towerIcon(): L.DivIcon {
+    const type = this.selectedType();
+    const icon = type?.icon || DEFAULT_TOWER_ICON;
+    const color = type?.color || DEFAULT_TOWER_COLOR;
+    return L.divIcon({
+      className: 'tower-pin',
+      html: `<span style="background:${color}"><i class="bi ${icon}"></i></span>`,
+      iconSize: [32, 32],
+      iconAnchor: [16, 16],
     });
   }
 
@@ -733,16 +1055,29 @@ export class FieldModeComponent {
     const pos = this.towerPos();
     if (!this.map || !pos) return;
     if (!this.towerMarker) {
-      this.towerMarker = L.marker([pos.lat, pos.lng], { draggable: true }).addTo(
-        this.map,
-      );
+      this.towerMarker = L.marker([pos.lat, pos.lng], {
+        draggable: true,
+        icon: this.towerIcon(),
+      }).addTo(this.map);
       this.towerMarker.on('dragend', () => {
         const p = this.towerMarker!.getLatLng();
-        this.nudge.set({ lat: p.lat, lng: p.lng }); // manual nudge wins
+        this.nudge.set({ lat: p.lat, lng: p.lng });
+        // Keep pin, crosshair and saved point coincident: with a mouse
+        // the drag is the nicer gesture, and it must not create a
+        // second candidate position.
+        this.map?.setView([p.lat, p.lng], this.map.getZoom());
+        this.mapCentre.set({ lat: p.lat, lng: p.lng });
       });
     } else {
       this.towerMarker.setLatLng([pos.lat, pos.lng]);
+      this.towerMarker.setIcon(this.towerIcon());
     }
+  }
+
+  /** Choosing a type repaints the pin immediately — the point of one tap. */
+  protected chooseType(id: number | null): void {
+    this.typeId.set(this.typeId() === id ? null : id);
+    if (this.towerMarker) this.towerMarker.setIcon(this.towerIcon());
   }
 
   protected saveTower(): void {
@@ -757,6 +1092,7 @@ export class FieldModeComponent {
       is_active: !this.draft(),
       authored_accuracy_m: fix ? round1(fix.accuracy) : null,
       collection: this.collectionId(),
+      tower_type: this.typeId(),
     };
     if (!this.queue.online()) {
       const item = this.queue.enqueue('create-tower', payload);
@@ -783,6 +1119,8 @@ export class FieldModeComponent {
   }
 
   private afterTowerSaved(ctx: TowerContext, queued: boolean): void {
+    // The thing just placed becomes context for the next one.
+    if (!queued) this.loadExisting();
     this.currentTower.set(ctx);
     this.photoCount.set(0);
     this.towerName.set('');
@@ -1068,6 +1406,19 @@ export class FieldModeComponent {
         return kind;
     }
   }
+}
+
+/** Great-circle metres between two points (equirectangular is plenty
+    at the tens-of-metres scale this is read at). */
+export function distanceMeters(
+  a: { lat: number; lng: number },
+  b: { lat: number; lng: number },
+): number {
+  const R = 6371000;
+  const toRad = Math.PI / 180;
+  const x = (b.lng - a.lng) * toRad * Math.cos(((a.lat + b.lat) / 2) * toRad);
+  const y = (b.lat - a.lat) * toRad;
+  return Math.sqrt(x * x + y * y) * R;
 }
 
 function average(readings: Fix[]): Fix | null {

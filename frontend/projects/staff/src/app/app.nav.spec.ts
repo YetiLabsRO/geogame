@@ -20,6 +20,10 @@ const EXCLUDED = new Set([
 
 function navigableRoutes(): string[] {
   return routes
+    // A pure redirect is not a destination: it exists so an old link
+    // keeps working, and linking it in the sidebar would advertise a
+    // path we deliberately moved away from.
+    .filter((route) => !route.redirectTo)
     .map((route) => route.path ?? '')
     .filter((path) => !EXCLUDED.has(path))
     // Parameterised and nested routes (sessions/:id/replay, games/:id/edit)
@@ -39,6 +43,8 @@ describe('staff sidebar navigation', () => {
   });
 
   it('points every sidebar entry at a real route', () => {
+    // Redirects count as real here — a sidebar entry pointing at one
+    // still lands the user somewhere valid.
     const known = new Set(routes.map((route) => route.path ?? ''));
     const dangling = [...linked].filter((link) => !known.has(link));
     expect(dangling, `sidebar entries with no route: ${dangling.join(', ')}`).toEqual([]);

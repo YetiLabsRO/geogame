@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
-import { AdminTower, AdminZone, StaffApiService } from 'shared';
+import { AdminTower, AdminTowerType, AdminZone, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -54,6 +54,7 @@ interface Row {
           <thead>
             <tr>
               <th>Name</th>
+              <th>Type</th>
               <th>Zones</th>
               <th>Category</th>
               <th>Prox (m)</th>
@@ -76,6 +77,39 @@ interface Row {
                     [ngModel]="row.draft.name"
                     (ngModelChange)="update(row, 'name', $event)"
                   />
+                </td>
+                <td style="min-width: 11rem">
+                  <!-- tower-types: the kind of place. The swatch shows
+                       what will actually be painted, which is the type's
+                       unless this tower overrides it. -->
+                  <div class="d-flex align-items-center gap-2">
+                    <span
+                      class="type-swatch"
+                      [style.background-color]="row.draft.resolved_color"
+                      [title]="row.draft.resolved_icon"
+                    >
+                      <i class="bi" [class]="row.draft.resolved_icon"></i>
+                    </span>
+                    <select
+                      class="form-select form-select-sm"
+                      [ngModel]="row.draft.tower_type"
+                      (ngModelChange)="update(row, 'tower_type', $event)"
+                    >
+                      <option [ngValue]="null">untyped</option>
+                      @for (t of towerTypes(); track t.id) {
+                        <option [ngValue]="t.id">{{ t.name }}</option>
+                      }
+                    </select>
+                  </div>
+                  @if (row.draft.icon || row.draft.color) {
+                    <button
+                      type="button"
+                      class="btn btn-link btn-sm p-0 small"
+                      (click)="resetStyle(row)"
+                    >
+                      reset styling to type
+                    </button>
+                  }
                 </td>
                 <td style="min-width: 12rem">
                   <!-- Many-to-many membership (tower-zone-topology): a
@@ -112,13 +146,14 @@ interface Row {
                   </select>
                 </td>
                 <td style="max-width: 7rem">
-                  <!-- Per-tower capture radius; blank = inherit the
-                       Game's game-wide proximity default. -->
+                  <!-- Per-tower capture radius; blank inherits the
+                       tower's type (tower-types) and then the Game's
+                       game-wide default. -->
                   <input
                     class="form-control form-control-sm"
                     type="number"
                     min="1"
-                    placeholder="inherit"
+                    [placeholder]="inheritedRadiusLabel(row)"
                     [ngModel]="row.draft.proximity_meters"
                     (ngModelChange)="update(row, 'proximity_meters', $event)"
                   />
@@ -224,12 +259,27 @@ interface Row {
       </div>
     }
   `,
+  styles: `
+    .type-swatch {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 1.6rem;
+      height: 1.6rem;
+      flex: 0 0 1.6rem;
+      border-radius: 50%;
+      color: #fff;
+      font-size: 0.8rem;
+      box-shadow: inset 0 0 0 1px rgb(0 0 0 / 25%);
+    }
+  `,
 })
 export class TowersComponent {
   private readonly api = inject(StaffApiService);
 
   protected readonly rows = signal<Row[]>([]);
   protected readonly zones = signal<AdminZone[]>([]);
+  protected readonly towerTypes = signal<AdminTowerType[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
   protected readonly unassigningAll = signal(false);
@@ -241,6 +291,29 @@ export class TowersComponent {
       next: (list) => this.zones.set(list),
       error: () => {},
     });
+    this.api.listTowerTypes().subscribe({
+      next: (list) => this.towerTypes.set(list),
+      error: () => {},
+    });
+  }
+
+  /**
+   * What a blank capture radius will inherit, named rather than implied.
+   *
+   * "inherit" alone does not say inherit *what*, and with types in play
+   * the answer differs per row — the type's radius when it has one,
+   * the game's otherwise.
+   */
+  protected inheritedRadiusLabel(row: Row): string {
+    const type = this.towerTypes().find((t) => t.id === row.draft.tower_type);
+    if (type?.proximity_meters != null) return `${type.proximity_meters} (type)`;
+    return 'game default';
+  }
+
+  /** Drop this tower's own icon/colour so the type's show through again. */
+  protected resetStyle(row: Row): void {
+    this.update(row, 'icon', '');
+    this.update(row, 'color', null);
   }
 
   private refresh(): void {

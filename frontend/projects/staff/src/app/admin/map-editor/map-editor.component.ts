@@ -21,6 +21,7 @@ import {
   AdminCollection,
   AdminGame,
   AdminTower,
+  AdminTowerType,
   AdminZone,
   ConfirmService,
   FieldRowComponent,
@@ -51,6 +52,8 @@ interface ZoneDraftMeta {
 }
 
 interface PendingTower {
+  /** tower-types: chosen before saving, so the pin paints as you decide. */
+  towerTypeId: number | null;
   lat: number;
   lng: number;
   name: string;
@@ -70,12 +73,28 @@ const DEFAULT_ZONE_COLOR = '#2C74B3';
 /** Zone.SCORE_LIN (game/models.py) -- "points proportional to possession". */
 const DEFAULT_SCORING_TYPE = 3;
 
-const TOWER_ICON = L.divIcon({
-  className: 'map-editor-tower-icon',
-  html: '<i class="bi bi-broadcast"></i>',
-  iconSize: [26, 26],
-  iconAnchor: [13, 13],
-});
+/** Untyped paint — mirrors game/models.py's DEFAULT_TOWER_* constants. */
+const DEFAULT_TOWER_ICON = 'bi-geo-alt-fill';
+const DEFAULT_TOWER_COLOR = '#5F6B7A';
+
+/**
+ * A tower marker painted by its resolved type styling (tower-types).
+ *
+ * `resolved_*` comes off the API already worked out — tower override,
+ * else type, else default — so this never re-implements that chain.
+ */
+function towerIcon(
+  options: { icon?: string; color?: string; pending?: boolean } = {},
+): L.DivIcon {
+  const icon = options.icon || DEFAULT_TOWER_ICON;
+  const color = options.color || DEFAULT_TOWER_COLOR;
+  return L.divIcon({
+    className: `map-editor-tower-icon${options.pending ? ' pending' : ''}`,
+    html: `<span style="background:${color}"><i class="bi ${icon}"></i></span>`,
+    iconSize: [26, 26],
+    iconAnchor: [13, 13],
+  });
+}
 const VERTEX_ICON = L.divIcon({
   className: 'map-editor-vertex-icon',
   html: '',
@@ -312,6 +331,9 @@ function isTextInputFocused(): boolean {
               <div class="map-editor-divider"></div>
               <div class="map-editor-form">
                 <h2 class="map-editor-form__title">New tower</h2>
+                <p class="map-editor-hint">
+                  Placed on the map — drag the pin to adjust before saving.
+                </p>
                 <app-field-row label="Name" [required]="true" [error]="pt.error ?? undefined" for="new-tower-name">
                   <input
                     id="new-tower-name"
@@ -321,6 +343,21 @@ function isTextInputFocused(): boolean {
                     (ngModelChange)="updatePendingTowerName($event)"
                   />
                 </app-field-row>
+                @if (towerTypes().length) {
+                  <app-field-row label="Type" for="new-tower-type">
+                    <select
+                      id="new-tower-type"
+                      class="form-select form-select-sm"
+                      [ngModel]="pt.towerTypeId"
+                      (ngModelChange)="updatePendingTowerType($event)"
+                    >
+                      <option [ngValue]="null">untyped</option>
+                      @for (t of towerTypes(); track t.id) {
+                        <option [ngValue]="t.id">{{ t.name }}</option>
+                      }
+                    </select>
+                  </app-field-row>
+                }
                 <div class="map-editor-row">
                   <button
                     type="button"
@@ -495,6 +532,12 @@ function isTextInputFocused(): boolean {
       color: var(--ink-muted);
     }
 
+    .map-editor-hint {
+      margin: 0 0 var(--space-2);
+      font-size: var(--text-xs);
+      color: var(--ink-muted);
+    }
+
     .map-editor-hint-row {
       display: flex;
       align-items: center;
@@ -627,15 +670,54 @@ function isTextInputFocused(): boolean {
     .map-editor-tower-icon {
       width: 26px;
       height: 26px;
+      box-shadow: var(--shadow-2);
       border-radius: 50%;
-      background-color: var(--panel);
-      border: 2px solid var(--primary);
-      color: var(--primary);
+    }
+
+    .map-editor-tower-icon span {
+      width: 26px;
+      height: 26px;
+      border-radius: 50%;
+      color: #fff;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 13px;
-      box-shadow: var(--shadow-2);
+      /* A white ring against busy tiles, and a dark one so a pale type
+         colour still has an edge. */
+      box-shadow:
+        0 0 0 2px var(--panel),
+        inset 0 0 0 1px rgb(0 0 0 / 25%);
+    }
+
+    /* The unsaved one: dashed and pulsing, so it reads as a decision in
+       progress rather than as a tower that already exists. */
+    .map-editor-tower-icon.pending span {
+      box-shadow:
+        0 0 0 2px var(--panel),
+        0 0 0 4px var(--primary);
+      animation: map-editor-pending-pulse 1.6s ease-in-out infinite;
+      cursor: grab;
+    }
+
+    .map-editor-tower-icon.pending:active span {
+      cursor: grabbing;
+    }
+
+    @keyframes map-editor-pending-pulse {
+      0%,
+      100% {
+        opacity: 1;
+      }
+      50% {
+        opacity: 0.55;
+      }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      .map-editor-tower-icon.pending span {
+        animation: none;
+      }
     }
 
     .map-editor-vertex-icon {
@@ -693,6 +775,7 @@ export class MapEditorComponent {
   protected readonly selectedGameId = signal<number | null>(null);
   protected readonly selectedCollectionId = signal<number | null>(null);
   protected readonly towers = signal<AdminTower[]>([]);
+  protected readonly towerTypes = signal<AdminTowerType[]>([]);
   protected readonly zones = signal<AdminZone[]>([]);
   protected readonly loading = signal(false);
   protected readonly loadError = signal<string | null>(null);
@@ -721,6 +804,15 @@ export class MapEditorComponent {
   // ---- towers ----------------------------------------------------------------
 
   protected readonly pendingTower = signal<PendingTower | null>(null);
+  /**
+   * The not-yet-saved tower, drawn on the map the instant it is placed.
+   *
+   * Without it, clicking the map opened a name field in the side
+   * palette and put nothing where the click landed — so the one thing
+   * the click was about (where) was the one thing invisible until after
+   * a name had been typed and the server had answered.
+   */
+  private pendingMarker: L.Marker | null = null;
   protected readonly selectedTower = signal<AdminTower | null>(null);
 
   protected readonly collectionsForSelectedGame = computed(() => {
@@ -770,6 +862,11 @@ export class MapEditorComponent {
     }
 
     afterNextRender(() => this.initMap());
+
+    this.api.listTowerTypes().subscribe({
+      next: (list) => this.towerTypes.set(list),
+      error: () => {},
+    });
 
     this.api.listGames().subscribe({
       next: (list) => this.games.set(list),
@@ -898,6 +995,7 @@ export class MapEditorComponent {
       this.renderZones();
     }
     this.pendingTower.set(null);
+    this.clearPendingMarker();
     this.selectedTower.set(null);
     this.tool.set(tool);
     this.renderTowers(); // draggable-state depends on "no zone being edited"
@@ -931,13 +1029,70 @@ export class MapEditorComponent {
     const snap = this.trySnap(latlng, null);
     const point = snap ?? latlng;
     this.hideSnapIndicator();
-    this.pendingTower.set({ lat: point.lat, lng: point.lng, name: '', saving: false, error: null });
+    this.pendingTower.set({
+      lat: point.lat, lng: point.lng, name: '',
+      towerTypeId: null, saving: false, error: null,
+    });
+    this.showPendingMarker(point);
+  }
+
+  /** Put the pin down first; the name is the part that can wait. */
+  private showPendingMarker(point: L.LatLng | { lat: number; lng: number }): void {
+    if (!this.map) return;
+    const latlng = L.latLng(point.lat, point.lng);
+    if (!this.pendingMarker) {
+      this.pendingMarker = L.marker(latlng, {
+        icon: towerIcon({ pending: true }),
+        draggable: true,
+        // Above the saved towers: it is the one thing being decided.
+        zIndexOffset: 1000,
+      });
+      this.pendingMarker.bindTooltip('New tower — drag to reposition');
+      this.pendingMarker.on('dragstart', () => this.hideSnapIndicator());
+      this.pendingMarker.on('drag', (ev) => {
+        const snapped = this.trySnap((ev.target as L.Marker).getLatLng(), null);
+        if (snapped) this.showSnapIndicator(snapped);
+        else this.hideSnapIndicator();
+      });
+      this.pendingMarker.on('dragend', (ev) => this.onPendingDragEnd(ev.target as L.Marker));
+      this.pendingMarker.addTo(this.map);
+      this.pendingMarker.openTooltip();
+    } else {
+      this.pendingMarker.setLatLng(latlng);
+    }
+  }
+
+  /** Repositioning before saving: the marker is the source of truth. */
+  private onPendingDragEnd(marker: L.Marker): void {
+    this.hideSnapIndicator();
+    const snapped = this.trySnap(marker.getLatLng(), null);
+    const point = snapped ?? marker.getLatLng();
+    marker.setLatLng(point);
+    const pt = this.pendingTower();
+    if (pt) this.pendingTower.set({ ...pt, lat: point.lat, lng: point.lng });
+  }
+
+  private clearPendingMarker(): void {
+    if (this.pendingMarker && this.map) this.map.removeLayer(this.pendingMarker);
+    this.pendingMarker = null;
   }
 
   protected updatePendingTowerName(name: string): void {
     const pt = this.pendingTower();
     if (!pt) return;
     this.pendingTower.set({ ...pt, name });
+  }
+
+  protected updatePendingTowerType(towerTypeId: number | null): void {
+    const pt = this.pendingTower();
+    if (!pt) return;
+    this.pendingTower.set({ ...pt, towerTypeId });
+    // Repaint the pin as the choice is made, so the map answers
+    // "what will this look like" without a save.
+    const type = this.towerTypes().find((t) => t.id === towerTypeId);
+    this.pendingMarker?.setIcon(
+      towerIcon({ icon: type?.icon, color: type?.color, pending: true }),
+    );
   }
 
   protected savePendingTower(): void {
@@ -965,11 +1120,13 @@ export class MapEditorComponent {
         // desk-placed towers default to a plain, active tower.
         category: 1, // Tower.CATEGORY_NORMAL (game/models.py)
         is_active: true,
+        tower_type: pt.towerTypeId,
       })
       .subscribe({
         next: (tower) => {
           this.notice.set(`Tower "${tower.name}" placed.`);
           this.pendingTower.set(null);
+          this.clearPendingMarker();
           this.reloadGeometry();
         },
         error: (err) => {
@@ -983,6 +1140,7 @@ export class MapEditorComponent {
 
   protected cancelPendingTower(): void {
     this.pendingTower.set(null);
+    this.clearPendingMarker();
   }
 
   private onTowerDragEnd(tower: AdminTower, marker: L.Marker): void {
@@ -1487,7 +1645,10 @@ export class MapEditorComponent {
     for (const tower of this.towers()) {
       if (!tower.location) continue;
       const [lng, lat] = tower.location.coordinates;
-      const marker = L.marker([lat, lng], { icon: TOWER_ICON, draggable: draggableAllowed });
+      const marker = L.marker([lat, lng], {
+        icon: towerIcon({ icon: tower.resolved_icon, color: tower.resolved_color }),
+        draggable: draggableAllowed,
+      });
       marker.bindTooltip(tower.name);
       marker.on('dragstart', () => this.hideSnapIndicator());
       marker.on('drag', (ev) => {

@@ -30,6 +30,7 @@ from game.models import (
     Tower,
     TowerLock,  # tower-locking
     TowerPhoto,
+    TowerType,
     Zone,
 )
 from game.scoping import (
@@ -124,6 +125,22 @@ class TowerPhotoSerializer(serializers.ModelSerializer):
             'captured_by', 'captured_by_username', 'captured_at',
         )
         read_only_fields = ('tower', 'captured_by', 'captured_at')
+
+
+class AdminTowerTypeSerializer(serializers.ModelSerializer):
+    """Tower type payload (tower-types)."""
+
+    tower_count = serializers.IntegerField(source='towers.count', read_only=True)
+
+    class Meta:
+        model = TowerType
+        fields = (
+            'id', 'name', 'slug', 'icon', 'color', 'proximity_meters',
+            'description', 'order', 'tower_count',
+        )
+
+    def validate_slug(self, value):
+        return value.strip().lower()
 
 
 class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
@@ -321,6 +338,17 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         write_only=True, required=False, allow_null=True,
     )
     photos = TowerPhotoSerializer(many=True, read_only=True)
+    # tower-types. The nullable `icon`/`color` say what the curator
+    # chose (blank = inherit); the resolved pair says what to paint.
+    # Both are served because an editor needs the first and every map
+    # needs the second — and four clients re-implementing
+    # tower-over-type-over-default is four chances to differ in a way
+    # that shows up as a slightly wrong colour on one screen.
+    resolved_icon = serializers.CharField(read_only=True)
+    resolved_color = serializers.CharField(read_only=True)
+    tower_type_name = serializers.CharField(
+        source='tower_type.name', read_only=True, default=None,
+    )
 
     class Meta:
         model = Tower
@@ -332,6 +360,9 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
             'discoverability', 'challenge_visibility',
             'initial_bonus', 'rfid_code',
             'location', 'lat', 'lng', 'authored_accuracy_m',
+            # tower-types: the choice, and the resolution of it.
+            'tower_type', 'tower_type_name', 'icon', 'color',
+            'resolved_icon', 'resolved_color',
             'collection', 'photos', 'collections', 'games',
         )
 
@@ -575,6 +606,19 @@ class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewset
         instance.delete()
 
 
+class AdminTowerTypeViewSet(viewsets.ModelViewSet):
+    """Staff-only CRUD for tower types (tower-types).
+
+    Deleting a type does not take its towers with it: the FK is
+    `SET_NULL`, so they fall back to the untyped defaults. A library
+    should survive someone tidying its vocabulary.
+    """
+
+    permission_classes = [IsAdminUser]
+    queryset = TowerType.objects.all()
+    serializer_class = AdminTowerTypeSerializer
+
+
 class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
     """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
@@ -590,7 +634,11 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
     """
 
     permission_classes = [IsAdminUser]
-    queryset = Tower.objects.all().order_by('name').prefetch_related('photos__captured_by')
+    queryset = (
+        Tower.objects.all().order_by('name')
+        .select_related('tower_type')
+        .prefetch_related('photos__captured_by')
+    )
     serializer_class = AdminTowerSerializer
 
     def get_queryset(self):

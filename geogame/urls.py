@@ -30,6 +30,7 @@ from game.admin_api import (
     AdminTeamGroupList,
     AdminTeamMembershipViewSet,
     AdminTeamViewSet,
+    AdminTowerTypeViewSet,
     AdminTowerViewSet,
     AdminZoneViewSet,
     ResetScoresView,
@@ -60,6 +61,7 @@ from game.discovery_api import (
     DiscoveryPingView,
     StaffRevealView,
 )
+from game.library_api import StaffLibraryView
 from game.location_api import (
     LocationConsentView,
     LocationLiveView,
@@ -120,6 +122,10 @@ router.register(r'team_tower_challenges', TeamTowerChallengeViewSet)
 admin_router = routers.DefaultRouter()
 admin_router.register(r'zones', AdminZoneViewSet, basename='admin-zone')
 admin_router.register(r'towers', AdminTowerViewSet, basename='admin-tower')
+# tower-types: the kind-of-place lookup towers are styled and defaulted from.
+admin_router.register(
+    r'tower-types', AdminTowerTypeViewSet, basename='admin-tower-type',
+)
 admin_router.register(r'teams', AdminTeamViewSet, basename='admin-team')
 admin_router.register(
     r'team-groups', AdminTeamGroupList, basename='admin-team-group',
@@ -203,6 +209,8 @@ urlpatterns = [
         StaffSessionReplayView.as_view(),
         name='api-staff-session-replay',
     ),
+    # library-map: the whole repository, drawable in one request.
+    path('api/staff/library/', StaffLibraryView.as_view(), name='api-staff-library'),
     # live-overview: one snapshot per Session for the big-screen view,
     # plus the revocable share links that address it without an account.
     path(

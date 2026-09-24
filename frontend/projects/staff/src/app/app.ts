@@ -50,8 +50,9 @@ export const NAV_SECTIONS: NavSection[] = [
     items: [
       { label: 'Map editor', link: '/map-editor', icon: 'bi-pencil-square' },
       { label: 'Towers', link: '/towers', icon: 'bi-geo-alt' },
+      { label: 'Tower types', link: '/tower-types', icon: 'bi-tags' },
       { label: 'Zones', link: '/zones', icon: 'bi-bounding-box' },
-      { label: 'Collections', link: '/collections', icon: 'bi-collection' },
+      { label: 'Library', link: '/library', icon: 'bi-collection' },
       { label: 'Challenges', link: '/challenges', icon: 'bi-puzzle' },
       { label: 'Trails', link: '/trails', icon: 'bi-signpost-split' },
       { label: 'NFC tags', link: '/nfc-tags', icon: 'bi-tag' },
