@@ -11,6 +11,12 @@ media/*
 .env
 .envrc
 dump*sql
+# Database dumps carry production data, including real people's names.
+# They belong on the machine doing the import, never in git history.
+# (Deliberately not a bare `*.sql`, so a hand-written script can still
+# be tracked.)
+*.dump
+*.sql.gz
 geogame/local_settings*.py
 cercetador/local_settings*
 

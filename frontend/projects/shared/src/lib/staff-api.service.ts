@@ -1,4 +1,4 @@
-import { HttpClient } from '@angular/common/http';
+import { HttpClient, HttpResponse } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
@@ -858,6 +858,47 @@ export class StaffApiService {
   }
 
   // ---- Games ---------------------------------------------------------------
+
+  // ---- Content bundles (content-portability) ------------------------------
+
+  /**
+   * Export a selection as a bundle.
+   *
+   * POST, not GET: the selection is two lists of ids. The whole response
+   * is returned so the caller can read the filename the server chose.
+   */
+  exportBundle(
+    gameIds: number[],
+    collectionIds: number[],
+  ): Observable<HttpResponse<Blob>> {
+    return this.http.post(
+      '/api/staff/bundles/export/',
+      { games: gameIds, collections: collectionIds },
+      { responseType: 'blob', observe: 'response' },
+    );
+  }
+
+  /** What a bundle holds and what importing it would do. Writes nothing. */
+  inspectBundle(file: File, mode: BundleImportMode): Observable<BundleInspection> {
+    return this.http.post<BundleInspection>(
+      '/api/staff/bundles/inspect/',
+      this.bundleForm(file, mode),
+    );
+  }
+
+  importBundle(file: File, mode: BundleImportMode): Observable<BundleImportReport> {
+    return this.http.post<BundleImportReport>(
+      '/api/staff/bundles/import/',
+      this.bundleForm(file, mode),
+    );
+  }
+
+  private bundleForm(file: File, mode: BundleImportMode): FormData {
+    const form = new FormData();
+    form.append('file', file);
+    form.append('mode', mode);
+    return form;
+  }
 
   listGames(): Observable<AdminGame[]> {
     return this.http.get<AdminGame[]>('/api/staff/games/');
@@ -1796,4 +1837,45 @@ export interface OverviewLink {
   created_by: string | null;
   path: string;
   url: string;
+}
+// ---- Content bundles (content-portability) ----------------------------------
+
+/** How an import treats content this install already holds. */
+export type BundleImportMode = 'sync' | 'copy';
+
+export interface BundleKindSummary {
+  kind: string;
+  label: string;
+  in_bundle: number;
+  already_here: number;
+  would_create: number;
+  would_update: number;
+}
+
+export interface BundleSlugCollision {
+  kind: string;
+  slug: string;
+  /** What holds that slug here, so the warning names something human. */
+  name: string;
+  incoming_uuid: string;
+}
+
+export interface BundleInspection {
+  format_version: number;
+  exported_at: string;
+  selection: { games: string[]; collections: string[] };
+  mode: BundleImportMode;
+  kinds: BundleKindSummary[];
+  slug_collisions: BundleSlugCollision[];
+  media_files: number;
+}
+
+export interface BundleImportReport {
+  mode: BundleImportMode;
+  created: Record<string, number>;
+  updated: Record<string, number>;
+  conflicts: { kind: string; message: string }[];
+  media: number;
+  total_created: number;
+  total_updated: number;
 }

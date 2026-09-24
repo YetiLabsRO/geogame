@@ -27,6 +27,14 @@ Guidance for Claude Code when working in this repository.
 # Migrations
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py migrate
 /home/yeti/.virtualenvs/cercetador/bin/python manage.py makemigrations
+
+# Content portability — move maps/game templates between installs
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py export_bundle --game <slug> -o bundle.zip
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_bundle bundle.zip --dry-run
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_bundle bundle.zip --mode sync|copy
+
+# Import a pre-Session production dump into a Collection + Game
+/home/yeti/.virtualenvs/cercetador/bin/python manage.py import_legacy_dump <dump> --collection "<name>" --game "<name>"
 ```
 
 VS Code launch configs in [.vscode/launch.json](.vscode/launch.json) wrap these with the debugger.

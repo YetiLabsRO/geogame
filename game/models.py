@@ -1,5 +1,6 @@
 import math
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from colorfield.fields import ColorField
@@ -188,6 +189,12 @@ class Zone(models.Model):
         (SCORE_BONUS, "Putine punct la început, tot mai multe apoi (bonus)")
     ]
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
 
     color = ColorField(default="#000000", max_length=18)
@@ -299,6 +306,12 @@ class TowerType(models.Model):
     it is physical, a fountain being a smaller target than a hilltop.
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=80, unique=True)
     # A Bootstrap Icons class name, the icon vocabulary the staff app
@@ -333,6 +346,12 @@ class Tower(models.Model):
         (CATEGORY_NORMAL, "Normal"),
         (CATEGORY_RFID, "RFID")
     ]
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     name = models.CharField(max_length=255)
 
@@ -887,6 +906,12 @@ class TowerPhoto(models.Model):
     photos (several angles of the same fountain).
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='photos')
     image = models.ImageField(upload_to='tower_photos')
     caption = models.CharField(max_length=255, blank=True, default='')
@@ -916,6 +941,12 @@ class Collection(models.Model):
     `Game.collections`. A Tower or Zone may belong to any number of
     Collections; removing it from a Collection never deletes the row.
     """
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     name = models.CharField(max_length=255)
     slug = models.SlugField(max_length=80, unique=True)
@@ -971,6 +1002,12 @@ class PresenceRequirement(models.Model):
     `game.presence.resolve_presence`).
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     name = models.CharField(max_length=255)
     min_members_present = models.PositiveIntegerField(default=1)
     method = models.CharField(
@@ -995,6 +1032,12 @@ class PresenceRequirement(models.Model):
 
 
 class Challenge(models.Model):
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     # game is nullable at the column level through T3.1 so the data
     # migration can backfill; T3.2 tightens to NOT NULL once every row
     # is attached to a Game.
@@ -1960,6 +2003,12 @@ class Trail(models.Model):
     the Tower stays a reusable library asset carrying no trail data.
     """
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     game = models.OneToOneField(
         'organize.Game', on_delete=models.CASCADE, related_name='trail',
     )
@@ -2066,6 +2115,12 @@ class Trail(models.Model):
 class TrailStep(models.Model):
     """A node of the trail, geofenced at a repository Tower."""
 
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+
     trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='steps')
     tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='trail_steps')
     order = models.PositiveIntegerField(default=0)
@@ -2094,6 +2149,12 @@ class TrailStep(models.Model):
 
 class TrailEdge(models.Model):
     """Directed clue-bearing link between two steps (GRAPH branches)."""
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     trail = models.ForeignKey(Trail, on_delete=models.CASCADE, related_name='edges')
     from_step = models.ForeignKey(
@@ -2415,6 +2476,12 @@ class ScoreMultiplier(models.Model):
         (TYPE_SCHEDULED, 'Scheduled — Session-relative offset window'),
         (TYPE_RANDOM_BONUS, 'Random bonus — dropped live with an absolute window'),
     ]
+
+    # Portable identity (content-bundles): stable across databases, so
+    # content exported here is recognisable when it lands elsewhere.
+    # Minted once at creation and never rewritten — a rename or an edit
+    # must not fork the row.
+    uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
     game = models.ForeignKey(
         'organize.Game',

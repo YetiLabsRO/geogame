@@ -50,6 +50,11 @@ from game.badge_api import (
     StaffBadgeListView,
     StaffGatewayListView,
 )
+from game.bundles_api import (
+    StaffBundleExportView,
+    StaffBundleImportView,
+    StaffBundleInspectView,
+)
 from game.discovery_api import (
     DiscoveredTowersView,
     DiscoveryPingView,
@@ -353,6 +358,23 @@ urlpatterns = [
         'api/staff/gateways/',
         StaffGatewayListView.as_view(),
         name='api-staff-gateways',
+    ),
+    # content-bundles: move authored content between installs. Export is a
+    # POST because the selection is two lists of ids, not a URL's worth.
+    path(
+        'api/staff/bundles/export/',
+        StaffBundleExportView.as_view(),
+        name='api-staff-bundle-export',
+    ),
+    path(
+        'api/staff/bundles/inspect/',
+        StaffBundleInspectView.as_view(),
+        name='api-staff-bundle-inspect',
+    ),
+    path(
+        'api/staff/bundles/import/',
+        StaffBundleImportView.as_view(),
+        name='api-staff-bundle-import',
     ),
     path('api/staff/', include(admin_router.urls)),
     path(

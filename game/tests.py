@@ -20,10 +20,16 @@ Tests target the post-refactor structure:
     hardcoded categories). Each Game has its own set of TeamGroups.
 """
 import base64
+import io
 import json
 import math
+import tempfile
+import uuid
+import zipfile
 from datetime import datetime, timedelta
 from datetime import timezone as dt_timezone
+from io import StringIO
+from pathlib import Path
 from unittest.mock import patch
 from urllib.parse import urlencode
 
@@ -32,7 +38,9 @@ from channels.testing import HttpCommunicator, WebsocketCommunicator
 from django.contrib.auth import get_user_model
 from django.contrib.gis.geos import Point, Polygon
 from django.core.exceptions import ValidationError
+from django.core.files.uploadedfile import SimpleUploadedFile
 from django.core.management import call_command  # tower-locking
+from django.core.management.base import CommandError
 from django.db import IntegrityError, connection, transaction  # tower-locking
 from django.db.migrations.executor import MigrationExecutor
 from django.test import TestCase, TransactionTestCase, override_settings
@@ -42,6 +50,7 @@ from rest_framework.authtoken.models import Token
 from rest_framework.test import APIClient
 
 from game import (
+    bundles,  # content-bundles
     events,
     overview,  # live-overview
     replay,  # session-replay
@@ -114,6 +123,7 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     TowerDiscovery,
     TowerLock,
     TowerPhoto,
+    TowerType,  # content-bundles fixture
     Trail,
     TrailEdge,
     TrailStep,
@@ -3644,6 +3654,17 @@ class CloneGameTest(TestCase):
             payload or {},
             format='json',
         )
+
+    def test_clone_gets_its_own_portable_identity(self):
+        """content-bundles: a clone is a new template, not the same one.
+
+        `clone()` copies the instance and clears its pk, which silently
+        carried the source's uuid into a unique column and made every
+        clone fail. Cheap to assert, expensive to rediscover.
+        """
+        clone = self.game.clone(slug='identity-clone')
+        self.assertNotEqual(clone.uuid, self.game.uuid)
+        self.assertIsNotNone(clone.uuid)
 
     def test_clone_copies_template_and_shares_geometry(self):
         resp = self._clone()
@@ -12418,3 +12439,1090 @@ class OverviewShareSocketTest(TransactionTestCase):
         self.assertFalse(connected)
         self.assertEqual(code, 4401)
         await communicator.disconnect()
+
+
+# ---------------------------------------------------------------------------
+# content-bundles — portable export/import of authored content, and the
+# legacy-dump importer that brings in what predates the format.
+# ---------------------------------------------------------------------------
+
+
+def _bundle_fixture(slug='travelling'):
+    """A Game exercising every kind of content a bundle carries.
+
+    Deliberately wide rather than deep: one row of each kind is enough to
+    prove a reference survives the trip, and a fixture that omits a kind
+    is a kind nobody notices is broken.
+    """
+    game = _make_game(name='Travelling game', slug=slug)
+    game.mode = MODE_TRAIL
+    game.proximity_meters = 42
+    game.save()
+
+    fountain = TowerType.objects.create(
+        name='Fountain', slug=f'{slug}-fountain', icon='bi-droplet-fill',
+        color='#1F6FEB', proximity_meters=25,
+    )
+    zone = _make_zone(game, name='Old town')
+    other_zone = _make_zone(game, name='Riverside')
+    tower = _make_tower(game, name='Old Mill', zone=zone, lng=23.58, lat=46.07)
+    tower.zones.add(other_zone)
+    tower.tower_type = fountain
+    tower.initial_bonus = 7
+    tower.rfid_code = 'RFIDTRAVEL01'
+    tower.save()
+    second = _make_tower(game, name='Gate', zone=other_zone, lng=23.59, lat=46.08)
+
+    photo = TowerPhoto.objects.create(
+        tower=tower,
+        image=SimpleUploadedFile('mill.jpg', b'not-really-a-jpeg', 'image/jpeg'),
+        caption='From the bridge',
+    )
+
+    requirement = PresenceRequirement.objects.create(
+        name='Two together', min_members_present=2,
+    )
+    role = GameRole.objects.create(
+        game=game, name='Navigator', slug='navigator', description='Reads the map',
+    )
+    group = _make_group(game, name='Explo', slug='explo')
+
+    bound = Challenge.objects.create(
+        game=game, tower=tower, text='How many arches?', difficulty=2,
+        presence_requirement=requirement,
+    )
+    bound.required_roles.add(role)
+    floating = Challenge.objects.create(
+        game=game, tower=None, text='Name three knots.', difficulty=3,
+    )
+
+    multiplier = ScoreMultiplier.objects.create(
+        game=game, scope=ScoreMultiplier.SCOPE_TOWER, tower=tower,
+        multiplier_type=ScoreMultiplier.TYPE_SCHEDULED, factor=2.0,
+        window_start_offset=timedelta(minutes=30),
+        window_end_offset=timedelta(minutes=90),
+        label='Double at the mill',
+    )
+
+    trail = Trail.objects.create(game=game, structure=STRUCTURE_GRAPH)
+    step_one = TrailStep.objects.create(
+        trail=trail, tower=tower, order=1, is_start=True, gate_challenge=bound,
+        clue_text='Start at the water',
+    )
+    step_two = TrailStep.objects.create(
+        trail=trail, tower=second, order=2, is_finish=True,
+    )
+    edge = TrailEdge.objects.create(
+        trail=trail, from_step=step_one, to_step=step_two, clue='Follow the wall',
+    )
+
+    return {
+        'game': game, 'collection': _game_collection(game), 'type': fountain,
+        'zone': zone, 'other_zone': other_zone, 'tower': tower,
+        'second': second, 'photo': photo, 'requirement': requirement,
+        'role': role, 'group': group, 'bound': bound, 'floating': floating,
+        'multiplier': multiplier, 'trail': trail, 'step_one': step_one,
+        'step_two': step_two, 'edge': edge,
+    }
+
+
+def _zip_bytes(entries, payload=None):
+    """Build a raw archive, for the paths that must be refused."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, 'w') as archive:
+        if payload is not None:
+            archive.writestr(bundles.BUNDLE_JSON, json.dumps(payload))
+        for name, data in entries.items():
+            archive.writestr(name, data)
+    buffer.seek(0)
+    return buffer
+
+
+def _minimal_payload(**overrides):
+    payload = {
+        'format': bundles.FORMAT,
+        'format_version': bundles.FORMAT_VERSION,
+        'exported_at': '2026-09-24T00:00:00+00:00',
+        'selection': {'games': [], 'collections': []},
+        'content': {},
+    }
+    payload.update(overrides)
+    return payload
+
+
+class ContentBundleIdentityTest(TestCase):
+    """The uuid that makes a row recognisable after it travels."""
+
+    def test_rows_get_distinct_uuids(self):
+        game = _make_game(name='Ident')
+        zone = _make_zone(game)
+        other = _make_zone(game, name='Second')
+        self.assertIsNotNone(zone.uuid)
+        self.assertNotEqual(zone.uuid, other.uuid)
+
+    def test_uuid_survives_an_edit(self):
+        """The point of uuid4 over a content hash: editing is when
+        identity must NOT change."""
+        game = _make_game(name='Renaming')
+        tower = _make_tower(game, name='Before', zone=_make_zone(game))
+        original = tower.uuid
+        tower.name = 'After'
+        tower.save()
+        tower.refresh_from_db()
+        self.assertEqual(tower.uuid, original)
+
+    def test_every_bundled_model_carries_one(self):
+        for spec in bundles.manifest():
+            self.assertTrue(
+                hasattr(spec.model, 'uuid'),
+                f'{spec.model.__name__} is in the manifest without a uuid',
+            )
+
+    def test_the_backfill_migration_gave_existing_rows_distinct_uuids(self):
+        """Guards the three-step migration, whose one-step form silently
+        writes the same value into every row."""
+        executor = MigrationExecutor(connection)
+        migration = executor.loader.get_migration(
+            'game', '0042_content_bundle_uuids',
+        )
+        self.assertTrue(
+            any(
+                getattr(op, 'code', None) is not None
+                for op in migration.operations
+            ),
+            'the migration must backfill, not rely on the field default',
+        )
+
+
+class ContentBundleManifestTest(TestCase):
+    """The manifest is the whole contract; these are its invariants."""
+
+    def test_manifest_is_consistent(self):
+        bundles.validate_manifest()
+
+    def test_references_point_backwards(self):
+        order = {spec.key: i for i, spec in enumerate(bundles.manifest())}
+        for spec in bundles.manifest():
+            for name, target in {**spec.refs, **spec.m2m}.items():
+                self.assertLess(
+                    order[target], order[spec.key],
+                    f'{spec.key}.{name} -> {target} breaks the single-pass order',
+                )
+
+    def test_no_spec_exports_a_user_or_a_source_timestamp(self):
+        """Fields that mean nothing in another database must not travel,
+        and this has to hold for specs added later too."""
+        for spec in bundles.manifest():
+            names = {f.name for f in bundles.scalar_fields(spec)}
+            self.assertNotIn('created_at', names, spec.key)
+            self.assertNotIn('created_by', names, spec.key)
+            self.assertNotIn('captured_by', names, spec.key)
+            for f in spec.model._meta.concrete_fields:
+                if f.is_relation and f.related_model is User:
+                    self.assertNotIn(f.name, names, f'{spec.key}.{f.name}')
+
+    def test_a_missing_relation_declaration_is_an_error(self):
+        """The property that keeps this honest as models grow: a new FK
+        must be declared to travel or declared not to."""
+        spec = bundles.BundleSpec(key='towers', model=Tower)
+        with self.assertRaises(bundles.ManifestError):
+            bundles.MANIFEST.clear()
+            bundles.MANIFEST.extend([spec])
+            bundles.validate_manifest()
+        bundles.MANIFEST.clear()
+        bundles.validate_manifest()
+
+    def test_game_lands_inactive(self):
+        names = {
+            f.name for f in bundles.scalar_fields(bundles.spec_for('games'))
+        }
+        self.assertNotIn('is_active', names)
+
+
+class ContentBundleExportTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+
+    def _payload(self, **kwargs):
+        payload, _files = bundles.build_bundle(**kwargs)
+        return payload
+
+    def test_a_game_pulls_everything_it_needs(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        expected = {
+            'tower_types': 1, 'zones': 2, 'towers': 2, 'tower_photos': 1,
+            'collections': 1, 'presence_requirements': 1, 'games': 1,
+            'game_roles': 1, 'team_groups': 1, 'challenges': 2,
+            'score_multipliers': 1, 'trails': 1, 'trail_steps': 2,
+            'trail_edges': 1,
+        }
+        self.assertEqual({k: len(v) for k, v in content.items()}, expected)
+
+    def test_every_reference_is_a_uuid(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        for spec in bundles.manifest():
+            for row in content.get(spec.key, []):
+                for name in spec.refs:
+                    value = row[name]
+                    if value is not None:
+                        uuid.UUID(value)
+                for name in spec.m2m:
+                    for value in row[name]:
+                        uuid.UUID(value)
+
+    def test_a_collection_alone_carries_geometry_without_challenges(self):
+        content = self._payload(collections=[self.fx['collection']])['content']
+        self.assertEqual(len(content['towers']), 2)
+        self.assertEqual(len(content['zones']), 2)
+        self.assertNotIn('challenges', content)
+        self.assertNotIn('games', content)
+
+    def test_run_data_never_travels(self):
+        session = _default_session(self.fx['game'])
+        team = _make_team(self.fx['game'], self.fx['group'], name='Badgers')
+        self.fx['tower'].assign_to_team(team)
+        TeamTowerChallenge.objects.create(
+            team=team, tower=self.fx['tower'], challenge=self.fx['bound'],
+            outcome=TeamTowerChallenge.CONFIRMED,
+        )
+        ScoreMultiplier.objects.create(
+            session=session, scope=ScoreMultiplier.SCOPE_GLOBAL, factor=3.0,
+        )
+        payload = self._payload(games=[self.fx['game']])
+        blob = json.dumps(payload)
+        self.assertNotIn('Badgers', blob)
+        known = {spec.key for spec in bundles.manifest()}
+        self.assertTrue(set(payload['content']) <= known)
+        # The Session-owned multiplier stayed behind; the Game-owned one came.
+        self.assertEqual(len(payload['content']['score_multipliers']), 1)
+        self.assertEqual(
+            payload['content']['score_multipliers'][0]['label'],
+            'Double at the mill',
+        )
+
+    def test_geometry_is_geojson(self):
+        content = self._payload(games=[self.fx['game']])['content']
+        tower = next(
+            row for row in content['towers'] if row['name'] == 'Old Mill'
+        )
+        self.assertEqual(tower['location']['type'], 'Point')
+        self.assertAlmostEqual(tower['location']['coordinates'][0], 23.58)
+        zone = content['zones'][0]
+        self.assertEqual(zone['shape']['type'], 'Polygon')
+
+    def test_media_is_carried(self):
+        _payload, files = bundles.build_bundle(games=[self.fx['game']])
+        self.assertEqual(len(files), 1)
+        arcname, data = next(iter(files.items()))
+        self.assertTrue(arcname.startswith(bundles.MEDIA_ROOT))
+        self.assertEqual(data, b'not-really-a-jpeg')
+
+    def test_a_photo_whose_file_vanished_does_not_fail_the_export(self):
+        self.fx['photo'].image.storage.delete(self.fx['photo'].image.name)
+        payload, files = bundles.build_bundle(games=[self.fx['game']])
+        self.assertEqual(files, {})
+        self.assertIsNone(payload['content']['tower_photos'][0]['image'])
+
+
+class ContentBundleImportTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, self.payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _bundle(self):
+        return bundles.read_bundle(io.BytesIO(self.archive_bytes))
+
+    def _wipe(self):
+        """Remove the exported content, leaving an install that has none."""
+        Game.objects.all().delete()
+        Challenge.objects.all().delete()
+        Tower.objects.all().update(autocreate_zone=False)
+        Zone.objects.all().delete()
+        Tower.objects.all().delete()
+        Collection.objects.all().delete()
+        TowerType.objects.all().delete()
+        PresenceRequirement.objects.all().delete()
+
+    def test_import_into_an_install_that_holds_none_of_it(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.updated, {})
+        game = Game.objects.get(slug='travelling')
+        self.assertEqual(game.uuid, self.fx['game'].uuid)
+        self.assertEqual(game.mode, MODE_TRAIL)
+        self.assertEqual(game.proximity_meters, 42)
+        # every reference resolved locally
+        tower = Tower.objects.get(name='Old Mill')
+        self.assertEqual(tower.tower_type.name, 'Fountain')
+        self.assertEqual(
+            sorted(z.name for z in tower.zones.all()), ['Old town', 'Riverside'],
+        )
+        self.assertEqual(
+            sorted(c.slug for c in game.collections.all()),
+            [self.fx['collection'].slug],
+        )
+        bound = Challenge.objects.get(text='How many arches?')
+        self.assertEqual(bound.tower_id, tower.id)
+        self.assertEqual(bound.game_id, game.id)
+        self.assertEqual(bound.presence_requirement.name, 'Two together')
+        self.assertEqual(
+            [r.slug for r in bound.required_roles.all()], ['navigator'],
+        )
+        self.assertIsNone(Challenge.objects.get(text='Name three knots.').tower_id)
+        trail = Trail.objects.get(game=game)
+        self.assertEqual(trail.structure, STRUCTURE_GRAPH)
+        step = TrailStep.objects.get(trail=trail, order=1)
+        self.assertEqual(step.tower_id, tower.id)
+        self.assertEqual(step.gate_challenge_id, bound.id)
+        edge = TrailEdge.objects.get(trail=trail)
+        self.assertEqual(edge.from_step.order, 1)
+        self.assertEqual(edge.to_step.order, 2)
+        multiplier = ScoreMultiplier.objects.get(game=game)
+        self.assertEqual(multiplier.window_start_offset, timedelta(minutes=30))
+        self.assertEqual(multiplier.tower_id, tower.id)
+
+    def test_geometry_survives_the_round_trip(self):
+        original = Tower.objects.get(name='Old Mill').location
+        original_zone = Zone.objects.get(name='Old town').shape
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        landed = Tower.objects.get(name='Old Mill').location
+        self.assertAlmostEqual(landed.x, original.x, places=9)
+        self.assertAlmostEqual(landed.y, original.y, places=9)
+        self.assertEqual(landed.srid, 4326)
+        self.assertTrue(
+            Zone.objects.get(name='Old town').shape.equals_exact(
+                original_zone, tolerance=1e-9,
+            ),
+        )
+
+    def test_media_lands_as_a_stored_file(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.media, 1)
+        photo = TowerPhoto.objects.get(caption='From the bridge')
+        with photo.image.open('rb') as fh:
+            self.assertEqual(fh.read(), b'not-really-a-jpeg')
+
+    def test_reimport_updates_in_place(self):
+        game = self.fx['game']
+        game.name = 'Locally renamed'
+        game.proximity_meters = 99
+        game.save()
+        before = Tower.objects.count()
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        self.assertEqual(report.created, {})
+        self.assertEqual(Tower.objects.count(), before)
+        self.assertEqual(Game.objects.count(), 1)
+        game.refresh_from_db()
+        self.assertEqual(game.name, 'Travelling game')
+        self.assertEqual(game.proximity_meters, 42)
+
+    def test_copy_mode_lands_a_second_independent_copy(self):
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(report.updated, {})
+        self.assertEqual(Game.objects.count(), 2)
+        self.assertEqual(Tower.objects.count(), 4)
+        copy = Game.objects.exclude(pk=self.fx['game'].pk).get()
+        self.assertEqual(copy.slug, 'travelling-2')
+        self.assertNotEqual(copy.uuid, self.fx['game'].uuid)
+        # the original is untouched
+        self.fx['game'].refresh_from_db()
+        self.assertEqual(self.fx['game'].slug, 'travelling')
+        self.assertEqual(self.fx['game'].collections.count(), 1)
+        # and the copy points only at its own geometry
+        copied_tower_ids = set(copy.towers().values_list('pk', flat=True))
+        self.assertTrue(copied_tower_ids.isdisjoint(
+            set(self.fx['game'].towers().values_list('pk', flat=True)),
+        ))
+        copied_challenge = Challenge.objects.get(
+            game=copy, text='How many arches?',
+        )
+        self.assertIn(copied_challenge.tower_id, copied_tower_ids)
+
+    def test_copy_mode_does_not_autocreate_zones(self):
+        """`Tower.save()` conjures a circle for a tower with no zones,
+        which during an import is every tower until its m2m lands."""
+        self.fx['tower'].autocreate_zone = True
+        self.fx['tower'].save()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        before = Zone.objects.count()
+        with bundles.read_bundle(buffer) as bundle:
+            bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(Zone.objects.count(), before + 2)
+        copied = Tower.objects.filter(
+            name='Old Mill',
+        ).exclude(pk=self.fx['tower'].pk).get()
+        self.assertTrue(copied.autocreate_zone)
+        self.assertEqual(copied.zones.count(), 2)
+
+    def test_an_rfid_collision_keeps_the_incumbent(self):
+        self._wipe()
+        squatter = Tower.objects.create(
+            name='Squatter', location=Point(23.0, 46.0), is_active=True,
+            category=Tower.CATEGORY_NORMAL, rfid_code='RFIDTRAVEL01',
+        )
+        with self._bundle() as bundle:
+            report = bundles.import_bundle(bundle)
+        squatter.refresh_from_db()
+        self.assertEqual(squatter.rfid_code, 'RFIDTRAVEL01')
+        arrived = Tower.objects.get(name='Old Mill')
+        self.assertIsNone(arrived.rfid_code)
+        self.assertTrue(
+            any('RFIDTRAVEL01' in c['message'] for c in report.conflicts),
+        )
+
+    def test_a_slug_held_by_a_different_row_refuses_the_import(self):
+        self._wipe()
+        Game.objects.create(name='Someone else', slug='travelling')
+        with self._bundle() as bundle:
+            with self.assertRaises(bundles.BundleError) as caught:
+                bundles.import_bundle(bundle)
+        self.assertIn('travelling', str(caught.exception))
+        self.assertEqual(Tower.objects.count(), 0)
+
+    def test_a_failure_rolls_the_whole_import_back(self):
+        self._wipe()
+        counts = (Tower.objects.count(), Zone.objects.count())
+        with self._bundle() as bundle:
+            # A challenge pointing at a tower nobody has: the failure
+            # happens after zones and towers have been written.
+            bundle.payload['content']['challenges'][0]['tower'] = str(uuid.uuid4())
+            with self.assertRaises(bundles.BundleError):
+                bundles.import_bundle(bundle)
+        self.assertEqual(
+            (Tower.objects.count(), Zone.objects.count()), counts,
+        )
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_export_import_export_is_stable(self):
+        """Round-tripped content re-exports identically.
+
+        Media is compared by its bytes rather than by its archive path:
+        storage names the file it stores, so the path is expected to
+        differ and the content is not.
+        """
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        again, _payload = bundles.export_bundle(
+            games=[Game.objects.get(slug='travelling')],
+        )
+        first = _normalised(zipfile.ZipFile(io.BytesIO(self.archive_bytes)))
+        second = _normalised(zipfile.ZipFile(again))
+        self.assertEqual(first, second)
+
+    def test_an_unknown_mode_is_refused(self):
+        with self._bundle() as bundle:
+            with self.assertRaises(bundles.BundleError):
+                bundles.import_bundle(bundle, mode='merge-somehow')
+
+
+def _normalised(archive):
+    """A bundle's content, comparable across two exports.
+
+    Rows are ordered by uuid (row order is not content), the export
+    timestamp is dropped, and every file reference is replaced by the
+    bytes it points at — the archive path is chosen by storage on
+    arrival and is expected to change.
+    """
+    content = json.loads(archive.read(bundles.BUNDLE_JSON))['content']
+    out = {}
+    for spec in bundles.manifest():
+        rows = content.get(spec.key)
+        if rows is None:
+            continue
+        copied = []
+        for row in rows:
+            row = dict(row)
+            for name in spec.files:
+                row[name] = archive.read(row[name]) if row.get(name) else None
+            copied.append(row)
+        out[spec.key] = sorted(copied, key=lambda r: r['uuid'])
+    return out
+
+
+class ContentBundleReadSafetyTest(TestCase):
+    """An archive from elsewhere is input, not instructions."""
+
+    def test_a_non_zip_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(io.BytesIO(b'this is not a zip at all'))
+
+    def test_an_archive_without_bundle_json_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(_zip_bytes({'media/x.jpg': b'x'}))
+
+    def test_a_path_traversal_entry_is_refused(self):
+        for name in ('../escape.txt', '/etc/passwd', 'media/../../x'):
+            with self.subTest(name=name):
+                with self.assertRaises(bundles.BundleError):
+                    bundles.read_bundle(
+                        _zip_bytes({name: b'x'}, payload=_minimal_payload()),
+                    )
+
+    def test_an_unexpected_entry_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(
+                _zip_bytes({'run.sh': b'#!/bin/sh'}, payload=_minimal_payload()),
+            )
+
+    def test_too_many_entries_are_refused(self):
+        entries = {
+            f'media/{i}.jpg': b'x' for i in range(bundles.MAX_ENTRIES + 2)
+        }
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(_zip_bytes(entries, payload=_minimal_payload()))
+
+    def test_an_oversized_expansion_is_refused(self):
+        with patch.object(bundles, 'MAX_UNCOMPRESSED_BYTES', 64):
+            with self.assertRaises(bundles.BundleError):
+                bundles.read_bundle(
+                    _zip_bytes(
+                        {'media/big.jpg': b'x' * 4096},
+                        payload=_minimal_payload(),
+                    ),
+                )
+
+    def test_a_future_format_version_is_refused_by_name(self):
+        with self.assertRaises(bundles.BundleError) as caught:
+            bundles.read_bundle(
+                _zip_bytes({}, payload=_minimal_payload(format_version=99)),
+            )
+        self.assertIn('99', str(caught.exception))
+        self.assertIn(str(bundles.FORMAT_VERSION), str(caught.exception))
+
+    def test_another_format_is_refused(self):
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(
+                _zip_bytes({}, payload=_minimal_payload(format='something-else')),
+            )
+
+    def test_unreadable_json_is_refused(self):
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, 'w') as archive:
+            archive.writestr(bundles.BUNDLE_JSON, b'{not json')
+        buffer.seek(0)
+        with self.assertRaises(bundles.BundleError):
+            bundles.read_bundle(buffer)
+
+    def test_an_unknown_content_kind_is_refused(self):
+        with self.assertRaises(bundles.BundleError) as caught:
+            bundles.read_bundle(
+                _zip_bytes(
+                    {},
+                    payload=_minimal_payload(content={'wormholes': [{'uuid': '1'}]}),
+                ),
+            )
+        self.assertIn('wormholes', str(caught.exception))
+
+    def test_a_row_without_a_usable_uuid_is_refused(self):
+        for rows in ([{'name': 'no uuid'}], [{'uuid': 'not-a-uuid'}]):
+            with self.subTest(rows=rows):
+                with self.assertRaises(bundles.BundleError):
+                    bundles.read_bundle(
+                        _zip_bytes({}, payload=_minimal_payload(
+                            content={'zones': rows},
+                        )),
+                    )
+
+
+class ContentBundleInspectTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _inspect(self, mode=bundles.MODE_SYNC):
+        with bundles.read_bundle(io.BytesIO(self.archive_bytes)) as bundle:
+            return bundles.inspect_bundle(bundle, mode=mode)
+
+    def test_reports_what_is_already_here(self):
+        inspection = self._inspect()
+        by_kind = {k['kind']: k for k in inspection['kinds']}
+        self.assertEqual(by_kind['towers']['in_bundle'], 2)
+        self.assertEqual(by_kind['towers']['already_here'], 2)
+        self.assertEqual(by_kind['towers']['would_create'], 0)
+        self.assertEqual(by_kind['towers']['would_update'], 2)
+        self.assertEqual(inspection['media_files'], 1)
+        self.assertEqual(inspection['selection']['games'], ['travelling'])
+
+    def test_copy_mode_would_create_everything(self):
+        by_kind = {k['kind']: k for k in self._inspect(bundles.MODE_COPY)['kinds']}
+        self.assertEqual(by_kind['towers']['would_create'], 2)
+        self.assertEqual(by_kind['towers']['would_update'], 0)
+
+    def test_reports_slug_collisions(self):
+        Game.objects.filter(pk=self.fx['game'].pk).delete()
+        Game.objects.create(name='Impostor', slug='travelling')
+        collisions = self._inspect()['slug_collisions']
+        self.assertEqual(len(collisions), 1)
+        self.assertEqual(collisions[0]['slug'], 'travelling')
+        self.assertEqual(collisions[0]['kind'], 'games')
+
+    def test_copy_mode_reports_no_collisions_because_it_suffixes(self):
+        self.assertEqual(self._inspect(bundles.MODE_COPY)['slug_collisions'], [])
+
+    def test_inspection_writes_nothing(self):
+        before = {
+            model.__name__: model.objects.count()
+            for model in (Game, Tower, Zone, Challenge, Collection, TowerPhoto)
+        }
+        self._inspect()
+        self._inspect(bundles.MODE_COPY)
+        after = {
+            model.__name__: model.objects.count()
+            for model in (Game, Tower, Zone, Challenge, Collection, TowerPhoto)
+        }
+        self.assertEqual(before, after)
+
+
+class ContentBundleCommandTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        self.path = Path(tempfile.mkdtemp()) / 'bundle.zip'
+
+    def test_export_then_import(self):
+        out = StringIO()
+        call_command(
+            'export_bundle', '--game', 'travelling',
+            '-o', str(self.path), stdout=out,
+        )
+        self.assertIn('towers', out.getvalue())
+        self.assertTrue(self.path.exists())
+
+        out = StringIO()
+        call_command(
+            'import_bundle', str(self.path), '--mode', 'copy', stdout=out,
+        )
+        self.assertIn('created', out.getvalue())
+        self.assertEqual(Game.objects.count(), 2)
+
+    def test_export_by_id_and_by_slug_agree(self):
+        by_slug = Path(tempfile.mkdtemp()) / 'a.zip'
+        by_id = Path(tempfile.mkdtemp()) / 'b.zip'
+        call_command('export_bundle', '--game', 'travelling', '-o', str(by_slug))
+        call_command(
+            'export_bundle', '--game', str(self.fx['game'].pk), '-o', str(by_id),
+        )
+        first = json.loads(zipfile.ZipFile(by_slug).read(bundles.BUNDLE_JSON))
+        second = json.loads(zipfile.ZipFile(by_id).read(bundles.BUNDLE_JSON))
+        self.assertEqual(first['content'].keys(), second['content'].keys())
+
+    def test_export_needs_a_selection(self):
+        with self.assertRaises(CommandError):
+            call_command('export_bundle', '-o', str(self.path))
+
+    def test_export_names_what_it_could_not_find(self):
+        with self.assertRaises(CommandError) as caught:
+            call_command('export_bundle', '--game', 'no-such-game', '-o', str(self.path))
+        self.assertIn('no-such-game', str(caught.exception))
+
+    def test_dry_run_writes_nothing(self):
+        call_command('export_bundle', '--game', 'travelling', '-o', str(self.path))
+        Game.objects.all().delete()
+        out = StringIO()
+        call_command('import_bundle', str(self.path), '--dry-run', stdout=out)
+        self.assertIn('Nothing was written', out.getvalue())
+        self.assertEqual(Game.objects.count(), 0)
+
+    def test_an_unreadable_bundle_is_a_command_error(self):
+        bad = Path(tempfile.mkdtemp()) / 'bad.zip'
+        bad.write_bytes(b'nope')
+        with self.assertRaises(CommandError):
+            call_command('import_bundle', str(bad))
+
+
+class ContentBundleApiTest(TestCase):
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        self.client_staff, _staff = _staff_client()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _upload(self, data=None):
+        return SimpleUploadedFile(
+            'bundle.zip', data if data is not None else self.archive_bytes,
+            'application/zip',
+        )
+
+    def test_export_returns_a_zip(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [self.fx['game'].pk], 'collections': []},
+            format='json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response['Content-Type'], 'application/zip')
+        self.assertIn('attachment', response['Content-Disposition'])
+        payload = json.loads(
+            zipfile.ZipFile(io.BytesIO(response.content)).read(bundles.BUNDLE_JSON),
+        )
+        self.assertEqual(payload['selection']['games'], ['travelling'])
+
+    def test_export_needs_a_selection(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [], 'collections': []}, format='json',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_export_of_an_unknown_id_is_404(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-export'),
+            {'games': [99999], 'collections': []}, format='json',
+        )
+        self.assertEqual(response.status_code, 404)
+
+    def test_inspect_changes_nothing(self):
+        before = Tower.objects.count()
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-inspect'),
+            {'file': self._upload(), 'mode': 'sync'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['format_version'], bundles.FORMAT_VERSION)
+        self.assertTrue(response.data['kinds'])
+        self.assertEqual(Tower.objects.count(), before)
+
+    def test_import_applies_and_reports(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(), 'mode': 'copy'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data['mode'], 'copy')
+        self.assertEqual(response.data['created']['games'], 1)
+        self.assertEqual(Game.objects.count(), 2)
+
+    def test_a_bad_bundle_is_a_400_not_a_500(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(b'not a zip')}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn('detail', response.data)
+
+    def test_a_bad_mode_is_refused(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'),
+            {'file': self._upload(), 'mode': 'whatever'}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_import_without_a_file_is_refused(self):
+        response = self.client_staff.post(
+            reverse('api-staff-bundle-import'), {}, format='multipart',
+        )
+        self.assertEqual(response.status_code, 400)
+
+    def test_every_endpoint_is_staff_only(self):
+        session = _default_session(self.fx['game'])
+        team = _make_team(self.fx['game'], self.fx['group'])
+        team.session = session
+        team.save()
+        player, _user = _authed_client(team, username='player-bundles')
+        anon = APIClient()
+        for name in (
+            'api-staff-bundle-export',
+            'api-staff-bundle-inspect',
+            'api-staff-bundle-import',
+        ):
+            url = reverse(name)
+            with self.subTest(endpoint=name):
+                self.assertIn(anon.post(url, {}).status_code, (401, 403))
+                self.assertIn(player.post(url, {}).status_code, (401, 403))
+
+
+LEGACY_SCHEMA = """
+CREATE TABLE geogame_zone (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    color varchar(18) NOT NULL,
+    scoring_type smallint NOT NULL,
+    shape geometry(Polygon, 4326)
+);
+CREATE TABLE geogame_tower (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    location geometry(Point, 4326) NOT NULL,
+    category smallint NOT NULL,
+    is_active boolean NOT NULL,
+    zone_id integer NOT NULL,
+    rfid_code varchar(16)
+);
+CREATE TABLE geogame_challenge (
+    id integer PRIMARY KEY,
+    text text NOT NULL,
+    difficulty smallint NOT NULL,
+    tower_id integer
+);
+CREATE TABLE geogame_team (
+    id integer PRIMARY KEY,
+    name varchar(255) NOT NULL,
+    category smallint NOT NULL
+);
+"""
+
+LEGACY_ROWS = """
+INSERT INTO geogame_zone VALUES
+  (1, 'Z1', '#112233', 1,
+   ST_GeomFromText('POLYGON((23.0 46.0, 23.1 46.0, 23.1 46.1, 23.0 46.1, 23.0 46.0))', 4326)),
+  (2, 'BZ2', '#000000', 4,
+   ST_GeomFromText('POLYGON((23.2 46.2, 23.3 46.2, 23.3 46.3, 23.2 46.3, 23.2 46.2))', 4326));
+INSERT INTO geogame_tower VALUES
+  (10, 'Cetate', ST_SetSRID(ST_MakePoint(23.05, 46.05), 4326), 1, true, 1, NULL),
+  (11, E'Trei m\\u0103gari\\n', ST_SetSRID(ST_MakePoint(23.06, 46.06), 4326), 1, true, 1, NULL),
+  (12, 'Poarta', ST_SetSRID(ST_MakePoint(23.25, 46.25), 4326), 2, false, 2, 'LEGACYCODE01'),
+  (13, 'Orphan', ST_SetSRID(ST_MakePoint(23.26, 46.26), 4326), 1, true, 99, NULL);
+INSERT INTO geogame_challenge VALUES
+  (100, 'How many gates?', 2, 10),
+  (101, 'Name three knots.', 3, NULL),
+  (102, 'Challenge for a tower that is not here', 1, 555);
+INSERT INTO geogame_team VALUES
+  (1, 'Pisicile', 1), (2, 'Inferno', 2), (3, 'Redu', 3), (4, 'Second explo', 1);
+"""
+
+
+class LegacyDumpImportTest(TransactionTestCase):
+    """The pre-Session schema, mapped onto the current one.
+
+    Reads through `--from-db` against legacy tables created inside the
+    test database: their names (`geogame_*`) cannot collide with the
+    current schema's (`game_*`), and it exercises the real SQL the
+    command runs rather than a stand-in for it.
+    """
+
+    def setUp(self):
+        with connection.cursor() as cursor:
+            cursor.execute(LEGACY_SCHEMA)
+            cursor.execute(LEGACY_ROWS)
+        self.dbname = connection.settings_dict['NAME']
+
+    def tearDown(self):
+        with connection.cursor() as cursor:
+            cursor.execute(
+                'DROP TABLE IF EXISTS geogame_zone, geogame_tower, '
+                'geogame_challenge, geogame_team CASCADE',
+            )
+
+    def _import(self, **kwargs):
+        out = StringIO()
+        options = {
+            'from_db': self.dbname,
+            'collection': 'Legacy map',
+            'game': 'Legacy game',
+            'stdout': out,
+            **kwargs,
+        }
+        call_command('import_legacy_dump', **options)
+        return out.getvalue()
+
+    def test_zones_towers_and_challenges_land(self):
+        self._import()
+        collection = Collection.objects.get(name='Legacy map')
+        game = Game.objects.get(name='Legacy game')
+        self.assertEqual(collection.zones.count(), 2)
+        self.assertEqual(collection.towers.count(), 4)
+        self.assertIn(collection, game.collections.all())
+
+        zone = Zone.objects.get(name='Z1')
+        self.assertEqual(zone.color, '#112233')
+        self.assertEqual(zone.scoring_type, 1)
+        self.assertAlmostEqual(zone.shape.centroid.x, 23.05, places=6)
+        self.assertEqual(Zone.objects.get(name='BZ2').scoring_type, 4)
+
+        tower = Tower.objects.get(name='Cetate')
+        self.assertAlmostEqual(tower.location.x, 23.05)
+        self.assertEqual(tower.category, Tower.CATEGORY_NORMAL)
+        self.assertTrue(tower.is_active)
+        self.assertEqual([z.name for z in tower.zones.all()], ['Z1'])
+
+        gate = Tower.objects.get(name='Poarta')
+        self.assertEqual(gate.category, Tower.CATEGORY_RFID)
+        self.assertFalse(gate.is_active)
+        self.assertEqual(gate.rfid_code, 'LEGACYCODE01')
+        self.assertEqual([z.name for z in gate.zones.all()], ['BZ2'])
+
+    def test_legacy_names_are_stripped(self):
+        self._import()
+        self.assertTrue(Tower.objects.filter(name='Trei măgari').exists())
+
+    def test_a_tower_bound_challenge_keeps_its_tower(self):
+        self._import()
+        challenge = Challenge.objects.get(text='How many gates?')
+        self.assertEqual(challenge.tower.name, 'Cetate')
+        self.assertEqual(challenge.game.name, 'Legacy game')
+        self.assertEqual(challenge.difficulty, 2)
+
+    def test_a_challenge_with_no_tower_becomes_game_wide(self):
+        output = self._import()
+        challenge = Challenge.objects.get(text='Name three knots.')
+        self.assertIsNone(challenge.tower_id)
+        self.assertEqual(challenge.game.name, 'Legacy game')
+        self.assertIn('game-wide', output)
+
+    def test_a_challenge_for_a_missing_tower_is_skipped_and_reported(self):
+        output = self._import()
+        self.assertFalse(
+            Challenge.objects.filter(
+                text='Challenge for a tower that is not here',
+            ).exists(),
+        )
+        self.assertIn('555', output)
+
+    def test_a_tower_naming_a_missing_zone_still_lands(self):
+        output = self._import()
+        orphan = Tower.objects.get(name='Orphan')
+        self.assertEqual(orphan.zones.count(), 0)
+        self.assertIn('99', output)
+
+    def test_team_categories_become_team_groups_and_teams_do_not_travel(self):
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        self.assertEqual(
+            sorted(TeamGroup.objects.filter(game=game).values_list('slug', flat=True)),
+            ['explo', 'seniori', 'temerari'],
+        )
+        self.assertFalse(Team.objects.filter(name='Pisicile').exists())
+
+    def test_an_rfid_code_already_held_here_is_dropped_and_reported(self):
+        Tower.objects.create(
+            name='Incumbent', location=Point(22.0, 45.0), is_active=True,
+            category=Tower.CATEGORY_NORMAL, rfid_code='LEGACYCODE01',
+        )
+        output = self._import()
+        self.assertIsNone(Tower.objects.get(name='Poarta').rfid_code)
+        self.assertEqual(
+            Tower.objects.get(name='Incumbent').rfid_code, 'LEGACYCODE01',
+        )
+        self.assertIn('LEGACYCODE01', output)
+
+    def test_the_game_opens_on_the_imported_towers(self):
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        self.assertIsNotNone(game.base_point)
+        self.assertAlmostEqual(game.base_point.x, 23.155, places=3)
+        self.assertAlmostEqual(game.base_point.y, 46.155, places=3)
+
+    def test_rerunning_refuses_to_duplicate(self):
+        self._import()
+        with self.assertRaises(CommandError) as caught:
+            self._import()
+        self.assertIn('--replace', str(caught.exception))
+        self.assertEqual(Tower.objects.count(), 4)
+
+    def test_replace_replaces_rather_than_duplicating(self):
+        self._import()
+        first = set(Tower.objects.values_list('name', flat=True))
+        self._import(replace=True)
+        self.assertEqual(Tower.objects.count(), 4)
+        self.assertEqual(set(Tower.objects.values_list('name', flat=True)), first)
+        self.assertEqual(Collection.objects.filter(name='Legacy map').count(), 1)
+
+    def test_a_database_that_is_not_a_legacy_one_is_refused_before_writing(self):
+        self.tearDown()
+        with self.assertRaises(CommandError) as caught:
+            self._import()
+        self.assertIn('geogame_zone', str(caught.exception))
+        self.assertFalse(Collection.objects.filter(name='Legacy map').exists())
+        self.assertFalse(Game.objects.filter(name='Legacy game').exists())
+
+    def test_naming_both_a_dump_and_a_database_is_refused(self):
+        with self.assertRaises(CommandError):
+            call_command(
+                'import_legacy_dump', 'some.dump', '--from-db', self.dbname,
+                '--collection', 'X', '--game', 'Y',
+            )
+
+    def test_imported_content_can_then_be_exported_as_a_bundle(self):
+        """The two halves of this change, against each other."""
+        self._import()
+        game = Game.objects.get(name='Legacy game')
+        buffer, payload = bundles.export_bundle(games=[game])
+        self.assertEqual(len(payload['content']['towers']), 4)
+        self.assertEqual(len(payload['content']['challenges']), 2)
+        with bundles.read_bundle(buffer) as bundle:
+            report = bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(report.created['towers'], 4)
+        self.assertEqual(Game.objects.filter(name='Legacy game').count(), 2)
+
+
+class ContentBundleAdoptionTest(TestCase):
+    """Two installs that each grew the same per-game child.
+
+    The uuid is the identity, but a Game has exactly one Trail and one
+    role per slug. When both sides created theirs independently, a sync
+    used to hit a unique constraint and refuse a bundle that was not
+    really in conflict; now it adopts the local row and converges the
+    identifiers.
+    """
+
+    def setUp(self):
+        self.fx = _bundle_fixture()
+        buffer, _payload = bundles.export_bundle(games=[self.fx['game']])
+        self.archive_bytes = buffer.getvalue()
+
+    def _bundle(self):
+        return bundles.read_bundle(io.BytesIO(self.archive_bytes))
+
+    def _reuuid(self, instance):
+        """Give a row a fresh uuid, as if it had been created here."""
+        type(instance).objects.filter(pk=instance.pk).update(uuid=uuid.uuid4())
+        instance.refresh_from_db()
+
+    def test_a_role_created_on_both_sides_is_adopted_not_duplicated(self):
+        self._reuuid(self.fx['role'])
+        local_pk, local_uuid = self.fx['role'].pk, self.fx['role'].uuid
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        roles = GameRole.objects.filter(game=self.fx['game'], slug='navigator')
+        self.assertEqual(roles.count(), 1)
+        adopted = roles.get()
+        self.assertEqual(adopted.pk, local_pk)
+        self.assertNotEqual(adopted.uuid, local_uuid)
+        # …and the challenge's requirement points at the surviving row.
+        challenge = Challenge.objects.get(text='How many arches?')
+        self.assertEqual(
+            [r.pk for r in challenge.required_roles.all()], [local_pk],
+        )
+
+    def test_a_trail_created_on_both_sides_is_adopted_not_duplicated(self):
+        self._reuuid(self.fx['trail'])
+        local_pk = self.fx['trail'].pk
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        trails = Trail.objects.filter(game=self.fx['game'])
+        self.assertEqual(trails.count(), 1)
+        self.assertEqual(trails.get().pk, local_pk)
+
+    def test_a_team_group_created_on_both_sides_is_adopted(self):
+        self._reuuid(self.fx['group'])
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        self.assertEqual(
+            TeamGroup.objects.filter(game=self.fx['game'], slug='explo').count(), 1,
+        )
+
+    def test_adoption_converges_so_a_second_sync_matches_directly(self):
+        self._reuuid(self.fx['role'])
+        for _ in range(2):
+            with self._bundle() as bundle:
+                bundles.import_bundle(bundle)
+        self.assertEqual(
+            GameRole.objects.filter(game=self.fx['game'], slug='navigator').count(), 1,
+        )
+
+    def test_copy_mode_never_adopts(self):
+        """Copy means a second copy — it must not reach into what is here."""
+        self._reuuid(self.fx['role'])
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle, mode=bundles.MODE_COPY)
+        self.assertEqual(GameRole.objects.filter(slug='navigator').count(), 2)
+        self.assertEqual(Trail.objects.count(), 2)

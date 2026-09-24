@@ -57,6 +57,8 @@ export const NAV_SECTIONS: NavSection[] = [
       { label: 'NFC tags', link: '/nfc-tags', icon: 'bi-tag' },
       { label: 'Badges', link: '/badges', icon: 'bi-cpu' },
       { label: 'AI review', link: '/authoring', icon: 'bi-robot' },
+      // content-portability: move authored content between installs.
+      { label: 'Import / export', link: '/bundles', icon: 'bi-box-arrow-in-down' },
     ],
   },
   {
