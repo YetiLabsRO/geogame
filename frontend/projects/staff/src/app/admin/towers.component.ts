@@ -1,7 +1,7 @@
 import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
-import { AdminTower, AdminTowerType, AdminZone, StaffApiService } from 'shared';
+import { AdminTower, AdminTowerType, AdminZone, DialogService, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -276,6 +276,7 @@ interface Row {
 })
 export class TowersComponent {
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
 
   protected readonly rows = signal<Row[]>([]);
   protected readonly zones = signal<AdminZone[]>([]);
@@ -394,11 +395,18 @@ export class TowersComponent {
     });
   }
 
-  protected unassignAll(): void {
+  protected async unassignAll(): Promise<void> {
     if (this.unassigningAll()) return;
-    if (!confirm('Close ALL active tower ownerships? This ends the game round.')) {
-      return;
-    }
+    const ok = await this.dialogs.confirm({
+      title: 'End the round?',
+      message:
+        'Every active tower and zone ownership is closed. This ends the round ' +
+        'for every team at once, and cannot be undone.',
+      confirmLabel: 'Close all ownerships',
+      cancelLabel: 'Leave the round running',
+      danger: true,
+    });
+    if (!ok) return;
     this.unassigningAll.set(true);
     this.api.unassignAllTowers().subscribe({
       next: (res) => {

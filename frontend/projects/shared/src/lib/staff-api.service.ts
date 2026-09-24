@@ -1030,6 +1030,15 @@ export class StaffApiService {
     return this.http.patch<AdminGame>(`/api/staff/games/${id}/`, payload);
   }
 
+  /**
+   * Delete a Game and every Session on it. Superadmin only (403
+   * otherwise); refused with 409 + `blockers` while any of its Sessions
+   * is live. Shared Collections, Towers and Zones survive it.
+   */
+  deleteGame(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/games/${id}/`);
+  }
+
   // ---- Sessions ------------------------------------------------------------
 
   listSessions(gameId?: number): Observable<AdminSession[]> {
@@ -1047,6 +1056,14 @@ export class StaffApiService {
 
   updateSession(id: number, payload: AdminSessionPayload): Observable<AdminSession> {
     return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
+  }
+
+  /**
+   * Delete a Session and its roster. Superadmin only (403 otherwise);
+   * refused with 409 + `blockers` unless the run is draft or finished.
+   */
+  deleteSession(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/sessions/${id}/`);
   }
 
   // ---- Session lifecycle transitions (session-lifecycle) -------------------

@@ -14,6 +14,7 @@ import {
   AdminScoreMultiplier,
   AdminTower,
   AdminZone,
+  DialogService,
   ScoreMultiplierScope,
   StaffApiService,
 } from 'shared';
@@ -272,6 +273,7 @@ interface MultiplierRow {
 })
 export class ScoreMultipliersPanelComponent {
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
 
   readonly gameId = input.required<number>();
 
@@ -453,9 +455,15 @@ export class ScoreMultipliersPanelComponent {
       });
   }
 
-  protected remove(row: MultiplierRow): void {
+  protected async remove(row: MultiplierRow): Promise<void> {
     if (row.saving) return;
-    if (!confirm('Delete this scheduled multiplier?')) return;
+    const ok = await this.dialogs.confirm({
+      title: 'Delete this multiplier?',
+      message: 'The scheduled multiplier is removed. This cannot be undone.',
+      confirmLabel: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
     this.patch(row, { saving: true, error: null });
     this.api.deleteGameMultiplier(this.gameId(), row.multiplier.id).subscribe({
       next: () =>
