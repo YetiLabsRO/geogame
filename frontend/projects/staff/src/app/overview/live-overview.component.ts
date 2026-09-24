@@ -26,6 +26,7 @@ import {
   RealtimeService,
   ScoreboardUpdatedPayload,
   StaffApiService,
+  StatusPillComponent,
   TeamColorResolver,
   TowerOwnershipChangedPayload,
   ZoneControlChangedPayload,
@@ -87,7 +88,7 @@ export const HIDDEN_REASON_TEXT: Record<OverviewHiddenReason, string> = {
   selector: 'app-live-overview',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, DecimalPipe],
+  imports: [DatePipe, DecimalPipe, StatusPillComponent],
   template: `
     <div class="overview" [class.presenting]="presenting()" [class.bare]="!!shareToken">
       <header class="overview-head">
@@ -97,9 +98,7 @@ export const HIDDEN_REASON_TEXT: Record<OverviewHiddenReason, string> = {
         </div>
 
         @if (snapshot(); as s) {
-          <span class="state-badge" [class]="'state-' + s.session.state.toLowerCase()">
-            {{ s.session.state_label }}
-          </span>
+          <app-status-pill [status]="s.session.state" />
         }
 
         <div class="spacer"></div>

@@ -11,6 +11,7 @@
 
 @use 'sass:color';
 @use './bootstrap-overrides' as p;
+@use './pill' as pill;
 @use '@fontsource-variable/inter';
 
 // Staff = denser, player = comfortable. Defaults below are the "comfortable"
@@ -52,6 +53,32 @@ $dark-theme-colors: (
   'warning': p.$color-warning-dark,
   'danger': p.$color-danger-dark,
 );
+
+// Pill / badge tones, named after Bootstrap's own so the `.text-bg-*`
+// overrides below and the semantic `app-status-pill` tones can both be
+// emitted from one place. Each becomes a `--pill-<tone>-bg` / `-ink` pair,
+// derived by `_pill.scss` — nothing here is a hand-picked text colour.
+$pill-tones-light: (
+  'primary': p.$color-primary,
+  'secondary': p.$color-secondary,
+  'success': p.$color-success,
+  'info': p.$color-info,
+  'warning': p.$color-warning,
+  'danger': p.$color-danger,
+  'dark': p.$color-ink,
+  'light': p.$color-panel-sunken,
+) !default;
+
+$pill-tones-dark: (
+  'primary': p.$color-primary-dark,
+  'secondary': p.$color-secondary-dark,
+  'success': p.$color-success-dark,
+  'info': p.$color-info-dark,
+  'warning': p.$color-warning-dark,
+  'danger': p.$color-danger-dark,
+  'dark': p.$color-panel-sunken-dark,
+  'light': p.$color-panel-sunken-dark,
+) !default;
 
 :root {
   // ---- Color tokens (light) ------------------------------------------------
@@ -105,6 +132,16 @@ $dark-theme-colors: (
   --text-2xl: 28px;
   --text-3xl: 36px;
 
+  // ---- Status pills -------------------------------------------------------
+  // Fill and ink per tone, both derived from the palette by `_pill.scss`:
+  // white text on a fill deepened until it can carry it, dark ink on a fill
+  // too pale for that. Nothing below is hand-picked — retinting the palette
+  // retints the pills.
+  @each $tone, $value in $pill-tones-light {
+    --pill-#{$tone}-bg: #{pill.pill-fill($value, p.$color-ink)};
+    --pill-#{$tone}-ink: #{pill.pill-ink($value, p.$color-ink)};
+  }
+
   // ---- Decorative topographic background ----------------------------------
   --topo-bg: #{$topo-bg-light};
 }
@@ -129,12 +166,42 @@ $dark-theme-colors: (
 
   --topo-bg: #{$topo-bg-dark};
 
+  @each $tone, $value in $pill-tones-dark {
+    --pill-#{$tone}-bg: #{pill.pill-fill($value, p.$color-ink-dark)};
+    --pill-#{$tone}-ink: #{pill.pill-ink($value, p.$color-ink-dark)};
+  }
+
   @each $name, $value in $dark-theme-colors {
     --bs-#{$name}: #{$value};
     --bs-#{$name}-rgb: #{to-rgb($value)};
   }
 
   --bs-focus-ring-color: var(--focus);
+}
+
+// ---- Badges and pills ---------------------------------------------------
+//
+// Bootstrap compiles `.text-bg-*` ink at build time from `color-contrast()`,
+// a 4.5:1 test against white — and our trail green reaches only ~3.5:1, so
+// every RUNNING badge in the app came out with black text on green. Point
+// the utilities at the luminance-derived tokens instead, so one rule decides
+// the ink everywhere and retinting the palette retints it with them.
+@each $tone in ('primary', 'secondary', 'success', 'info', 'warning', 'danger', 'dark', 'light') {
+  .text-bg-#{$tone} {
+    background-color: var(--pill-#{$tone}-bg) !important;
+    color: var(--pill-#{$tone}-ink) !important;
+  }
+}
+
+// Bootstrap's `.badge` is `line-height: 1`, which reserves descender space
+// under a label that — being all-caps or short — never uses it, leaving the
+// text sitting high in the fill. Centre it on both axes instead.
+.badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 1.5em;
+  line-height: 1.35;
 }
 
 // ---- Utilities ----------------------------------------------------------

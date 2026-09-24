@@ -45,18 +45,18 @@
 
 ## 5. Status as language
 
-- [ ] 5.1 A `StatusPillComponent` in `shared`: a status string, an optional tone, a humanising fallback for statuses it has no label for.
-- [ ] 5.2 One label map covering session lifecycle states, invite statuses, simulation run statuses, authoring proposal and operation statuses, and trail step states — the sets the app currently prints raw.
-- [ ] 5.3 Every raw-status render moves onto the pill: `sessions`, `session-detail`, `game-state`, `live-overview`, `invites`, `simulator`, `authoring-review`, `badges`, the player's `trail` and `join-requests`.
-- [ ] 5.4 Retire the per-component `STATE_BADGES` / `STATE_LABELS` maps the pill replaces.
-- [ ] 5.5 Tests: the humanising fallback; that a known status renders its label rather than its constant.
+- [x] 5.1 A `StatusPillComponent` in `shared`: a status string, an optional tone, a humanising fallback for statuses it has no label for.
+- [x] 5.2 One label map covering session lifecycle states, invite statuses, simulation run statuses, authoring proposal and operation statuses, and trail step states — the sets the app currently prints raw.
+- [x] 5.3 Every raw-status render moves onto the pill: `sessions`, `session-detail`, `game-state`, `live-overview`, `invites`, `simulator`, `authoring-review`, `badges`, the player's `trail` and `join-requests`.
+- [x] 5.4 Retire the per-component `STATE_BADGES` / `STATE_LABELS` maps the pill replaces.
+- [x] 5.5 Tests: the humanising fallback; that a known status renders its label rather than its constant.
 
 ## 6. Pills that can be read
 
-- [ ] 6.1 A Sass relative-luminance function and a `pill-ink($fill)` that picks white or dark ink from it, in the shared theme next to the palette it reads.
-- [ ] 6.2 Emit the pill's fill and ink per tone from the theme tokens, for light and dark mode both, so the running-state green takes white text.
-- [ ] 6.3 The pill centres its text — a flex box with a line-height that leaves equal space above and below, rather than Bootstrap's `line-height: 1`.
-- [ ] 6.4 Check the result in a browser against both modes and against the statuses in the screenshots that prompted this.
+- [x] 6.1 A Sass relative-luminance function and a `pill-ink($fill)` that picks white or dark ink from it, in the shared theme next to the palette it reads.
+- [x] 6.2 Emit the pill's fill and ink per tone from the theme tokens, for light and dark mode both, so the running-state green takes white text.
+- [x] 6.3 The pill centres its text — a flex box with a line-height that leaves equal space above and below, rather than Bootstrap's `line-height: 1`.
+- [x] 6.4 Check the result in a browser against both modes and against the statuses in the screenshots that prompted this.
 
 ## 7. The session list's game filter
 

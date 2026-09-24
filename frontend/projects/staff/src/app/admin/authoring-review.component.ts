@@ -8,6 +8,7 @@ import {
   McpCredential,
   ProposedOperation,
   StaffApiService,
+  StatusPillComponent,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -22,7 +23,7 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-authoring-review',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [FormsModule, DatePipe, JsonPipe],
+  imports: [DatePipe, FormsModule, JsonPipe, StatusPillComponent],
   template: `
     <h1 class="h3 mb-1">AI authoring review</h1>
     <p class="text-body-secondary small">
@@ -54,7 +55,7 @@ import { extractErrorMessage } from '../auth/form-error';
             >
               <div class="d-flex justify-content-between">
                 <span class="fw-semibold">#{{ p.id }} · {{ p.summary || 'Untitled' }}</span>
-                <span class="badge" [class]="badgeClass(p.status)">{{ p.status }}</span>
+                <app-status-pill [status]="p.status" />
               </div>
               <div class="small text-body-secondary">
                 {{ p.operation_count }} operation(s)
@@ -74,7 +75,7 @@ import { extractErrorMessage } from '../auth/form-error';
               <div class="d-flex justify-content-between align-items-start">
                 <h2 class="h6 mb-2">
                   Proposal #{{ d.id }}
-                  <span class="badge {{ badgeClass(d.status) }}">{{ d.status }}</span>
+                  <app-status-pill [status]="d.status" />
                 </h2>
                 <span class="small text-body-secondary">
                   {{ d.atomic ? 'atomic' : 'per-op' }}
@@ -89,7 +90,7 @@ import { extractErrorMessage } from '../auth/form-error';
                       {{ op.action }} {{ op.entity_type }}
                       @if (op.temp_ref) { <code class="small">&#64;new:{{ op.temp_ref }}</code> }
                     </span>
-                    <span class="badge {{ opBadge(op.status) }}">{{ op.status }}</span>
+                    <app-status-pill [status]="op.status" />
                   </div>
                   @if (op.rationale) {
                     <div class="small fst-italic text-body-secondary mb-1">
@@ -277,25 +278,5 @@ export class AuthoringReviewComponent {
     });
   }
 
-  badgeClass(status: string): string {
-    switch (status) {
-      case 'APPLIED': return 'text-bg-success';
-      case 'APPROVED': return 'text-bg-primary';
-      case 'PENDING': return 'text-bg-warning';
-      case 'PARTIALLY_APPLIED': return 'text-bg-warning';
-      case 'REJECTED':
-      case 'FAILED': return 'text-bg-danger';
-      default: return 'text-bg-secondary';
-    }
-  }
 
-  opBadge(status: string): string {
-    switch (status) {
-      case 'APPLIED': return 'text-bg-success';
-      case 'APPROVED': return 'text-bg-primary';
-      case 'REJECTED':
-      case 'FAILED': return 'text-bg-danger';
-      default: return 'text-bg-secondary';
-    }
-  }
 }

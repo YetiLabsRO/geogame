@@ -1,0 +1,91 @@
+// Status pills — ink chosen by luminance, fill deepened to carry it.
+//
+// Bootstrap's `text-bg-*` picks badge ink at build time with
+// `color-contrast()`, a 4.5:1 test against white. Our trail green reaches
+// only ~3.5:1, so Bootstrap fell to black — which on a saturated mid-tone
+// at pill size is the muddier of the two, not the clearer one.
+//
+// One rule instead, applied to every tone: pills carry white text, and the
+// fill is deepened until white on it actually clears 4.5:1. A fill already
+// pale enough that white could never work keeps the dark ink instead. So a
+// pill is never a colour with unreadable text on it, and retinting the
+// theme retints the pills with it — nothing here is hand-assigned per
+// status.
+//
+// See `frontend/THEME.md`.
+
+@use 'sass:color';
+@use 'sass:math';
+
+/// One channel of WCAG relative luminance: sRGB 0–255 → linear 0–1.
+@function _linear($channel) {
+  $c: math.div($channel, 255);
+  @if $c <= 0.03928 {
+    @return math.div($c, 12.92);
+  }
+  @return math.pow(math.div($c + 0.055, 1.055), 2.4);
+}
+
+/// WCAG relative luminance of a colour, 0 (black) to 1 (white).
+@function luminance($value) {
+  @return 0.2126 * _linear(color.channel($value, 'red', $space: rgb)) + 0.7152 *
+    _linear(color.channel($value, 'green', $space: rgb)) + 0.0722 *
+    _linear(color.channel($value, 'blue', $space: rgb));
+}
+
+/// `color.scale` returns fractional channels; a token is read by people, so
+/// snap them back to whole sRGB values.
+@function _round($value) {
+  @return rgb(
+    math.round(color.channel($value, 'red', $space: rgb)),
+    math.round(color.channel($value, 'green', $space: rgb)),
+    math.round(color.channel($value, 'blue', $space: rgb))
+  );
+}
+
+/// WCAG contrast ratio between two colours, 1 (none) to 21 (black on white).
+@function contrast($a, $b) {
+  $la: luminance($a);
+  $lb: luminance($b);
+  $lighter: math.max($la, $lb);
+  $darker: math.min($la, $lb);
+  @return math.div($lighter + 0.05, $darker + 0.05);
+}
+
+/// Below this, a fill is dark enough that white is the readable choice.
+/// A fill lighter than this could not carry white at any reasonable
+/// deepening without ceasing to be the colour it is.
+$pill-white-ink-max-luminance: 0.55 !default;
+
+/// The contrast a pill's text must clear against its fill.
+$pill-min-contrast: 4.5 !default;
+
+/// White when the fill is dark enough to carry it, dark ink otherwise.
+@function pill-ink($fill, $dark-ink: #1e2a32) {
+  @if luminance($fill) < $pill-white-ink-max-luminance {
+    @return #fff;
+  }
+  @return $dark-ink;
+}
+
+/// The fill as a pill should draw it.
+///
+/// When the ink is white, deepen the colour until white on it clears
+/// `$pill-min-contrast` — a mid-tone green or orange is the right hue and
+/// the wrong depth, and this is what makes the label readable rather than
+/// merely present. A fill taking dark ink is already light and is left
+/// alone.
+@function pill-fill($fill, $dark-ink: #1e2a32) {
+  @if pill-ink($fill, $dark-ink) != #fff {
+    @return $fill;
+  }
+  $result: $fill;
+  // 24 × 3% covers the whole range from white down; the guard exits as soon
+  // as the contrast clears, so a colour already deep enough is untouched.
+  @for $step from 1 through 24 {
+    @if contrast($result, #fff) < $pill-min-contrast {
+      $result: color.scale($result, $lightness: -3%);
+    }
+  }
+  @return _round($result);
+}

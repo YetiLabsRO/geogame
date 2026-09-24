@@ -41,6 +41,7 @@ import {
   SessionTransitionAction,
   StaffApiService,
   StartReadiness,
+  StatusPillComponent,
   TeamBuildResult,
   TeammateVisibilityMode,
   TogethernessMode,
@@ -203,15 +204,7 @@ const TABS: TabDef[] = [
   selector: 'app-staff-session-detail',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [
-    DatePipe,
-    NgTemplateOutlet,
-    FormsModule,
-    RouterLink,
-    FieldRowComponent,
-    InfoHintComponent,
-    PageHeaderComponent,
-  ],
+  imports: [DatePipe, FieldRowComponent, FormsModule, InfoHintComponent, NgTemplateOutlet, PageHeaderComponent, RouterLink, StatusPillComponent],
   template: `
     <a routerLink="/sessions" class="small text-body-secondary">
       &larr; Back to sessions
@@ -226,9 +219,7 @@ const TABS: TabDef[] = [
       >
         @if (session(); as s) {
           <ng-container>
-            <span actions class="badge" [class]="stateBadgeClass(s.state)">
-              {{ stateLabel(s.state) }}
-            </span>
+            <app-status-pill actions [status]="s.state" />
             <a actions [routerLink]="['/sessions', sessionId, 'overview']" class="btn btn-sm btn-outline-secondary">
               <i class="bi bi-map"></i> Live overview
             </a>
@@ -267,9 +258,7 @@ const TABS: TabDef[] = [
               <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
                 <h2 class="h6 mb-0">
                   State
-                  <span class="badge ms-2" [class]="stateBadgeClass(s.state)">
-                    {{ stateLabel(s.state) }}
-                  </span>
+                  <app-status-pill class="ms-2" [status]="s.state" />
                 </h2>
                 <div class="d-flex gap-2 flex-wrap">
                   @for (a of s.allowed_transitions; track a) {
@@ -1921,13 +1910,7 @@ export class StaffSessionDetailComponent {
 
   // ---- Lifecycle controls (session-lifecycle) -----------------------------
 
-  protected stateLabel(state: SessionState): string {
-    return STATE_LABELS[state] ?? state;
-  }
 
-  protected stateBadgeClass(state: SessionState): string {
-    return STATE_BADGES[state] ?? 'text-bg-secondary';
-  }
 
   protected actionLabel(action: SessionTransitionAction): string {
     return ACTION_LABELS[action] ?? action;
@@ -2211,21 +2194,7 @@ export class StaffSessionDetailComponent {
   }
 }
 
-const STATE_LABELS: Record<SessionState, string> = {
-  DRAFT: 'Draft',
-  OPEN_FOR_PARTICIPANTS: 'Open for participants',
-  RUNNING: 'Running',
-  PAUSED: 'Paused',
-  FINISHED: 'Finished',
-};
 
-const STATE_BADGES: Record<SessionState, string> = {
-  DRAFT: 'text-bg-secondary',
-  OPEN_FOR_PARTICIPANTS: 'text-bg-info',
-  RUNNING: 'text-bg-success',
-  PAUSED: 'text-bg-warning',
-  FINISHED: 'text-bg-dark',
-};
 
 const ACTION_LABELS: Record<SessionTransitionAction, string> = {
   open_participation: 'Open participation',

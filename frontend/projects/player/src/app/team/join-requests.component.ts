@@ -3,6 +3,7 @@ import { DatePipe } from '@angular/common';
 import { ActivatedRoute, RouterLink } from '@angular/router';
 
 import {
+  StatusLabelPipe,
   TeamFormationService,
   TeamJoinRequest,
   ToastService,
@@ -21,17 +22,7 @@ import { extractErrorMessage } from '../auth/form-error';
   selector: 'app-join-requests',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [
-    DatePipe,
-    RouterLink,
-    UiAlertComponent,
-    UiAvatarComponent,
-    UiButtonComponent,
-    UiCardComponent,
-    UiChipComponent,
-    UiEmptyStateComponent,
-    UiSpinnerComponent,
-  ],
+  imports: [DatePipe, RouterLink, StatusLabelPipe, UiAlertComponent, UiAvatarComponent, UiButtonComponent, UiCardComponent, UiChipComponent, UiEmptyStateComponent, UiSpinnerComponent],
   template: `
     <div class="team-screen">
       <div class="team-screen__title-row">
@@ -110,7 +101,7 @@ import { extractErrorMessage } from '../auth/form-error';
                 <div class="team-screen__decided-row">
                   <span class="tr-body">{{ r.username }}</span>
                   <ui-chip [tone]="r.status === 'APPROVED' ? 'brand' : 'neutral'">
-                    {{ r.status }}
+                    {{ r.status | statusLabel }}
                   </ui-chip>
                 </div>
               </ui-card>

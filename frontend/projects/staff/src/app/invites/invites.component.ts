@@ -5,9 +5,10 @@ import { FormBuilder, ReactiveFormsModule, Validators } from '@angular/forms';
 import {
   GameApiService,
   Invite,
-  InviteStatus,
   InvitesService,
+  InviteStatus,
   QrCodeComponent,
+  StatusPillComponent,
   TeamSummary,
 } from 'shared';
 
@@ -19,7 +20,7 @@ type TabKey = InviteStatus | 'all';
   selector: 'app-invites',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, DatePipe, QrCodeComponent],
+  imports: [DatePipe, QrCodeComponent, ReactiveFormsModule, StatusPillComponent],
   template: `
     <h1 class="h3 mb-3">Invites</h1>
 
@@ -112,7 +113,7 @@ type TabKey = InviteStatus | 'all';
                       Expires {{ i.expires_at | date: 'medium' }}
                     </div>
                   </div>
-                  <span class="badge" [class]="badgeClass(i.status)">{{ i.status }}</span>
+                  <app-status-pill [status]="i.status" />
                 </div>
 
                 @if (i.status === 'pending') {
@@ -290,18 +291,6 @@ export class InvitesComponent {
     return `${window.location.origin}/invite/${i.token}`;
   }
 
-  protected badgeClass(status: InviteStatus): string {
-    switch (status) {
-      case 'pending':
-        return 'text-bg-info';
-      case 'accepted':
-        return 'text-bg-success';
-      case 'revoked':
-        return 'text-bg-secondary';
-      case 'expired':
-        return 'text-bg-warning';
-    }
-  }
 
   private afterAction(id: number): void {
     this.actingId.set(null);

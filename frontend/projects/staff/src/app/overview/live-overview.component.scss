@@ -72,31 +72,6 @@
   flex: 1 1 auto;
 }
 
-.state-badge {
-  padding: 0.15rem var(--space-2);
-  border-radius: var(--radius-sm);
-  font-size: var(--text-xs);
-  font-weight: 700;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  background: var(--panel-sunken);
-  color: var(--ink-muted);
-  white-space: nowrap;
-}
-
-.state-badge.state-running {
-  background: color-mix(in srgb, var(--success) 18%, transparent);
-  color: var(--success);
-}
-
-.state-badge.state-paused {
-  background: color-mix(in srgb, var(--warning) 22%, transparent);
-  color: var(--warning);
-}
-
-.state-badge.state-finished {
-  background: color-mix(in srgb, var(--ink-muted) 18%, transparent);
-}
 
 .live-badge {
   font-size: var(--text-xs);
