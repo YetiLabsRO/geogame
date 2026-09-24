@@ -22,6 +22,7 @@ from game.models import (
     GatewayNode,
     LocationConsent,
     LocationPing,
+    MediaAsset,
     NfcTag,
     PauseWindow,
     PresenceCheck,
@@ -40,7 +41,6 @@ from game.models import (
     Tower,
     TowerDiscovery,
     TowerLock,
-    TowerPhoto,
     TowerType,
     Trail,
     TrailEdge,
@@ -50,12 +50,31 @@ from game.models import (
 from organize.models import Team, TeamGroup
 
 
+class TowerMediaInline(admin.TabularInline):
+    """Reference media hanging off a Tower.
+
+    `fk_name` is required: `MediaAsset` has two nullable subjects and
+    the inline has to say which one it edits.
+    """
+
+    model = MediaAsset
+    fk_name = 'tower'
+    extra = 0
+    fields = ['kind', 'file', 'caption', 'duration_seconds', 'captured_by', 'captured_at']
+    readonly_fields = ['captured_by', 'captured_at']
+
+
+class ZoneMediaInline(TowerMediaInline):
+    fk_name = 'zone'
+
+
 class ZoneAdmin(LeafletGeoAdmin):
     list_display = [
         '__str__', 'scoring_type', 'color', 'conquest_rule',
         'fog_reveal_coverage_pct',
         'get_member_towers', 'get_zone_control',
     ]
+    inlines = [ZoneMediaInline]
 
     def get_member_towers(self, instance: Zone):
         """Member towers via the many-to-many (tower-zone-topology)."""
@@ -128,12 +147,6 @@ class TowerTypeAdmin(admin.ModelAdmin):
     search_fields = ('name', 'slug')
 
 
-class TowerPhotoInline(admin.TabularInline):
-    model = TowerPhoto
-    extra = 0
-    readonly_fields = ['captured_by', 'captured_at']
-
-
 class TowerAdmin(LeafletGeoAdmin):
     form = TowerAdminForm
     list_display = [
@@ -152,7 +165,7 @@ class TowerAdmin(LeafletGeoAdmin):
     filter_horizontal = ['zones']
     # readonly_fields = ['rfid_code']
     actions = [unassign_all, ]
-    inlines = [TowerPhotoInline]
+    inlines = [TowerMediaInline]
 
     def get_zones(self, instance):
         return ', '.join(instance.zones.values_list('name', flat=True)) or '-'
@@ -337,10 +350,10 @@ class TeamTowerFailCounterAdmin(admin.ModelAdmin):
     search_fields = ('team__name', 'tower__name')
 
 
-class TowerPhotoAdmin(admin.ModelAdmin):
-    list_display = ('tower', 'caption', 'captured_by', 'captured_at')
-    list_filter = ('tower',)
-    readonly_fields = ('captured_at',)
+class MediaAssetAdmin(admin.ModelAdmin):
+    list_display = ('__str__', 'kind', 'tower', 'zone', 'caption', 'captured_by', 'captured_at')
+    list_filter = ('kind',)
+    search_fields = ('caption', 'tower__name', 'zone__name')
 
 
 class NfcTagAdmin(admin.ModelAdmin):
@@ -568,7 +581,7 @@ admin.site.register(ProximityEvent, ProximityEventAdmin)
 admin.site.register(DementorState, DementorStateAdmin)
 admin.site.register(DementorFlip, DementorFlipAdmin)
 admin.site.register(Tower, TowerAdmin)
-admin.site.register(TowerPhoto, TowerPhotoAdmin)
+admin.site.register(MediaAsset, MediaAssetAdmin)
 admin.site.register(Team, TeamAdmin)
 admin.site.register(Challenge, ChallengeAdmin)
 admin.site.register(TeamTowerChallenge, TeamTowerChallangeAdmin)

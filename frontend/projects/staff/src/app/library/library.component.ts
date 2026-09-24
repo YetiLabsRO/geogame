@@ -70,8 +70,8 @@ type Selection =
         }
         <div class="legend">
           @if (activeCollection(); as c) {
-            <strong>{{ c.name }}</strong> · {{ c.tower_count }} towers,
-            {{ c.zone_count }} zones · tap an element to add or remove it
+            <strong>{{ c.name }}</strong> · {{ c.tower_count }} towers, {{ c.zone_count }} zones ·
+            tap an element to add or remove it
           } @else {
             Showing the whole library · pick a collection to curate it
           }
@@ -120,11 +120,7 @@ type Selection =
               </button>
             </div>
           } @else {
-            <button
-              type="button"
-              class="btn btn-sm btn-link p-0 mt-1"
-              (click)="creating.set(true)"
-            >
+            <button type="button" class="btn btn-sm btn-link p-0 mt-1" (click)="creating.set(true)">
               + new collection
             </button>
           }
@@ -162,8 +158,7 @@ type Selection =
                 <strong>{{ sel.tower.name }}</strong>
               </div>
               <div class="small text-body-secondary">
-                {{ sel.tower.tower_type_name ?? 'untyped' }} ·
-                {{ sel.tower.media_count }} media
+                {{ sel.tower.tower_type_name ?? 'untyped' }} · {{ sel.tower.media_count }} media
                 @if (!sel.tower.is_active) {
                   · <span class="badge text-bg-secondary">draft</span>
                 }
@@ -196,6 +191,7 @@ type Selection =
                 <span class="swatch square" [style.background-color]="sel.zone.color"></span>
                 <strong>{{ sel.zone.name }}</strong>
               </div>
+              <div class="small text-body-secondary">{{ sel.zone.media_count }} media</div>
               <div class="small mt-2">
                 In {{ membershipNames(sel.zone.collection_ids).length }} collection(s):
                 {{ membershipNames(sel.zone.collection_ids).join(', ') || '—' }}

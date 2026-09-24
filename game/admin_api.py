@@ -4,7 +4,6 @@ import secrets
 from django.contrib.gis.geos import GEOSException, Point, Polygon
 from django.core.exceptions import ValidationError as DjangoValidationError
 from django.db import transaction
-from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.text import slugify
 from rest_framework import serializers, status, viewsets
@@ -15,6 +14,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from game.challenge_types import REVIEW_MANUAL, TYPE_NFC_QR, TYPE_TEXT
+from game.media_api import MediaAssetSerializer, MediaSubjectMixin
 from game.models import (
     NFC_MODE_LEGACY_URL,
     NFC_MODE_SECURE_TOKEN,
@@ -29,7 +29,6 @@ from game.models import (
     TeamZoneOwnership,
     Tower,
     TowerLock,  # tower-locking
-    TowerPhoto,
     TowerType,
     Zone,
 )
@@ -38,7 +37,6 @@ from game.scoping import (
     SessionScopedViewSetMixin,
     _current_session,
 )
-from game.serializers import Base64ImageField
 from organize.models import (
     Game,
     GameRole,
@@ -105,28 +103,6 @@ def _close_ring(vertices):
         raise serializers.ValidationError({'vertices': f'Invalid polygon: {exc}'})
 
 
-class TowerPhotoSerializer(serializers.ModelSerializer):
-    """Reference photo payload (field-authoring, task 2.2).
-
-    `image` accepts a multipart file OR a base64 data URL (the offline
-    queue replays captures as JSON). `tower` / `captured_by` are set by
-    the viewset, never by the client.
-    """
-
-    image = Base64ImageField(use_url=True)
-    captured_by_username = serializers.CharField(
-        source='captured_by.username', read_only=True, default=None,
-    )
-
-    class Meta:
-        model = TowerPhoto
-        fields = (
-            'id', 'tower', 'image', 'caption',
-            'captured_by', 'captured_by_username', 'captured_at',
-        )
-        read_only_fields = ('tower', 'captured_by', 'captured_at')
-
-
 class AdminTowerTypeSerializer(serializers.ModelSerializer):
     """Tower type payload (tower-types)."""
 
@@ -166,12 +142,16 @@ class AdminZoneSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         queryset=Collection.objects.all(),
         write_only=True, required=False, allow_null=True,
     )
+    # tower-zone-media: "the meadow behind the church, enter by the north
+    # gate" is exactly what a curator knows on site and could not write
+    # down until a zone could carry media of its own.
+    media = MediaAssetSerializer(many=True, read_only=True)
 
     class Meta:
         model = Zone
         fields = (
             'id', 'name', 'color', 'scoring_type', 'conquest_rule',
-            'towers', 'shape', 'vertices', 'collection',
+            'towers', 'shape', 'vertices', 'collection', 'media',
             'collections', 'games',
             # tower-visibility: per-zone fog threshold (null = inherit).
             'fog_reveal_coverage_pct',
@@ -323,7 +303,8 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
     Field authoring (task 2.1): create-at-GPS writes `lat`/`lng`
     (+ optional `authored_accuracy_m` capture provenance) and an optional
     target `collection` the new tower is filed into in the same call.
-    `location` reads back as GeoJSON; `photos` lists reference photos.
+    `location` reads back as GeoJSON; `media` lists reference media
+    (tower-zone-media) — photos, audio notes and short clips.
     """
 
     # Many-to-many zone membership (tower-zone-topology).
@@ -337,7 +318,7 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
         queryset=Collection.objects.all(),
         write_only=True, required=False, allow_null=True,
     )
-    photos = TowerPhotoSerializer(many=True, read_only=True)
+    media = MediaAssetSerializer(many=True, read_only=True)
     # tower-types. The nullable `icon`/`color` say what the curator
     # chose (blank = inherit); the resolved pair says what to paint.
     # Both are served because an editor needs the first and every map
@@ -363,7 +344,7 @@ class AdminTowerSerializer(GeometryUsageMixin, serializers.ModelSerializer):
             # tower-types: the choice, and the resolution of it.
             'tower_type', 'tower_type_name', 'icon', 'color',
             'resolved_icon', 'resolved_color',
-            'collection', 'photos', 'collections', 'games',
+            'collection', 'media', 'collections', 'games',
         )
 
     def get_location(self, tower):
@@ -570,7 +551,10 @@ class CollectionAuthorGateMixin:
             self._require_collection_author(collection)
 
 
-class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
+class AdminZoneViewSet(
+    MediaSubjectMixin, CollectionAuthorGateMixin, CollectionFilterMixin,
+    viewsets.ModelViewSet,
+):
     """Staff-only CRUD for repository Zones.
 
     `?tower=<id>` narrows to the zones a tower belongs to (many-to-many
@@ -578,13 +562,18 @@ class AdminZoneViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewset
 
     Field authoring: boundaries are writable as `vertices` (walked or
     tapped [[lng, lat], ...]); new zones are filed into the target
-    `collection` in the same call. Writes into a Collection are gated
+    `collection` in the same call; reference media attaches under
+    {id}/media/ (tower-zone-media). Writes into a Collection are gated
     by `Collection.can_author` (task 2.5).
     """
 
     permission_classes = [IsAdminUser]
-    queryset = Zone.objects.all().order_by('name')
+    queryset = (
+        Zone.objects.all().order_by('name')
+        .prefetch_related('media__captured_by')
+    )
     serializer_class = AdminZoneSerializer
+    media_subject_field = 'zone'
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -619,7 +608,10 @@ class AdminTowerTypeViewSet(viewsets.ModelViewSet):
     serializer_class = AdminTowerTypeSerializer
 
 
-class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewsets.ModelViewSet):
+class AdminTowerViewSet(
+    MediaSubjectMixin, CollectionAuthorGateMixin, CollectionFilterMixin,
+    viewsets.ModelViewSet,
+):
     """Staff-only CRUD for repository Towers + activate/deactivate/unassign actions.
 
     `?zone=<id>` narrows to one zone's member towers (many-to-many
@@ -628,7 +620,8 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
     Field authoring: create-at-GPS via `lat`/`lng` (+ optional
     `authored_accuracy_m` provenance and a target `collection` the new
     tower is filed into in one call, task 2.1); reference-photo
-    endpoints under {id}/photos/ (task 2.2); attach-challenge action
+    media endpoints under {id}/media/ (task 2.2, widened by
+    tower-zone-media); attach-challenge action
     (task 2.4). Collection-touching writes are gated by
     `Collection.can_author` (task 2.5).
     """
@@ -637,9 +630,10 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
     queryset = (
         Tower.objects.all().order_by('name')
         .select_related('tower_type')
-        .prefetch_related('photos__captured_by')
+        .prefetch_related('media__captured_by')
     )
     serializer_class = AdminTowerSerializer
+    media_subject_field = 'tower'
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -665,41 +659,6 @@ class AdminTowerViewSet(CollectionAuthorGateMixin, CollectionFilterMixin, viewse
                 instance.delete()
         except DjangoValidationError as exc:
             raise serializers.ValidationError({'detail': exc.messages})
-
-    @action(detail=True, methods=['get', 'post'])
-    def photos(self, request, pk=None):
-        """Reference photos: GET lists, POST uploads (multipart or base64)."""
-        tower = self.get_object()
-        if request.method == 'POST':
-            self._require_geometry_author(tower)
-            serializer = TowerPhotoSerializer(
-                data=request.data, context=self.get_serializer_context(),
-            )
-            serializer.is_valid(raise_exception=True)
-            photo = serializer.save(tower=tower, captured_by=request.user)
-            return Response(
-                TowerPhotoSerializer(
-                    photo, context=self.get_serializer_context(),
-                ).data,
-                status=status.HTTP_201_CREATED,
-            )
-        return Response(
-            TowerPhotoSerializer(
-                tower.photos.all(), many=True,
-                context=self.get_serializer_context(),
-            ).data,
-        )
-
-    @action(
-        detail=True, methods=['delete'],
-        url_path=r'photos/(?P<photo_id>[0-9]+)',
-    )
-    def delete_photo(self, request, pk=None, photo_id=None):
-        tower = self.get_object()
-        self._require_geometry_author(tower)
-        photo = get_object_or_404(TowerPhoto, pk=photo_id, tower=tower)
-        photo.delete()
-        return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=True, methods=['post'], url_path='attach-challenge')
     def attach_challenge(self, request, pk=None):

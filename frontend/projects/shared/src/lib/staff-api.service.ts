@@ -2,6 +2,7 @@ import { HttpClient, HttpResponse } from '@angular/common/http';
 import { Injectable, inject } from '@angular/core';
 import { Observable } from 'rxjs';
 
+import { MediaSubject } from './field-queue-store';
 import {
   ChallengeType,
   ReviewMode,
@@ -103,15 +104,36 @@ export type TowerVisibilityOverrides = {
 /** Scoring time units — the unit zone scores accrue per. */
 export type ScoreTimeUnit = 'SECOND' | 'MINUTE' | 'HOUR';
 
-/** A curator-captured reference photo of a tower (field-authoring-mode). */
-export interface TowerPhotoInfo {
+/** What a curator may attach to a place (tower-zone-media). */
+export type MediaKind = 'IMAGE' | 'AUDIO' | 'VIDEO';
+
+/** Curator-captured reference media for a tower or a zone. */
+export interface MediaAssetInfo {
   id: number;
-  tower: number;
-  image: string;
+  /** Exactly one of these is set; the other is null. */
+  tower: number | null;
+  zone: number | null;
+  kind: MediaKind;
+  /** Served URL of the stored file. */
+  file: string;
   caption: string;
+  /** Audio and video only. */
+  duration_seconds: number | null;
+  byte_size: number;
   captured_by: number | null;
   captured_by_username: string | null;
   captured_at: string;
+}
+
+/**
+ * An upload. `file` is a base64 data URL; the same endpoint also takes
+ * multipart, which is what a live capture posts.
+ */
+export interface UploadMediaPayload {
+  file?: string;
+  kind?: MediaKind;
+  caption?: string;
+  duration_seconds?: number | null;
 }
 
 export interface AdminTower {
@@ -142,7 +164,7 @@ export interface AdminTower {
    */
   resolved_icon: string;
   resolved_color: string;
-  photos: TowerPhotoInfo[];
+  media: MediaAssetInfo[];
   collections: UsageRef[];
   games: UsageRef[];
 }
@@ -194,6 +216,8 @@ export interface AdminZone {
   /** Member towers via the many-to-many (read-only). */
   towers: UsageRef[];
   shape: { type: 'Polygon'; coordinates: number[][][] } | null;
+  /** Reference media attached to the zone (tower-zone-media). */
+  media: MediaAssetInfo[];
   collections: UsageRef[];
   games: UsageRef[];
 }
@@ -476,7 +500,8 @@ export type DementorOverrides = { [K in keyof DementorConfig]: DementorConfig[K]
 // --- end game-creation-wizard additions ---
 
 export interface AdminGame
-  extends Phase10Config,
+  extends
+    Phase10Config,
     TeamRulesConfig,
     LocationTrackingConfig,
     PresenceRulesConfig,
@@ -525,12 +550,7 @@ export type Phase10Overrides = {
 };
 
 /** Session lifecycle states (session-lifecycle capability). */
-export type SessionState =
-  | 'DRAFT'
-  | 'OPEN_FOR_PARTICIPANTS'
-  | 'RUNNING'
-  | 'PAUSED'
-  | 'FINISHED';
+export type SessionState = 'DRAFT' | 'OPEN_FOR_PARTICIPANTS' | 'RUNNING' | 'PAUSED' | 'FINISHED';
 
 /** Lifecycle actions, each driving one edge of the transition table. */
 export type SessionTransitionAction =
@@ -542,7 +562,8 @@ export type SessionTransitionAction =
   | 'finish';
 
 export interface AdminSession
-  extends Phase10Overrides,
+  extends
+    Phase10Overrides,
     TeamRulesOverrides,
     LocationTrackingOverrides,
     PresenceRulesOverrides,
@@ -619,11 +640,7 @@ export interface FailCounterInfo {
 
 /** One reason a Session may not start (machine `code` + human `message`). */
 export interface StartBlocker {
-  code:
-    | 'too_few_teams'
-    | 'too_many_teams'
-    | 'team_below_minimum'
-    | 'team_above_maximum';
+  code: 'too_few_teams' | 'too_many_teams' | 'team_below_minimum' | 'team_above_maximum';
   message: string;
   required?: number;
   allowed?: number;
@@ -658,17 +675,16 @@ export class StaffApiService {
   }
 
   confirmSubmission(id: number): Observable<StaffSubmission> {
-    return this.http.post<StaffSubmission>(
-      `/api/staff/submissions/${id}/review/`,
-      { outcome: 'confirm' },
-    );
+    return this.http.post<StaffSubmission>(`/api/staff/submissions/${id}/review/`, {
+      outcome: 'confirm',
+    });
   }
 
   rejectSubmission(id: number, responseText = ''): Observable<StaffSubmission> {
-    return this.http.post<StaffSubmission>(
-      `/api/staff/submissions/${id}/review/`,
-      { outcome: 'reject', response_text: responseText },
-    );
+    return this.http.post<StaffSubmission>(`/api/staff/submissions/${id}/review/`, {
+      outcome: 'reject',
+      response_text: responseText,
+    });
   }
 
   // ---- Tower locks (tower-locking) ----------------------------------------
@@ -680,10 +696,7 @@ export class StaffApiService {
 
   /** Force-release an active lock (release_reason=CANCELLED). */
   cancelTowerLock(id: number): Observable<StaffTowerLock> {
-    return this.http.post<StaffTowerLock>(
-      `/api/staff/tower_locks/${id}/cancel/`,
-      {},
-    );
+    return this.http.post<StaffTowerLock>(`/api/staff/tower_locks/${id}/cancel/`, {});
   }
 
   // ---- Admin CRUD ---------------------------------------------------------
@@ -705,31 +718,34 @@ export class StaffApiService {
     return this.http.patch<AdminTower>(`/api/staff/towers/${id}/`, patch);
   }
 
-  // ---- Field authoring: reference photos + attach-challenge ----------------
+  // ---- Field authoring: reference media + attach-challenge ----------------
+  //
+  // One set of methods for both subjects: `subject` picks the endpoint
+  // family, exactly as the server has one viewset mixin serving both.
 
-  listTowerPhotos(towerId: number): Observable<TowerPhotoInfo[]> {
-    return this.http.get<TowerPhotoInfo[]>(`/api/staff/towers/${towerId}/photos/`);
+  listMedia(subject: MediaSubject, id: number): Observable<MediaAssetInfo[]> {
+    return this.http.get<MediaAssetInfo[]>(`/api/staff/${subject}/${id}/media/`);
   }
 
-  /** `image` is a base64 data URL (client-side compressed capture). */
-  uploadTowerPhoto(
-    towerId: number,
-    payload: { image: string; caption?: string },
-  ): Observable<TowerPhotoInfo> {
-    return this.http.post<TowerPhotoInfo>(
-      `/api/staff/towers/${towerId}/photos/`,
-      payload,
-    );
+  /**
+   * Attach media. A `FormData` sends the capture as multipart, which is
+   * what a live capture does; an `UploadMediaPayload` sends it as a
+   * base64 data URL, which is what a queued capture replays as, having
+   * had no multipart body to keep.
+   */
+  uploadMedia(
+    subject: MediaSubject,
+    id: number,
+    payload: UploadMediaPayload | FormData,
+  ): Observable<MediaAssetInfo> {
+    return this.http.post<MediaAssetInfo>(`/api/staff/${subject}/${id}/media/`, payload);
   }
 
-  deleteTowerPhoto(towerId: number, photoId: number): Observable<void> {
-    return this.http.delete<void>(`/api/staff/towers/${towerId}/photos/${photoId}/`);
+  deleteMedia(subject: MediaSubject, id: number, mediaId: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/${subject}/${id}/media/${mediaId}/`);
   }
 
-  attachChallenge(
-    towerId: number,
-    payload: AttachChallengePayload,
-  ): Observable<AdminChallenge> {
+  attachChallenge(towerId: number, payload: AttachChallengePayload): Observable<AdminChallenge> {
     return this.http.post<AdminChallenge>(
       `/api/staff/towers/${towerId}/attach-challenge/`,
       payload,
@@ -741,10 +757,7 @@ export class StaffApiService {
   }
 
   unassignAllTowers(): Observable<{ unassigned: number[] }> {
-    return this.http.post<{ unassigned: number[] }>(
-      '/api/staff/towers/unassign_all/',
-      {},
-    );
+    return this.http.post<{ unassigned: number[] }>('/api/staff/towers/unassign_all/', {});
   }
 
   listZones(collectionId?: number): Observable<AdminZone[]> {
@@ -817,10 +830,9 @@ export class StaffApiService {
   }
 
   assignRole(membershipId: number, roleId: number): Observable<AdminMembership> {
-    return this.http.post<AdminMembership>(
-      `/api/staff/memberships/${membershipId}/assign_role/`,
-      { role: roleId },
-    );
+    return this.http.post<AdminMembership>(`/api/staff/memberships/${membershipId}/assign_role/`, {
+      role: roleId,
+    });
   }
 
   unassignRole(membershipId: number, roleId: number): Observable<AdminMembership> {
@@ -849,10 +861,7 @@ export class StaffApiService {
     return this.http.post<AdminCollection>('/api/staff/collections/', payload);
   }
 
-  updateCollection(
-    id: number,
-    payload: AdminCollectionPayload,
-  ): Observable<AdminCollection> {
+  updateCollection(id: number, payload: AdminCollectionPayload): Observable<AdminCollection> {
     return this.http.patch<AdminCollection>(`/api/staff/collections/${id}/`, payload);
   }
 
@@ -861,31 +870,27 @@ export class StaffApiService {
   }
 
   addCollectionTowers(id: number, towerIds: number[]): Observable<AdminCollection> {
-    return this.http.post<AdminCollection>(
-      `/api/staff/collections/${id}/add-towers/`,
-      { tower_ids: towerIds },
-    );
+    return this.http.post<AdminCollection>(`/api/staff/collections/${id}/add-towers/`, {
+      tower_ids: towerIds,
+    });
   }
 
   removeCollectionTowers(id: number, towerIds: number[]): Observable<AdminCollection> {
-    return this.http.post<AdminCollection>(
-      `/api/staff/collections/${id}/remove-towers/`,
-      { tower_ids: towerIds },
-    );
+    return this.http.post<AdminCollection>(`/api/staff/collections/${id}/remove-towers/`, {
+      tower_ids: towerIds,
+    });
   }
 
   addCollectionZones(id: number, zoneIds: number[]): Observable<AdminCollection> {
-    return this.http.post<AdminCollection>(
-      `/api/staff/collections/${id}/add-zones/`,
-      { zone_ids: zoneIds },
-    );
+    return this.http.post<AdminCollection>(`/api/staff/collections/${id}/add-zones/`, {
+      zone_ids: zoneIds,
+    });
   }
 
   removeCollectionZones(id: number, zoneIds: number[]): Observable<AdminCollection> {
-    return this.http.post<AdminCollection>(
-      `/api/staff/collections/${id}/remove-zones/`,
-      { zone_ids: zoneIds },
-    );
+    return this.http.post<AdminCollection>(`/api/staff/collections/${id}/remove-zones/`, {
+      zone_ids: zoneIds,
+    });
   }
 
   // ---- Games ---------------------------------------------------------------
@@ -898,10 +903,7 @@ export class StaffApiService {
    * POST, not GET: the selection is two lists of ids. The whole response
    * is returned so the caller can read the filename the server chose.
    */
-  exportBundle(
-    gameIds: number[],
-    collectionIds: number[],
-  ): Observable<HttpResponse<Blob>> {
+  exportBundle(gameIds: number[], collectionIds: number[]): Observable<HttpResponse<Blob>> {
     return this.http.post(
       '/api/staff/bundles/export/',
       { games: gameIds, collections: collectionIds },
@@ -939,10 +941,7 @@ export class StaffApiService {
     return this.http.get<AdminGame>(`/api/staff/games/${id}/`);
   }
 
-  cloneGame(
-    id: number,
-    payload: { name?: string; slug?: string } = {},
-  ): Observable<AdminGame> {
+  cloneGame(id: number, payload: { name?: string; slug?: string } = {}): Observable<AdminGame> {
     return this.http.post<AdminGame>(`/api/staff/games/${id}/clone/`, payload);
   }
 
@@ -969,10 +968,7 @@ export class StaffApiService {
     return this.http.post<AdminSession>('/api/staff/sessions/', payload);
   }
 
-  updateSession(
-    id: number,
-    payload: AdminSessionPayload,
-  ): Observable<AdminSession> {
+  updateSession(id: number, payload: AdminSessionPayload): Observable<AdminSession> {
     return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
   }
 
@@ -1028,17 +1024,13 @@ export class StaffApiService {
   }
 
   sessionFailCounters(id: number): Observable<FailCounterInfo[]> {
-    return this.http.get<FailCounterInfo[]>(
-      `/api/staff/sessions/${id}/fail_counters/`,
-    );
+    return this.http.get<FailCounterInfo[]>(`/api/staff/sessions/${id}/fail_counters/`);
   }
 
   // ---- Team rules: start-gate readiness -------------------------------------
 
   sessionStartBlockers(id: number): Observable<StartReadiness> {
-    return this.http.get<StartReadiness>(
-      `/api/staff/sessions/${id}/start_blockers/`,
-    );
+    return this.http.get<StartReadiness>(`/api/staff/sessions/${id}/start_blockers/`);
   }
 
   // ---- presence-rules: reusable presence requirements -----------------------
@@ -1050,10 +1042,7 @@ export class StaffApiService {
   createPresenceRequirement(
     payload: AdminPresenceRequirementPayload,
   ): Observable<AdminPresenceRequirement> {
-    return this.http.post<AdminPresenceRequirement>(
-      '/api/staff/presence-requirements/',
-      payload,
-    );
+    return this.http.post<AdminPresenceRequirement>('/api/staff/presence-requirements/', payload);
   }
 
   updatePresenceRequirement(
@@ -1073,9 +1062,7 @@ export class StaffApiService {
   // ---- tower-visibility: discovery matrix + staff reveal --------------------
 
   sessionDiscoveryMatrix(id: number): Observable<DiscoveryMatrix> {
-    return this.http.get<DiscoveryMatrix>(
-      `/api/staff/sessions/${id}/discovery-matrix/`,
-    );
+    return this.http.get<DiscoveryMatrix>(`/api/staff/sessions/${id}/discovery-matrix/`);
   }
 
   revealTowerToTeam(teamId: number, towerId: number): Observable<DiscoveryMatrixCell> {
@@ -1097,11 +1084,8 @@ export class StaffApiService {
     if (filters.from) parts.push(`from=${encodeURIComponent(filters.from)}`);
     if (filters.to) parts.push(`to=${encodeURIComponent(filters.to)}`);
     const query = parts.length ? `?${parts.join('&')}` : '';
-    return this.http.get<LocationHistory>(
-      `/api/staff/sessions/${id}/location-history/${query}`,
-    );
+    return this.http.get<LocationHistory>(`/api/staff/sessions/${id}/location-history/${query}`);
   }
-
 
   // ---- session-replay: one bundle per Session, scrubbed client-side ---------
 
@@ -1125,7 +1109,6 @@ export class StaffApiService {
     const query = parts.length ? `?${parts.join('&')}` : '';
     return this.http.get<SessionReplayBundle>(`/api/staff/sessions/${id}/replay/${query}`);
   }
-
 
   // ---- library-map: the whole repository in one request -------------------
 
@@ -1166,32 +1149,22 @@ export class StaffApiService {
    * without telling that room anything it needs.
    */
   publicOverview(token: string): Observable<OverviewSnapshot> {
-    return this.http.get<OverviewSnapshot>(
-      `/api/overview/${encodeURIComponent(token)}/`,
-    );
+    return this.http.get<OverviewSnapshot>(`/api/overview/${encodeURIComponent(token)}/`);
   }
 
   overviewLinks(sessionId: number): Observable<OverviewLink[]> {
-    return this.http.get<OverviewLink[]>(
-      `/api/staff/sessions/${sessionId}/overview-links/`,
-    );
+    return this.http.get<OverviewLink[]>(`/api/staff/sessions/${sessionId}/overview-links/`);
   }
 
   createOverviewLink(
     sessionId: number,
     body: { label?: string; expires_at?: string } = {},
   ): Observable<OverviewLink> {
-    return this.http.post<OverviewLink>(
-      `/api/staff/sessions/${sessionId}/overview-links/`,
-      body,
-    );
+    return this.http.post<OverviewLink>(`/api/staff/sessions/${sessionId}/overview-links/`, body);
   }
 
   revokeOverviewLink(id: number): Observable<OverviewLink> {
-    return this.http.post<OverviewLink>(
-      `/api/staff/overview-links/${id}/revoke/`,
-      {},
-    );
+    return this.http.post<OverviewLink>(`/api/staff/overview-links/${id}/revoke/`, {});
   }
 
   // ---- nfc-native-and-secure-links: tag provisioning + scan audit ----------
@@ -1228,9 +1201,7 @@ export class StaffApiService {
   // ---- Score multipliers (score-multipliers) --------------------------------
 
   listGameMultipliers(gameId: number): Observable<AdminScoreMultiplier[]> {
-    return this.http.get<AdminScoreMultiplier[]>(
-      `/api/staff/games/${gameId}/score-multipliers/`,
-    );
+    return this.http.get<AdminScoreMultiplier[]>(`/api/staff/games/${gameId}/score-multipliers/`);
   }
 
   createGameMultiplier(
@@ -1255,9 +1226,7 @@ export class StaffApiService {
   }
 
   deleteGameMultiplier(gameId: number, id: number): Observable<void> {
-    return this.http.delete<void>(
-      `/api/staff/games/${gameId}/score-multipliers/${id}/`,
-    );
+    return this.http.delete<void>(`/api/staff/games/${gameId}/score-multipliers/${id}/`);
   }
 
   /** Union of Session-owned and Game-owned rows — the whole picture. */
@@ -1332,17 +1301,13 @@ export class StaffApiService {
   }
 
   issueMcpCredential(label: string): Observable<McpCredential & { token: string }> {
-    return this.http.post<McpCredential & { token: string }>(
-      '/api/staff/authoring/credentials/',
-      { label },
-    );
+    return this.http.post<McpCredential & { token: string }>('/api/staff/authoring/credentials/', {
+      label,
+    });
   }
 
   revokeMcpCredential(id: number): Observable<McpCredential> {
-    return this.http.post<McpCredential>(
-      `/api/staff/authoring/credentials/${id}/revoke/`,
-      {},
-    );
+    return this.http.post<McpCredential>(`/api/staff/authoring/credentials/${id}/revoke/`, {});
   }
 
   // --- simulator ---------------------------------------------------------
@@ -1467,7 +1432,6 @@ export interface TagScanInfo {
   counter: number | null;
 }
 
-
 /** A ScoreMultiplier row (score-multipliers capability). Durations are
  *  Django strings ("HH:MM:SS" or "D HH:MM:SS"); datetimes are ISO. */
 export interface AdminScoreMultiplier {
@@ -1510,11 +1474,16 @@ export interface AdminScoreMultiplierPayload {
 // ---- mcp-authoring: staged proposals, operations, audit, credentials -------
 
 export type AuthoringProposalStatus =
-  | 'DRAFT' | 'PENDING' | 'APPROVED' | 'APPLIED'
-  | 'PARTIALLY_APPLIED' | 'REJECTED' | 'WITHDRAWN' | 'FAILED';
+  | 'DRAFT'
+  | 'PENDING'
+  | 'APPROVED'
+  | 'APPLIED'
+  | 'PARTIALLY_APPLIED'
+  | 'REJECTED'
+  | 'WITHDRAWN'
+  | 'FAILED';
 
-export type ProposedOperationStatus =
-  | 'PENDING' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'FAILED';
+export type ProposedOperationStatus = 'PENDING' | 'APPROVED' | 'REJECTED' | 'APPLIED' | 'FAILED';
 
 export interface ProposedOperation {
   id: number;
@@ -1669,7 +1638,12 @@ export interface SimulationRunDetail extends SimulationRun {
 }
 
 export type SimulationEventAction =
-  | 'SPAWN' | 'MOVE' | 'PROXIMITY' | 'CAPTURE' | 'TRANSITION' | 'TICK';
+  | 'SPAWN'
+  | 'MOVE'
+  | 'PROXIMITY'
+  | 'CAPTURE'
+  | 'TRANSITION'
+  | 'TICK';
 
 /**
  * One entry in a run's append-only replay tape. MOVE payload carries
@@ -1687,7 +1661,6 @@ export interface SimulationEvent {
   payload: Record<string, unknown>;
   outcome: Record<string, unknown>;
 }
-
 
 // session-replay: the staff replay bundle for a recorded Session. Frame
 // indices are time buckets `interval_seconds` wide, counted from
@@ -1775,7 +1748,6 @@ export interface SessionReplayBundle {
   positions: SessionReplayPosition[];
   availability: SessionReplayAvailability;
 }
-
 
 // ---- live-overview -------------------------------------------------------
 
@@ -1894,7 +1866,6 @@ export interface OverviewLink {
   url: string;
 }
 
-
 // ---- Content bundles (content-portability) ----------------------------------
 
 /** How an import treats content this install already holds. */
@@ -1936,7 +1907,6 @@ export interface BundleImportReport {
   total_created: number;
   total_updated: number;
 }
-
 
 // ---- library-map ---------------------------------------------------------
 

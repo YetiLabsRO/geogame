@@ -239,6 +239,40 @@ BASE_URL = os.environ.get("BASE_URL", "http://127.0.0.1:8200")
 
 MEDIA_ROOT = BASE_DIR / 'media'
 
+# Reference media on towers and zones (tower-zone-media). Caps are per
+# kind and are enforced server-side; the field client applies the same
+# numbers up front so a curator learns the limit before recording rather
+# than after walking away. Raise them per install if the pipe allows —
+# `game.media.limits_for` merges whatever is named here over the
+# documented defaults in `game.media.DEFAULT_LIMITS`, so overriding one
+# number does not mean restating the other five.
+MEDIA_ASSET_LIMITS = {
+    # A photo is downscaled on the device before it is sent, so this cap
+    # catches a client that failed to, not a curator being careless.
+    'IMAGE': {
+        'max_bytes': int(os.environ.get('MEDIA_IMAGE_MAX_BYTES', 12 * 1024 * 1024)),
+    },
+    # Three minutes is a long spoken note; past that it is a recording
+    # someone forgot to stop.
+    'AUDIO': {
+        'max_bytes': int(os.environ.get('MEDIA_AUDIO_MAX_BYTES', 12 * 1024 * 1024)),
+        'max_seconds': int(os.environ.get('MEDIA_AUDIO_MAX_SECONDS', 180)),
+    },
+    # A clip shows an approach or a route. Thirty seconds is enough for
+    # either, and short enough that a curator on mobile data can send one.
+    'VIDEO': {
+        'max_bytes': int(os.environ.get('MEDIA_VIDEO_MAX_BYTES', 48 * 1024 * 1024)),
+        'max_seconds': int(os.environ.get('MEDIA_VIDEO_MAX_SECONDS', 30)),
+    },
+}
+
+# A video clip arrives as one multipart part; Django's default in-memory
+# ceiling would otherwise refuse it before any of our own limits get a
+# say, and the error that produces names nothing useful.
+DATA_UPLOAD_MAX_MEMORY_SIZE = int(
+    os.environ.get('DATA_UPLOAD_MAX_MEMORY_SIZE', 64 * 1024 * 1024),
+)
+
 try:
     from .local_settings import *
 except ImportError:

@@ -36,7 +36,11 @@ from django.utils.dateparse import parse_datetime, parse_duration
 from django.utils.duration import duration_iso_string
 
 FORMAT = 'cercetador-content-bundle'
-FORMAT_VERSION = 1
+# 2: `tower_photos` became `media` when reference media widened to zones
+# and to audio and video (tower-zone-media). The key set is the format,
+# so a v1 bundle is refused by name rather than silently losing its
+# photos to an unknown-kind error.
+FORMAT_VERSION = 2
 
 BUNDLE_JSON = 'bundle.json'
 MEDIA_ROOT = 'media/'
@@ -117,10 +121,10 @@ def _build_manifest():
     from game.models import (
         Challenge,
         Collection,
+        MediaAsset,
         PresenceRequirement,
         ScoreMultiplier,
         Tower,
-        TowerPhoto,
         TowerType,
         Trail,
         TrailEdge,
@@ -144,10 +148,14 @@ def _build_manifest():
             post_m2m_fields=('autocreate_zone',),
         ),
         BundleSpec(
-            key='tower_photos',
-            model=TowerPhoto,
-            refs={'tower': 'towers'},
-            files=('image',),
+            key='media',
+            model=MediaAsset,
+            # Exactly one of the two is set on any given row; the
+            # resolver writes whichever the bundle carried and leaves
+            # the other null, so the exactly-one constraint survives
+            # the trip without the importer knowing about it.
+            refs={'tower': 'towers', 'zone': 'zones'},
+            files=('file',),
             # A user id from another install names nobody here.
             exclude=('captured_by',),
         ),
@@ -373,10 +381,10 @@ def collect(games=(), collections=()):
     from game.models import (
         Challenge,
         Collection,
+        MediaAsset,
         PresenceRequirement,
         ScoreMultiplier,
         Tower,
-        TowerPhoto,
         TowerType,
         Trail,
         TrailEdge,
@@ -429,7 +437,11 @@ def collect(games=(), collections=()):
         'tower_types': list(TowerType.objects.filter(pk__in=type_ids)),
         'zones': zones,
         'towers': towers,
-        'tower_photos': list(TowerPhoto.objects.filter(tower_id__in=tower_ids)),
+        'media': list(
+            MediaAsset.objects.filter(
+                models.Q(tower_id__in=tower_ids) | models.Q(zone_id__in=zone_ids),
+            ),
+        ),
         'collections': collections,
         'presence_requirements': list(
             PresenceRequirement.objects.filter(pk__in=requirement_ids),

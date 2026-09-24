@@ -46,7 +46,7 @@ import { extractErrorMessage } from '../auth/form-error';
         <h2 class="h6 mb-1">
           Export
           <app-info-hint
-            text="A game already brings the collections it links, and those bring their towers, zones, types and photos. Pick a collection on its own to send a map without a game's rules or challenges."
+            text="A game already brings the collections it links, and those bring their towers, zones, types and reference media. Pick a collection on its own to send a map without a game's rules or challenges."
           />
         </h2>
         <p class="text-body-secondary small mb-3">

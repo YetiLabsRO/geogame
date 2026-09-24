@@ -29,7 +29,7 @@ def _towers():
         Tower.objects
         .select_related('tower_type')
         .prefetch_related('collections')
-        .annotate(media_count=Count('photos', distinct=True))
+        .annotate(media_count=Count('media', distinct=True))
         .order_by('name')
     )
     return [{
@@ -54,15 +54,18 @@ def _towers():
 
 
 def _zones():
-    rows = Zone.objects.prefetch_related('collections').order_by('name')
+    rows = (
+        Zone.objects
+        .prefetch_related('collections')
+        .annotate(media_count=Count('media', distinct=True))
+        .order_by('name')
+    )
     return [{
         'id': zone.id,
         'name': zone.name,
         'color': zone.color,
         'shape': zone.shape.geojson if zone.shape else None,
-        # Zones cannot carry media yet — that arrives with
-        # `tower-zone-media`. Zero here is true, not a placeholder.
-        'media_count': 0,
+        'media_count': zone.media_count,
         'collection_ids': [c.id for c in zone.collections.all()],
     } for zone in rows]
 

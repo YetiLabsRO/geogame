@@ -11,12 +11,17 @@ from django.db import transaction
 from django.db.models import Count, F, Max, Q, Value
 from django.db.models.functions import Greatest
 from django.db.models.signals import m2m_changed, pre_delete
+from django.utils import timezone as dj_timezone
 
 from game.challenge_types import (
     CHALLENGE_TYPE_CHOICES,
     REVIEW_MODE_CHOICES,
     TYPE_TEXT,
     get_handler,
+)
+from game.media import (
+    MEDIA_IMAGE,
+    MEDIA_KIND_CHOICES,
 )
 from organize.models import (
     CHALLENGE_VIS_VISIBLE_ANYWHERE,
@@ -897,13 +902,39 @@ pre_delete.connect(
 )
 
 
-class TowerPhoto(models.Model):
-    """A curator-captured reference photo of a Tower's physical objective.
+def media_upload_to(instance, filename):
+    """Store each kind under its own prefix.
 
-    Field-authoring provenance: helps players recognise the thing the
-    tower stands for. Explicitly distinct from the player submission
-    photos on `TeamTowerChallenge` — a Tower MAY have many reference
-    photos (several angles of the same fountain).
+    Purely for the humans who will one day look at the storage bucket.
+    Nothing reads the path back apart from the storage layer; the rows
+    migrated from the old `tower_photos/` prefix keep theirs, because a
+    `FileField` holds a path and re-homing several hundred files buys
+    nothing but a window in which half of them are missing.
+    """
+    return f'reference_media/{instance.kind.lower()}/{filename}'
+
+
+class MediaAsset(models.Model):
+    """Curator-captured reference media for a Tower or a Zone.
+
+    What turns a coordinate into a findable place: which of the four
+    fountains, which gate to enter the meadow by, and — for the things
+    badly suited to a still — ten seconds of someone saying where the
+    marker actually is.
+
+    Explicitly distinct from the photos players submit against
+    challenges (`TeamTowerChallenge.photo`). That is evidence of an
+    attempt; this is a description of a place, and neither belongs in
+    the other's listing.
+
+    **Exactly one subject.** `tower` and `zone` are both nullable and a
+    database `CheckConstraint` requires precisely one of them. The
+    alternative shapes — a parallel `ZonePhoto`, or a `GenericForeignKey`
+    — either duplicate every query and every rule, or give up
+    referential integrity and `select_related` for a polymorphism that
+    only ever points at two models. The rule lives in the constraint
+    rather than in `clean()` because bulk creates and data migrations
+    bypass model validation and the invariant has to hold for them too.
     """
 
     # Portable identity (content-bundles): stable across databases, so
@@ -912,24 +943,64 @@ class TowerPhoto(models.Model):
     # must not fork the row.
     uuid = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
 
-    tower = models.ForeignKey(Tower, on_delete=models.CASCADE, related_name='photos')
-    image = models.ImageField(upload_to='tower_photos')
+    tower = models.ForeignKey(
+        Tower, on_delete=models.CASCADE, related_name='media',
+        null=True, blank=True,
+    )
+    zone = models.ForeignKey(
+        Zone, on_delete=models.CASCADE, related_name='media',
+        null=True, blank=True,
+    )
+    kind = models.CharField(
+        max_length=8, choices=MEDIA_KIND_CHOICES, default=MEDIA_IMAGE,
+    )
+    file = models.FileField(upload_to=media_upload_to)
     caption = models.CharField(max_length=255, blank=True, default='')
+    # Audio and video only; the client measures it, because decoding
+    # every upload server-side to recover a number the recorder already
+    # knew is a lot of work for a chip that reads "0:12". Bounded on the
+    # way in (`game.media.check_duration`) rather than trusted.
+    duration_seconds = models.FloatField(null=True, blank=True)
+    # Recorded at upload from the stored file, never taken from the
+    # client. Migrated rows carry 0, meaning "not measured".
+    byte_size = models.PositiveBigIntegerField(default=0)
     captured_by = models.ForeignKey(
         settings.AUTH_USER_MODEL,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name='tower_photos',
+        related_name='captured_media',
     )
-    captured_at = models.DateTimeField(auto_now_add=True)
+    # Settable rather than `auto_now_add`: a capture queued offline and
+    # replayed three days later happened in the field, not at the moment
+    # the phone found a signal. Defaults to now for everything else.
+    captured_at = models.DateTimeField(default=dj_timezone.now)
 
     class Meta:
-        ordering = ['-captured_at']
+        # `-id` breaks the tie, so two captures a second apart — which a
+        # burst of three photos of the same gate certainly is — come back
+        # in a stable order rather than shuffling between requests.
+        ordering = ['-captured_at', '-id']
+        constraints = [
+            models.CheckConstraint(
+                condition=(
+                    Q(tower__isnull=False, zone__isnull=True)
+                    | Q(tower__isnull=True, zone__isnull=False)
+                ),
+                name='media_asset_exactly_one_subject',
+            ),
+        ]
+
+    @property
+    def subject(self):
+        """The Tower or Zone this describes — never both, never neither."""
+        return self.tower or self.zone
 
     def __str__(self):
-        return f'Reference photo of {self.tower.name} ({self.captured_at:%Y-%m-%d})' \
-            if self.captured_at else f'Reference photo of {self.tower.name}'
+        subject = self.subject
+        label = dict(MEDIA_KIND_CHOICES).get(self.kind, self.kind)
+        where = subject.name if subject is not None else 'nothing'
+        return f'{label} of {where}'
 
 
 class Collection(models.Model):

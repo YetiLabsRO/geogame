@@ -53,6 +53,7 @@ from rest_framework.test import APIClient
 from game import (
     bundles,  # content-bundles
     events,
+    media,  # tower-zone-media
     overview,  # live-overview
     replay,  # session-replay
 )
@@ -75,6 +76,11 @@ from game.challenge_types import (
     get_handler,
 )
 from game.dementors import assign_initial_roles, economy_tick, run_tick
+from game.media import (
+    MEDIA_AUDIO,
+    MEDIA_IMAGE,
+    MEDIA_VIDEO,
+)
 from game.models import (  # score-multipliers  # tower-locking  # mode-trail-discovery  # nfc-native-and-secure-links  # mode-dementors-ble
     DEFAULT_TOWER_COLOR,  # tower-types
     DEFAULT_TOWER_ICON,
@@ -105,6 +111,7 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     GatewayNode,
     LocationConsent,
     LocationPing,
+    MediaAsset,
     NfcTag,
     PauseWindow,
     PresenceCheck,
@@ -125,7 +132,6 @@ from game.models import (  # score-multipliers  # tower-locking  # mode-trail-di
     Tower,
     TowerDiscovery,
     TowerLock,
-    TowerPhoto,
     TowerType,  # tower-types
     Trail,
     TrailEdge,
@@ -5668,48 +5674,504 @@ class FieldAuthoringTowerApiTest(TestCase):
     def test_photo_upload_records_capture_provenance(self):
         tower = _make_tower(self.game, name='T1')
         resp = self.staff_client.post(
-            f'/api/staff/towers/{tower.id}/photos/',
+            f'/api/staff/towers/{tower.id}/media/',
             {
-                'image': f'data:image/png;base64,{_tiny_png_b64()}',
+                'file': f'data:image/png;base64,{_tiny_png_b64()}',
                 'caption': 'north face',
             },
             format='json',
         )
         self.assertEqual(resp.status_code, 201, resp.content)
-        photo = TowerPhoto.objects.get(pk=resp.json()['id'])
-        self.assertEqual(photo.tower, tower)
-        self.assertEqual(photo.caption, 'north face')
-        self.assertEqual(photo.captured_by, self.staff)
-        self.assertIsNotNone(photo.captured_at)
+        asset = MediaAsset.objects.get(pk=resp.json()['id'])
+        self.assertEqual(asset.tower, tower)
+        self.assertIsNone(asset.zone)
+        self.assertEqual(asset.kind, MEDIA_IMAGE)
+        self.assertEqual(asset.caption, 'north face')
+        self.assertEqual(asset.captured_by, self.staff)
+        self.assertIsNotNone(asset.captured_at)
 
     def test_tower_may_have_multiple_photos_listed_and_deleted(self):
         tower = _make_tower(self.game, name='T1')
         for caption in ('front', 'back'):
             self.staff_client.post(
-                f'/api/staff/towers/{tower.id}/photos/',
-                {'image': f'data:image/png;base64,{_tiny_png_b64()}', 'caption': caption},
+                f'/api/staff/towers/{tower.id}/media/',
+                {'file': f'data:image/png;base64,{_tiny_png_b64()}', 'caption': caption},
                 format='json',
             )
-        resp = self.staff_client.get(f'/api/staff/towers/{tower.id}/photos/')
+        resp = self.staff_client.get(f'/api/staff/towers/{tower.id}/media/')
         self.assertEqual(resp.status_code, 200)
         self.assertEqual(len(resp.json()), 2)
 
-        photo_id = resp.json()[0]['id']
+        asset_id = resp.json()[0]['id']
         resp = self.staff_client.delete(
-            f'/api/staff/towers/{tower.id}/photos/{photo_id}/',
+            f'/api/staff/towers/{tower.id}/media/{asset_id}/',
         )
         self.assertEqual(resp.status_code, 204)
-        self.assertEqual(tower.photos.count(), 1)
+        self.assertEqual(tower.media.count(), 1)
 
     def test_photo_endpoints_require_staff(self):
         tower = _make_tower(self.game, name='T1')
         player_client, _ = _authed_client(self.team)
         resp = player_client.post(
-            f'/api/staff/towers/{tower.id}/photos/',
-            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            f'/api/staff/towers/{tower.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
             format='json',
         )
         self.assertEqual(resp.status_code, 403)
+
+
+# ---------------------------------------------------------------------------
+# tower-zone-media — reference media on towers and zones
+# ---------------------------------------------------------------------------
+
+
+def _media_data_url(content_type, payload=b'bytes'):
+    return f'data:{content_type};base64,{base64.b64encode(payload).decode()}'
+
+
+class MediaRulesTest(TestCase):
+    """The rules themselves, away from a request.
+
+    `game.media` is the one place that decides what may be stored and
+    how much of it, and a serializer test only reaches the paths a
+    serializer happens to take. These are the rest.
+    """
+
+    def test_a_codec_parameter_does_not_change_the_type(self):
+        # Chrome's MediaRecorder emits exactly this.
+        self.assertEqual(
+            media.normalize_content_type('audio/webm;codecs=opus'), 'audio/webm',
+        )
+        self.assertEqual(media.normalize_content_type('  IMAGE/PNG '), 'image/png')
+        self.assertIsNone(media.normalize_content_type(''))
+        self.assertIsNone(media.normalize_content_type(None))
+
+    def test_a_type_is_guessed_from_a_name_when_none_was_declared(self):
+        self.assertEqual(media.content_type_for_name('gate.mp4'), 'video/mp4')
+        self.assertIsNone(media.content_type_for_name(''))
+        self.assertIsNone(media.content_type_for_name('mystery'))
+
+    def test_kinds_and_their_types_agree_in_both_directions(self):
+        for kind, content_types in media.CONTENT_TYPES_BY_KIND.items():
+            for content_type in content_types:
+                self.assertEqual(media.kind_for_content_type(content_type), kind)
+                # Every accepted type also has an extension to store it
+                # under; otherwise a decoded data URL lands as `.bin`
+                # and a web server serves it as a download.
+                self.assertNotEqual(
+                    media.extension_for(content_type), 'bin', content_type,
+                )
+        self.assertIsNone(media.kind_for_content_type('application/pdf'))
+
+    def test_an_unknown_kind_is_refused(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_kind('HOLOGRAM', 'image/png')
+        self.assertIn('HOLOGRAM', str(caught.exception))
+
+    def test_a_file_that_declares_nothing_is_refused(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_kind(MEDIA_IMAGE, None)
+        self.assertIn('did not say what type it is', str(caught.exception))
+
+    def test_a_negative_duration_is_refused(self):
+        with self.assertRaises(media.MediaRejected):
+            media.check_duration(MEDIA_VIDEO, -1)
+
+    def test_no_duration_is_allowed(self):
+        media.check_duration(MEDIA_IMAGE, None)  # a photo has none
+
+    @override_settings(MEDIA_ASSET_LIMITS={'AUDIO': {'max_seconds': 5}})
+    def test_an_override_names_one_facet_and_keeps_the_rest(self):
+        limits = media.limits_for(MEDIA_AUDIO)
+        self.assertEqual(limits['max_seconds'], 5)
+        # Not restated by the override, so it falls back to the default.
+        self.assertEqual(
+            limits['max_bytes'], media.DEFAULT_LIMITS[MEDIA_AUDIO]['max_bytes'],
+        )
+
+    def test_a_rejection_says_the_size_in_units_a_person_reads(self):
+        with self.assertRaises(media.MediaRejected) as caught:
+            media.check_size(MEDIA_VIDEO, 200 * 1024 * 1024)
+        self.assertIn('MB', str(caught.exception))
+        with self.assertRaises(media.MediaRejected) as caught:
+            with override_settings(MEDIA_ASSET_LIMITS={'IMAGE': {'max_bytes': 2048}}):
+                media.check_size(MEDIA_IMAGE, 4096)
+        self.assertIn('KB', str(caught.exception))
+
+
+class MediaAssetModelTest(TestCase):
+    """Task 1.5 — exactly one subject, cascade, and indifference to curation."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.other_tower = _make_tower(self.game, name='T2', zone=self.zone)
+
+    def _unsaved(self, **kwargs):
+        return MediaAsset(
+            kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+            **kwargs,
+        )
+
+    def test_both_subjects_is_refused(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._unsaved(tower=self.tower, zone=self.zone).save()
+
+    def test_neither_subject_is_refused(self):
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            self._unsaved().save()
+
+    def test_bulk_create_cannot_bypass_the_rule(self):
+        """Why the invariant is a constraint and not a `clean()`.
+
+        Bulk creates skip model validation, and so does every data
+        migration; if the rule lived in Python this would sail through.
+        """
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            MediaAsset.objects.bulk_create([self._unsaved()])
+
+    def test_deleting_a_tower_takes_its_media(self):
+        MediaAsset.objects.create(
+            tower=self.other_tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        self.other_tower.delete()
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_deleting_a_zone_takes_its_media(self):
+        zone = _make_zone(self.game, name='Spare')
+        MediaAsset.objects.create(
+            zone=zone, kind=MEDIA_AUDIO,
+            file=SimpleUploadedFile('a.weba', b'x', 'audio/webm'),
+        )
+        zone.delete()
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_recollecting_the_geometry_leaves_media_alone(self):
+        """Media hangs off the repository row, not off a collection."""
+        asset = MediaAsset.objects.create(
+            tower=self.tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        second = Collection.objects.create(name='Second map', slug='second-map')
+        second.towers.add(self.tower)
+        _game_collection(self.game).towers.remove(self.tower)
+        asset.refresh_from_db()
+        self.assertEqual(asset.tower, self.tower)
+        self.assertEqual(self.tower.media.count(), 1)
+
+    def test_subject_names_whichever_one_is_set(self):
+        photo = MediaAsset.objects.create(
+            tower=self.tower, kind=MEDIA_IMAGE,
+            file=SimpleUploadedFile('a.png', b'x', 'image/png'),
+        )
+        note = MediaAsset.objects.create(
+            zone=self.zone, kind=MEDIA_AUDIO,
+            file=SimpleUploadedFile('a.weba', b'x', 'audio/webm'),
+        )
+        self.assertEqual(photo.subject, self.tower)
+        self.assertEqual(note.subject, self.zone)
+
+
+class MediaCarryOverMigrationTest(TransactionTestCase):
+    """Task 1.5 — every existing reference photo survives the widening.
+
+    Run against the migration rather than against a helper, because the
+    thing under test is precisely what happens to rows that already
+    exist when the schema changes, and a helper would be testing a
+    second implementation of it.
+    """
+
+    migrate_from = [('game', '0042_content_bundle_uuids')]
+    migrate_to = [('game', '0043_media_assets')]
+
+    def _migrate(self, targets):
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(targets)
+        return executor.loader.project_state(targets).apps
+
+    def tearDown(self):
+        # Leave the schema at head for the rest of the suite.
+        executor = MigrationExecutor(connection)
+        executor.loader.build_graph()
+        executor.migrate(executor.loader.graph.leaf_nodes())
+        super().tearDown()
+
+    def _seed_photo(self):
+        old_apps = self._migrate(self.migrate_from)
+        OldTower = old_apps.get_model('game', 'Tower')
+        OldPhoto = old_apps.get_model('game', 'TowerPhoto')
+        user = User.objects.create_user(
+            username='fieldworker', email='f@example.com', password='pw',
+            is_staff=True,
+        )
+        tower = OldTower.objects.create(
+            name='Old Mill', location=Point(23.58, 46.07),
+            is_active=True, category=1,
+        )
+        photo = OldPhoto.objects.create(
+            tower=tower,
+            image='tower_photos/mill-from-the-bridge.jpg',
+            caption='From the bridge',
+            captured_by_id=user.pk,
+        )
+        captured_at = datetime(2026, 5, 4, 9, 15, tzinfo=dt_timezone.utc)
+        # `captured_at` is auto_now_add, so it has to be written past the
+        # model to be anything but "now".
+        OldPhoto.objects.filter(pk=photo.pk).update(captured_at=captured_at)
+        return {
+            'uuid': photo.uuid,
+            'tower_id': tower.pk,
+            'user_id': user.pk,
+            'captured_at': captured_at,
+        }
+
+    def test_a_photo_becomes_image_media_keeping_everything(self):
+        seeded = self._seed_photo()
+
+        new_apps = self._migrate(self.migrate_to)
+        MediaAsset = new_apps.get_model('game', 'MediaAsset')
+
+        asset = MediaAsset.objects.get()
+        self.assertEqual(asset.kind, 'IMAGE')
+        self.assertEqual(asset.tower_id, seeded['tower_id'])
+        self.assertIsNone(asset.zone_id)
+        # The stored path is copied verbatim: no file is moved, so the
+        # old `tower_photos/` prefix has to keep resolving.
+        self.assertEqual(asset.file.name, 'tower_photos/mill-from-the-bridge.jpg')
+        self.assertEqual(asset.caption, 'From the bridge')
+        self.assertEqual(asset.captured_by_id, seeded['user_id'])
+        self.assertEqual(asset.captured_at, seeded['captured_at'])
+        # Portable identity survives, so a bundle exported before this
+        # migration still names the same row after it.
+        self.assertEqual(asset.uuid, seeded['uuid'])
+
+    def test_rolling_back_restores_the_photo_it_came_from(self):
+        seeded = self._seed_photo()
+        self._migrate(self.migrate_to)
+
+        old_apps = self._migrate(self.migrate_from)
+        OldPhoto = old_apps.get_model('game', 'TowerPhoto')
+
+        photo = OldPhoto.objects.get()
+        self.assertEqual(photo.image.name, 'tower_photos/mill-from-the-bridge.jpg')
+        self.assertEqual(photo.caption, 'From the bridge')
+        self.assertEqual(photo.uuid, seeded['uuid'])
+        # `TowerPhoto.captured_at` is auto_now_add; the reverse puts the
+        # real capture time back rather than stamping the rollback.
+        self.assertEqual(photo.captured_at, seeded['captured_at'])
+
+
+class MediaApiTest(TestCase):
+    """Tasks 2.4 / 3.1–3.4 — what the media endpoints accept and refuse."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, name='T1', zone=self.zone)
+        self.staff_client, self.staff = _staff_client(username='curator')
+
+    def _post(self, subject, path_id, payload, fmt='json'):
+        return self.staff_client.post(
+            f'/api/staff/{subject}/{path_id}/media/', payload, format=fmt,
+        )
+
+    def test_zone_accepts_an_audio_note_with_its_duration(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm;codecs=opus'),
+            'kind': MEDIA_AUDIO,
+            'duration_seconds': 11.5,
+            'caption': 'Enter by the north gate',
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        asset = MediaAsset.objects.get(pk=resp.json()['id'])
+        self.assertEqual(asset.zone, self.zone)
+        self.assertIsNone(asset.tower)
+        self.assertEqual(asset.kind, MEDIA_AUDIO)
+        self.assertEqual(asset.duration_seconds, 11.5)
+        self.assertEqual(asset.captured_by, self.staff)
+        # The codec parameter must not have survived into the extension.
+        self.assertTrue(asset.file.name.endswith('.weba'), asset.file.name)
+
+    def test_tower_accepts_a_video_clip(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('video/mp4'),
+            'kind': MEDIA_VIDEO,
+            'duration_seconds': 12,
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().kind, MEDIA_VIDEO)
+
+    def test_kind_is_inferred_when_the_client_does_not_say(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/ogg'),
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().kind, MEDIA_AUDIO)
+
+    def test_a_declared_kind_that_contradicts_the_file_is_refused(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('audio/webm'),
+            'kind': MEDIA_IMAGE,
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('audio', str(resp.json()['file']).lower())
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_a_capture_that_will_not_decode_is_refused_clearly(self):
+        # The legacy-queue carry-over deliberately forwards a data URL it
+        # could not decode rather than dropping it, so this is the reply
+        # a curator sees when that happens.
+        resp = self._post('towers', self.tower.id, {
+            'file': 'data:image/png;base64,not-valid-base64!!',
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('could not be decoded', str(resp.json()['file']))
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_an_unsupported_type_is_refused_rather_than_stored(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('application/x-msdownload'),
+        })
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn('not a supported media type', str(resp.json()['file']))
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    @override_settings(MEDIA_ASSET_LIMITS={'AUDIO': {'max_bytes': 16}})
+    def test_an_oversized_upload_names_the_size_limit(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm', b'x' * 4096),
+            'kind': MEDIA_AUDIO,
+        })
+        self.assertEqual(resp.status_code, 400)
+        message = str(resp.json()['file'])
+        self.assertIn('at most', message)
+        self.assertIn('4 KB', message)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    @override_settings(MEDIA_ASSET_LIMITS={'VIDEO': {'max_seconds': 30}})
+    def test_a_clip_over_the_duration_cap_names_the_limit(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('video/webm'),
+            'kind': MEDIA_VIDEO,
+            'duration_seconds': 47,
+        })
+        self.assertEqual(resp.status_code, 400)
+        message = str(resp.json()['duration_seconds'])
+        self.assertIn('30 s', message)
+        self.assertIn('47 s', message)
+        self.assertEqual(MediaAsset.objects.count(), 0)
+
+    def test_a_multipart_upload_works_as_well_as_a_data_url(self):
+        """Both shapes, one endpoint: live capture posts a file, the
+        offline queue replays JSON hours later with no multipart body
+        left to replay."""
+        upload = SimpleUploadedFile('clip.webm', b'x' * 32, 'video/webm')
+        resp = self._post(
+            'zones', self.zone.id,
+            {'file': upload, 'kind': MEDIA_VIDEO, 'duration_seconds': 4},
+            fmt='multipart',
+        )
+        self.assertEqual(resp.status_code, 201, resp.content)
+        asset = MediaAsset.objects.get()
+        self.assertEqual(asset.kind, MEDIA_VIDEO)
+        self.assertEqual(asset.byte_size, 32)
+
+    def test_byte_size_is_measured_not_taken_from_the_client(self):
+        resp = self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png', b'x' * 500),
+            'byte_size': 1,
+        })
+        self.assertEqual(resp.status_code, 201, resp.content)
+        self.assertEqual(MediaAsset.objects.get().byte_size, 500)
+
+    def test_media_listings_are_per_subject(self):
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png'), 'caption': 'the tower',
+        })
+        self._post('zones', self.zone.id, {
+            'file': _media_data_url('image/png'), 'caption': 'the zone',
+        })
+        tower_listing = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/media/',
+        ).json()
+        zone_listing = self.staff_client.get(
+            f'/api/staff/zones/{self.zone.id}/media/',
+        ).json()
+        self.assertEqual([m['caption'] for m in tower_listing], ['the tower'])
+        self.assertEqual([m['caption'] for m in zone_listing], ['the zone'])
+
+    def test_a_zone_asset_cannot_be_deleted_through_a_tower(self):
+        resp = self._post('zones', self.zone.id, {
+            'file': _media_data_url('image/png'),
+        })
+        asset_id = resp.json()['id']
+        resp = self.staff_client.delete(
+            f'/api/staff/towers/{self.tower.id}/media/{asset_id}/',
+        )
+        self.assertEqual(resp.status_code, 404)
+        self.assertEqual(MediaAsset.objects.count(), 1)
+
+    def test_reference_media_and_submission_photos_stay_separate(self):
+        """Task 3.4 — asserted, because "obviously different tables" is
+        how two listings end up sharing one."""
+        team = _make_team(self.game, _make_group(self.game), name='Vulpile')
+        challenge = Challenge.objects.create(
+            game=self.game, tower=self.tower, text='How many arches?',
+            difficulty=1,
+        )
+        submission = TeamTowerChallenge.objects.create(
+            team=team, tower=self.tower, challenge=challenge,
+            photo=SimpleUploadedFile('proof.png', b'proof', 'image/png'),
+        )
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png', b'reference'),
+            'caption': 'north face',
+        })
+
+        listing = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/media/',
+        ).json()
+        self.assertEqual([m['caption'] for m in listing], ['north face'])
+        self.assertNotIn(
+            submission.photo.name, [m['file'] for m in listing],
+        )
+        # And the other direction: a reference photo is not evidence.
+        self.assertEqual(
+            TeamTowerChallenge.objects.filter(tower=self.tower).count(), 1,
+        )
+
+    def test_the_tower_payload_lists_its_media(self):
+        self._post('towers', self.tower.id, {
+            'file': _media_data_url('image/png'), 'caption': 'north face',
+        })
+        payload = self.staff_client.get(
+            f'/api/staff/towers/{self.tower.id}/',
+        ).json()
+        self.assertEqual([m['caption'] for m in payload['media']], ['north face'])
+
+    def test_the_zone_payload_lists_its_media(self):
+        self._post('zones', self.zone.id, {
+            'file': _media_data_url('audio/webm'), 'kind': MEDIA_AUDIO,
+            'caption': 'north gate',
+        })
+        payload = self.staff_client.get(
+            f'/api/staff/zones/{self.zone.id}/',
+        ).json()
+        self.assertEqual([m['caption'] for m in payload['media']], ['north gate'])
+
+    def test_the_library_feed_counts_media_on_both_kinds_of_element(self):
+        self._post('towers', self.tower.id, {'file': _media_data_url('image/png')})
+        self._post('zones', self.zone.id, {'file': _media_data_url('image/png')})
+        self._post('zones', self.zone.id, {'file': _media_data_url('image/png')})
+        feed = self.staff_client.get('/api/staff/library/').json()
+        by_name = {t['name']: t for t in feed['towers']}
+        self.assertEqual(by_name['T1']['media_count'], 1)
+        zones = {z['name']: z for z in feed['zones']}
+        self.assertEqual(zones['Zone A']['media_count'], 2)
 
 
 class FieldAuthoringZoneApiTest(TestCase):
@@ -5887,8 +6349,15 @@ class FieldAuthoringPermissionTest(TestCase):
         )
         self.assertEqual(resp.status_code, 403)
         resp = self.other_client.post(
-            f'/api/staff/towers/{self.tower.id}/photos/',
-            {'image': f'data:image/png;base64,{_tiny_png_b64()}'},
+            f'/api/staff/towers/{self.tower.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
+            format='json',
+        )
+        self.assertEqual(resp.status_code, 403)
+        # tower-zone-media task 3.5: the gate reaches a zone's media too.
+        resp = self.other_client.post(
+            f'/api/staff/zones/{self.zone.id}/media/',
+            {'file': f'data:image/png;base64,{_tiny_png_b64()}'},
             format='json',
         )
         self.assertEqual(resp.status_code, 403)
@@ -12656,10 +13125,20 @@ def _bundle_fixture(slug='travelling'):
     tower.save()
     second = _make_tower(game, name='Gate', zone=other_zone, lng=23.59, lat=46.08)
 
-    photo = TowerPhoto.objects.create(
+    photo = MediaAsset.objects.create(
         tower=tower,
-        image=SimpleUploadedFile('mill.jpg', b'not-really-a-jpeg', 'image/jpeg'),
+        kind=MEDIA_IMAGE,
+        file=SimpleUploadedFile('mill.jpg', b'not-really-a-jpeg', 'image/jpeg'),
         caption='From the bridge',
+    )
+    # A zone's media travels by the same spec entry as a tower's; if the
+    # nullable-subject ref resolution were wrong, only this one would say so.
+    MediaAsset.objects.create(
+        zone=zone,
+        kind=MEDIA_AUDIO,
+        file=SimpleUploadedFile('approach.weba', b'not-really-audio', 'audio/webm'),
+        caption='Enter by the north gate',
+        duration_seconds=11.5,
     )
 
     requirement = PresenceRequirement.objects.create(
@@ -12833,7 +13312,7 @@ class ContentBundleExportTest(TestCase):
     def test_a_game_pulls_everything_it_needs(self):
         content = self._payload(games=[self.fx['game']])['content']
         expected = {
-            'tower_types': 1, 'zones': 2, 'towers': 2, 'tower_photos': 1,
+            'tower_types': 1, 'zones': 2, 'towers': 2, 'media': 2,
             'collections': 1, 'presence_requirements': 1, 'games': 1,
             'game_roles': 1, 'team_groups': 1, 'challenges': 2,
             'score_multipliers': 1, 'trails': 1, 'trail_steps': 2,
@@ -12895,16 +13374,21 @@ class ContentBundleExportTest(TestCase):
 
     def test_media_is_carried(self):
         _payload, files = bundles.build_bundle(games=[self.fx['game']])
-        self.assertEqual(len(files), 1)
-        arcname, data = next(iter(files.items()))
-        self.assertTrue(arcname.startswith(bundles.MEDIA_ROOT))
-        self.assertEqual(data, b'not-really-a-jpeg')
+        # The tower's photo and the zone's audio note.
+        self.assertEqual(len(files), 2)
+        self.assertTrue(
+            all(name.startswith(bundles.MEDIA_ROOT) for name in files),
+        )
+        self.assertIn(b'not-really-a-jpeg', files.values())
+        self.assertIn(b'not-really-audio', files.values())
 
     def test_a_photo_whose_file_vanished_does_not_fail_the_export(self):
-        self.fx['photo'].image.storage.delete(self.fx['photo'].image.name)
+        self.fx['photo'].file.storage.delete(self.fx['photo'].file.name)
         payload, files = bundles.build_bundle(games=[self.fx['game']])
-        self.assertEqual(files, {})
-        self.assertIsNone(payload['content']['tower_photos'][0]['image'])
+        self.assertEqual(len(files), 1)
+        rows = {row['caption']: row for row in payload['content']['media']}
+        self.assertIsNone(rows['From the bridge']['file'])
+        self.assertIsNotNone(rows['Enter by the north gate']['file'])
 
 
 class ContentBundleImportTest(TestCase):
@@ -12986,10 +13470,20 @@ class ContentBundleImportTest(TestCase):
         self._wipe()
         with self._bundle() as bundle:
             report = bundles.import_bundle(bundle)
-        self.assertEqual(report.media, 1)
-        photo = TowerPhoto.objects.get(caption='From the bridge')
-        with photo.image.open('rb') as fh:
+        self.assertEqual(report.media, 2)
+        photo = MediaAsset.objects.get(caption='From the bridge')
+        with photo.file.open('rb') as fh:
             self.assertEqual(fh.read(), b'not-really-a-jpeg')
+
+    def test_zone_media_travels_with_its_zone(self):
+        self._wipe()
+        with self._bundle() as bundle:
+            bundles.import_bundle(bundle)
+        note = MediaAsset.objects.get(caption='Enter by the north gate')
+        self.assertEqual(note.kind, MEDIA_AUDIO)
+        self.assertIsNone(note.tower)
+        self.assertEqual(note.zone.name, 'Old town')
+        self.assertEqual(note.duration_seconds, 11.5)
 
     def test_reimport_updates_in_place(self):
         game = self.fx['game']
@@ -13233,7 +13727,7 @@ class ContentBundleInspectTest(TestCase):
         self.assertEqual(by_kind['towers']['already_here'], 2)
         self.assertEqual(by_kind['towers']['would_create'], 0)
         self.assertEqual(by_kind['towers']['would_update'], 2)
-        self.assertEqual(inspection['media_files'], 1)
+        self.assertEqual(inspection['media_files'], 2)
         self.assertEqual(inspection['selection']['games'], ['travelling'])
 
     def test_copy_mode_would_create_everything(self):
@@ -13255,13 +13749,13 @@ class ContentBundleInspectTest(TestCase):
     def test_inspection_writes_nothing(self):
         before = {
             model.__name__: model.objects.count()
-            for model in (Game, Tower, Zone, Challenge, Collection, TowerPhoto)
+            for model in (Game, Tower, Zone, Challenge, Collection, MediaAsset)
         }
         self._inspect()
         self._inspect(bundles.MODE_COPY)
         after = {
             model.__name__: model.objects.count()
-            for model in (Game, Tower, Zone, Challenge, Collection, TowerPhoto)
+            for model in (Game, Tower, Zone, Challenge, Collection, MediaAsset)
         }
         self.assertEqual(before, after)
 

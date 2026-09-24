@@ -10,6 +10,7 @@ export * from './lib/token.interceptor';
 export * from './lib/invites.service';
 export * from './lib/game-api.service';
 export * from './lib/staff-api.service';
+export * from './lib/field-queue-store';
 export * from './lib/field-sync.service';
 export * from './lib/qr-code.component';
 export * from './lib/team-formation.service';

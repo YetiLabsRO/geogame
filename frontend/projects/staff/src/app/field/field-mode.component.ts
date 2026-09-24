@@ -11,6 +11,7 @@ import {
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 import * as L from 'leaflet';
+import { firstValueFrom } from 'rxjs';
 
 import {
   AdminChallenge,
@@ -19,8 +20,13 @@ import {
   AdminTower,
   AdminTowerType,
   AdminZone,
+  FieldEdit,
   FieldSyncService,
+  MediaAssetInfo,
+  MediaKind,
+  MediaSubject,
   StaffApiService,
+  captureToBytes,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -32,10 +38,28 @@ interface Fix {
   accuracy: number;
 }
 
-/** The tower photos/challenges attach to: a server id or a queued localId. */
-interface TowerContext {
+/**
+ * What media and challenges attach to — the thing in hand.
+ *
+ * A tower or a zone, identified by a server id or, while it is still
+ * queued, by the `localId` the queue gave it. Widening this from
+ * "tower" is what lets a curator record the way into a meadow while
+ * standing at its gate (tower-zone-media).
+ */
+interface SubjectContext {
+  kind: MediaSubject;
   ref: number | string;
   name: string;
+}
+
+/** One attachment on the subject in hand — synced, or still queued. */
+interface FieldMedia {
+  /** Stable key for tracking; a server id or a queue local id. */
+  key: string;
+  id: number | null;
+  localId: string | null;
+  kind: MediaKind;
+  durationSeconds: number | null;
 }
 
 const FALLBACK_CENTER: [number, number] = [46.068374, 23.571797];
@@ -45,14 +69,31 @@ const DEFAULT_TOWER_ICON = 'bi-geo-alt-fill';
 const DEFAULT_TOWER_COLOR = '#5F6B7A';
 const PHOTO_MAX_DIM = 1280;
 const PHOTO_JPEG_QUALITY = 0.75;
+/**
+ * The duration caps this client enforces, mirroring the documented
+ * defaults in `geogame/settings.py`'s `MEDIA_ASSET_LIMITS`.
+ *
+ * The server is the control; these exist so a recording *stops* at the
+ * limit rather than being refused after the fact. Being refused after
+ * the fact is the bad case: it happens once the curator has walked away
+ * from the place they were describing.
+ *
+ * An install that raises the server's cap gets a client that still
+ * stops early, which is merely conservative. One that lowers it gets
+ * clips refused on upload — which is why the rejection names the limit.
+ */
+const AUDIO_MAX_SECONDS = 180;
+const VIDEO_MAX_SECONDS = 30;
 
 /**
  * Field authoring mode (field-authoring-mode tasks 3.1–3.6, 4.2).
  *
  * Mobile, one-handed on-site authoring: drop a tower at the device GPS
- * fix (live accuracy, re-read / averaging / nudge), attach compressed
- * camera photos, walk or tap a zone boundary, attach a challenge — all
- * filed into a target Collection, drafts by default, queued offline.
+ * fix (live accuracy, re-read / averaging / nudge), walk or tap a zone
+ * boundary, attach a challenge, and attach reference media — photos,
+ * spoken notes and short clips — to whichever of the two is in hand
+ * (tower-zone-media). All filed into a target Collection, drafts by
+ * default, queued offline.
  */
 @Component({
   selector: 'app-field-mode',
@@ -191,42 +232,133 @@ const PHOTO_JPEG_QUALITY = 0.75;
             </select>
           </div>
         </div>
-        @if (currentTower(); as t) {
+        @if (currentSubject(); as s) {
           <div class="card">
-            <div class="card-body py-2">
+            <div class="card-body py-2 d-grid gap-2">
               <div class="d-flex align-items-center gap-2 flex-wrap">
                 <span class="me-auto">
-                  <i class="bi bi-geo-alt"></i> {{ t.name }}
-                  @if (isQueuedRef(t.ref)) {
+                  <i [class]="s.kind === 'towers' ? 'bi bi-geo-alt' : 'bi bi-pentagon'"></i>
+                  {{ s.name }}
+                  @if (isQueuedRef(s.ref)) {
                     <span class="badge text-bg-warning ms-1">queued</span>
                   }
-                  @if (photoCount() > 0) {
-                    <span class="badge text-bg-light border ms-1">
-                      {{ photoCount() }} <i class="bi bi-camera"></i>
+                </span>
+                @if (recording(); as r) {
+                  <!-- While recording, the only control that matters is
+                       the one that stops it. Audio stops on release, so
+                       its button reports rather than invites a tap. -->
+                  <button
+                    type="button"
+                    class="btn btn-danger"
+                    [disabled]="r === 'AUDIO'"
+                    (click)="stopRecording()"
+                  >
+                    <i [class]="r === 'AUDIO' ? 'bi bi-mic-fill me-1' : 'bi bi-stop-fill me-1'"></i>
+                    {{ formatDuration(elapsed()) }} / {{ formatDuration(limitFor(r)) }}
+                  </button>
+                } @else {
+                  <button
+                    type="button"
+                    class="btn btn-outline-secondary"
+                    [disabled]="attaching()"
+                    (click)="photoInput.click()"
+                  >
+                    @if (attaching()) {
+                      <span class="spinner-border spinner-border-sm me-1"></span>
+                    } @else {
+                      <i class="bi bi-camera me-1"></i>
+                    }
+                    Photo
+                  </button>
+                  @if (canRecord()) {
+                    <!-- Hold to speak, as one would a walkie-talkie:
+                         a spoken note is short and a curator's other
+                         hand is holding a map.
+
+                         Only pointerdown is bound here. The release
+                         is caught on the window, because a thumb slides
+                         and because this button is replaced by the
+                         recording one the instant recording starts: a
+                         pointerup bound to an element that no longer
+                         exists never arrives, and the recording would
+                         run to its cap. -->
+                    <button
+                      type="button"
+                      class="btn btn-outline-secondary"
+                      [disabled]="attaching()"
+                      (pointerdown)="startRecording('AUDIO')"
+                    >
+                      <i class="bi bi-mic me-1"></i> Hold to talk
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-outline-secondary"
+                      [disabled]="attaching()"
+                      (click)="startRecording('VIDEO')"
+                    >
+                      <i class="bi bi-camera-video me-1"></i> Clip
+                    </button>
+                  } @else {
+                    <!-- No MediaRecorder here. Offer what this device
+                         does have — its own recorder, through a file
+                         picker — rather than a button that does nothing. -->
+                    <button
+                      type="button"
+                      class="btn btn-outline-secondary"
+                      [disabled]="attaching()"
+                      (click)="audioInput.click()"
+                    >
+                      <i class="bi bi-mic me-1"></i> Audio
+                    </button>
+                    <button
+                      type="button"
+                      class="btn btn-outline-secondary"
+                      [disabled]="attaching()"
+                      (click)="videoInput.click()"
+                    >
+                      <i class="bi bi-camera-video me-1"></i> Clip
+                    </button>
+                  }
+                  @if (s.kind === 'towers') {
+                    <button
+                      type="button"
+                      class="btn btn-outline-secondary"
+                      (click)="openChallengeSheet()"
+                    >
+                      <i class="bi bi-list-task me-1"></i> Challenge
+                    </button>
+                  }
+                }
+              </div>
+
+              <!-- What is attached, and a way to undo a mistake before
+                   walking on (tower-zone-media task 5.3). -->
+              @if (media().length) {
+                <div class="media-strip">
+                  @for (m of media(); track m.key) {
+                    <span class="media-chip">
+                      <i [class]="'bi ' + mediaIcon(m.kind)"></i>
+                      @if (m.durationSeconds) {
+                        <span>{{ formatDuration(m.durationSeconds) }}</span>
+                      }
+                      @if (m.localId) {
+                        <i class="bi bi-cloud-arrow-up" title="Waiting to sync"></i>
+                      }
+                      <button
+                        type="button"
+                        class="btn-close"
+                        [attr.aria-label]="'Remove ' + m.kind.toLowerCase()"
+                        (click)="removeMedia(m)"
+                      ></button>
                     </span>
                   }
-                </span>
-                <button
-                  type="button"
-                  class="btn btn-outline-secondary"
-                  [disabled]="uploadingPhoto()"
-                  (click)="photoInput.click()"
-                >
-                  @if (uploadingPhoto()) {
-                    <span class="spinner-border spinner-border-sm me-1"></span>
-                  } @else {
-                    <i class="bi bi-camera me-1"></i>
-                  }
-                  Photo
-                </button>
-                <button
-                  type="button"
-                  class="btn btn-outline-secondary"
-                  (click)="openChallengeSheet()"
-                >
-                  <i class="bi bi-list-task me-1"></i> Challenge
-                </button>
-              </div>
+                </div>
+              } @else if (!recording()) {
+                <div class="small text-body-secondary">
+                  Nothing attached yet. Clips stop at
+                  {{ formatDuration(videoMaxSeconds) }}.
+                </div>
+              }
             </div>
           </div>
         }
@@ -246,8 +378,8 @@ const PHOTO_JPEG_QUALITY = 0.75;
           @if (fix(); as f) {
             @if (f.accuracy > accuracyWarnM) {
               <div class="alert alert-warning py-2 mb-0">
-                Accuracy ±{{ f.accuracy.toFixed(0) }} m is poor — add readings to
-                average, or nudge the marker on the map.
+                Accuracy ±{{ f.accuracy.toFixed(0) }} m is poor — add readings to average, or nudge
+                the marker on the map.
               </div>
             }
           }
@@ -291,9 +423,9 @@ const PHOTO_JPEG_QUALITY = 0.75;
             </div>
             @if (radiusBelowAccuracy()) {
               <div class="alert alert-warning py-2 mb-0">
-                This type captures within {{ impliedRadius() }} m but the fix is only
-                accurate to ±{{ fix()?.accuracy?.toFixed(0) }} m — players may not be able
-                to reach it. Add readings or nudge the marker before saving.
+                This type captures within {{ impliedRadius() }} m but the fix is only accurate to
+                ±{{ fix()?.accuracy?.toFixed(0) }} m — players may not be able to reach it. Add
+                readings or nudge the marker before saving.
               </div>
             }
           }
@@ -344,7 +476,8 @@ const PHOTO_JPEG_QUALITY = 0.75;
             </div>
           </div>
           <div class="form-text">
-            Pan the map to place the crosshair. Saved {{ draft() ? 'as inactive draft' : 'active' }}.
+            Pan the map to place the crosshair. Saved
+            {{ draft() ? 'as inactive draft' : 'active' }}.
           </div>
         </div>
       </div>
@@ -366,8 +499,8 @@ const PHOTO_JPEG_QUALITY = 0.75;
             <div class="fw-semibold">Adjusting: {{ editingZone()!.name }}</div>
           }
           <div class="text-body-secondary">
-            {{ vertices().length }} vertices — mark at your GPS position while
-            walking, or tap the map. Drag a vertex to correct it.
+            {{ vertices().length }} vertices — mark at your GPS position while walking, or tap the
+            map. Drag a vertex to correct it.
           </div>
           <div class="row g-2">
             <div class="col-6">
@@ -405,7 +538,9 @@ const PHOTO_JPEG_QUALITY = 0.75;
               <button
                 type="button"
                 class="btn btn-primary btn-lg w-100"
-                [disabled]="saving() || vertices().length < 3 || (!editingZone() && !zoneName().trim())"
+                [disabled]="
+                  saving() || vertices().length < 3 || (!editingZone() && !zoneName().trim())
+                "
                 (click)="saveZone()"
               >
                 @if (saving()) {
@@ -434,7 +569,7 @@ const PHOTO_JPEG_QUALITY = 0.75;
             <li class="list-group-item py-2">
               <div class="d-flex align-items-center gap-2">
                 <span class="me-auto">
-                  {{ describeEdit(item.kind) }}
+                  {{ describeEdit(item) }}
                   @if (item.payload['name']; as name) {
                     · {{ name }}
                   }
@@ -473,12 +608,8 @@ const PHOTO_JPEG_QUALITY = 0.75;
       <div class="sheet-backdrop" (click)="sheetOpen.set(false)"></div>
       <div class="sheet card">
         <div class="card-header d-flex align-items-center">
-          <span class="me-auto">Attach challenge — {{ currentTower()?.name }}</span>
-          <button
-            type="button"
-            class="btn-close"
-            (click)="sheetOpen.set(false)"
-          ></button>
+          <span class="me-auto">Attach challenge — {{ currentSubject()?.name }}</span>
+          <button type="button" class="btn-close" (click)="sheetOpen.set(false)"></button>
         </div>
         <div class="card-body d-grid gap-2">
           <div class="btn-group w-100">
@@ -509,9 +640,7 @@ const PHOTO_JPEG_QUALITY = 0.75;
             >
               <option [ngValue]="null">— pick a challenge —</option>
               @for (c of challenges(); track c.id) {
-                <option [ngValue]="c.id">
-                  [{{ c.difficulty }}] {{ c.text.slice(0, 60) }}
-                </option>
+                <option [ngValue]="c.id">[{{ c.difficulty }}] {{ c.text.slice(0, 60) }}</option>
               }
             </select>
           } @else {
@@ -562,7 +691,24 @@ const PHOTO_JPEG_QUALITY = 0.75;
       accept="image/*"
       capture="environment"
       class="d-none"
-      (change)="onPhotoPicked($event)"
+      (change)="onFilePicked($event, 'IMAGE')"
+    />
+    <!-- Only reachable where MediaRecorder is not; see the panel above. -->
+    <input
+      #audioInput
+      type="file"
+      accept="audio/*"
+      capture
+      class="d-none"
+      (change)="onFilePicked($event, 'AUDIO')"
+    />
+    <input
+      #videoInput
+      type="file"
+      accept="video/*"
+      capture="environment"
+      class="d-none"
+      (change)="onFilePicked($event, 'VIDEO')"
     />
   `,
   styles: `
@@ -575,6 +721,27 @@ const PHOTO_JPEG_QUALITY = 0.75;
       display: flex;
       flex-wrap: wrap;
       gap: 0.375rem;
+    }
+    /* The media strip: what is attached to the thing in hand, sized so
+       a chip's remove button is hittable with a thumb in a glove. */
+    .media-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.375rem;
+    }
+    .media-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      min-height: 2.25rem;
+      padding: 0.25rem 0.5rem;
+      border: 1px solid var(--border);
+      border-radius: 999px;
+      font-variant-numeric: tabular-nums;
+    }
+    .media-chip .btn-close {
+      --bs-btn-close-opacity: 0.55;
+      padding: 0.35rem;
     }
     .type-chip {
       display: inline-flex;
@@ -695,8 +862,7 @@ export class FieldModeComponent {
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly accuracyWarnM = ACCURACY_WARN_M;
-  protected readonly mapContainer =
-    viewChild.required<ElementRef<HTMLDivElement>>('mapContainer');
+  protected readonly mapContainer = viewChild.required<ElementRef<HTMLDivElement>>('mapContainer');
 
   // Mode + capture state
   protected readonly mode = signal<'idle' | 'tower' | 'zone'>('idle');
@@ -753,7 +919,7 @@ export class FieldModeComponent {
 
   // Tower capture
   protected readonly towerName = signal('');
-  protected readonly currentTower = signal<TowerContext | null>(null);
+  protected readonly currentSubject = signal<SubjectContext | null>(null);
   // tower-types: one tap applies icon, colour and capture radius.
   protected readonly towerTypes = signal<AdminTowerType[]>([]);
   protected readonly typeId = signal<number | null>(null);
@@ -761,9 +927,7 @@ export class FieldModeComponent {
     () => this.towerTypes().find((t) => t.id === this.typeId()) ?? null,
   );
   /** Capture radius the chosen type implies; null means the Game default. */
-  protected readonly impliedRadius = computed(
-    () => this.selectedType()?.proximity_meters ?? null,
-  );
+  protected readonly impliedRadius = computed(() => this.selectedType()?.proximity_meters ?? null);
   /**
    * True when the fix is less precise than the radius the tower will
    * carry — a tower placed less precisely than its own capture radius
@@ -775,8 +939,27 @@ export class FieldModeComponent {
     const fix = this.fix();
     return radius !== null && fix !== null && fix.accuracy > radius;
   });
-  protected readonly photoCount = signal(0);
-  protected readonly uploadingPhoto = signal(false);
+
+  // Reference media on the subject in hand (tower-zone-media)
+  protected readonly videoMaxSeconds = VIDEO_MAX_SECONDS;
+  protected readonly media = signal<FieldMedia[]>([]);
+  protected readonly attaching = signal(false);
+  /** Which kind is recording right now, or null. */
+  protected readonly recording = signal<MediaKind | null>(null);
+  /** Seconds the current recording has run, for the stop button's face. */
+  protected readonly elapsed = signal(0);
+  /**
+   * Whether this device can record in-page.
+   *
+   * Where it cannot, the panel offers file pickers onto the device's
+   * own recorder instead. Showing a mic button that silently fails is
+   * worse than showing a different one that works.
+   */
+  protected readonly canRecord = signal(supportsRecording());
+  private recorder: MediaRecorder | null = null;
+  private recordedChunks: BlobPart[] = [];
+  private recordingTimer: ReturnType<typeof setInterval> | null = null;
+  private releaseHandler: (() => void) | null = null;
 
   // Zone capture
   protected readonly zones = signal<AdminZone[]>([]);
@@ -820,16 +1003,17 @@ export class FieldModeComponent {
       error: () => {},
     });
     this.api.listZones().subscribe({ next: (l) => this.zones.set(l), error: () => {} });
-    this.api
-      .listTowerTypes()
-      .subscribe({ next: (l) => this.towerTypes.set(l), error: () => {} });
-    this.api
-      .listChallenges()
-      .subscribe({ next: (l) => this.challenges.set(l), error: () => {} });
+    this.api.listTowerTypes().subscribe({ next: (l) => this.towerTypes.set(l), error: () => {} });
+    this.api.listChallenges().subscribe({ next: (l) => this.challenges.set(l), error: () => {} });
     this.api.listGames().subscribe({ next: (l) => this.games.set(l), error: () => {} });
 
     afterNextRender(() => this.initMap());
-    this.destroyRef.onDestroy(() => this.map?.remove());
+    this.destroyRef.onDestroy(() => {
+      this.map?.remove();
+      // Leaving the page must not leave the microphone live.
+      this.stopRecording();
+      this.clearRecordingState();
+    });
   }
 
   // ---- Map + geolocation ---------------------------------------------------
@@ -973,8 +1157,9 @@ export class FieldModeComponent {
           // Muted, so the element being captured stays the loudest
           // thing on the screen.
           className: 'tower-pin muted',
-          html: `<span style="background:${tower.resolved_color}">` +
-                `<i class="bi ${tower.resolved_icon}"></i></span>`,
+          html:
+            `<span style="background:${tower.resolved_color}">` +
+            `<i class="bi ${tower.resolved_icon}"></i></span>`,
           iconSize: [32, 32],
           iconAnchor: [16, 16],
         }),
@@ -1096,21 +1281,21 @@ export class FieldModeComponent {
     };
     if (!this.queue.online()) {
       const item = this.queue.enqueue('create-tower', payload);
-      this.afterTowerSaved({ ref: item.localId, name: payload.name }, true);
+      this.afterTowerSaved({ kind: 'towers', ref: item.localId, name: payload.name }, true);
       return;
     }
     this.saving.set(true);
     this.api.createTower(payload).subscribe({
       next: (tower) => {
         this.saving.set(false);
-        this.afterTowerSaved({ ref: tower.id, name: tower.name }, false);
+        this.afterTowerSaved({ kind: 'towers', ref: tower.id, name: tower.name }, false);
       },
       error: (err) => {
         this.saving.set(false);
         if (err?.status === 0) {
           // Network dropped mid-save: fall back to the offline queue.
           const item = this.queue.enqueue('create-tower', payload);
-          this.afterTowerSaved({ ref: item.localId, name: payload.name }, true);
+          this.afterTowerSaved({ kind: 'towers', ref: item.localId, name: payload.name }, true);
         } else {
           this.error.set(extractErrorMessage(err));
         }
@@ -1118,58 +1303,276 @@ export class FieldModeComponent {
     });
   }
 
-  private afterTowerSaved(ctx: TowerContext, queued: boolean): void {
+  private afterTowerSaved(ctx: SubjectContext, queued: boolean): void {
     // The thing just placed becomes context for the next one.
     if (!queued) this.loadExisting();
-    this.currentTower.set(ctx);
-    this.photoCount.set(0);
+    this.setSubject(ctx);
     this.towerName.set('');
     this.mode.set('idle');
     this.notice.set(
       queued
-        ? `${ctx.name} queued for sync — add photos or a challenge now.`
-        : `${ctx.name} saved — add photos or a challenge now.`,
+        ? `${ctx.name} queued for sync — add media or a challenge now.`
+        : `${ctx.name} saved — add media or a challenge now.`,
     );
   }
 
-  // ---- Reference photos (task 3.3) -----------------------------------------
+  /** Make something the subject in hand, and show what it already carries. */
+  private setSubject(ctx: SubjectContext): void {
+    this.currentSubject.set(ctx);
+    this.media.set([]);
+    if (typeof ctx.ref === 'number' && this.queue.online()) {
+      this.api.listMedia(ctx.kind, ctx.ref).subscribe({
+        next: (assets) => {
+          // Still the same subject? A slow response must not repopulate
+          // the strip for whatever the curator moved on to.
+          if (this.currentSubject()?.ref === ctx.ref) {
+            this.media.set(assets.map(asFieldMedia));
+          }
+        },
+        error: () => undefined, // an empty strip is the honest fallback
+      });
+    }
+  }
 
-  protected onPhotoPicked(event: Event): void {
+  // ---- Reference media (tower-zone-media task 5) ----------------------------
+
+  protected mediaIcon(kind: MediaKind): string {
+    switch (kind) {
+      case 'AUDIO':
+        return 'bi-mic-fill';
+      case 'VIDEO':
+        return 'bi-camera-video-fill';
+      default:
+        return 'bi-image-fill';
+    }
+  }
+
+  protected limitFor(kind: MediaKind): number {
+    return kind === 'VIDEO' ? VIDEO_MAX_SECONDS : AUDIO_MAX_SECONDS;
+  }
+
+  protected formatDuration(seconds: number): string {
+    const whole = Math.max(0, Math.round(seconds));
+    return `${Math.floor(whole / 60)}:${String(whole % 60).padStart(2, '0')}`;
+  }
+
+  /** A file from the camera roll, or from a device recorder we fell back to. */
+  protected onFilePicked(event: Event, kind: MediaKind): void {
     const input = event.target as HTMLInputElement;
     const file = input.files?.[0];
     input.value = '';
-    const tower = this.currentTower();
-    if (!file || !tower) return;
-    this.uploadingPhoto.set(true);
-    void compressImage(file, PHOTO_MAX_DIM, PHOTO_JPEG_QUALITY)
-      .then((dataUrl) => {
-        const payload = { image: dataUrl, caption: '' };
-        if (typeof tower.ref === 'number' && this.queue.online()) {
-          this.api.uploadTowerPhoto(tower.ref, payload).subscribe({
-            next: () => {
-              this.uploadingPhoto.set(false);
-              this.photoCount.update((n) => n + 1);
-            },
-            error: (err) => {
-              this.uploadingPhoto.set(false);
-              if (err?.status === 0) {
-                this.queue.enqueue('upload-photo', payload, tower.ref);
-                this.photoCount.update((n) => n + 1);
-              } else {
-                this.error.set(extractErrorMessage(err));
-              }
-            },
-          });
-        } else {
-          this.queue.enqueue('upload-photo', payload, tower.ref);
-          this.uploadingPhoto.set(false);
-          this.photoCount.update((n) => n + 1);
+    if (!file) return;
+    void this.attach(file, kind);
+  }
+
+  /**
+   * Record in-page, stopping at the cap for the kind.
+   *
+   * The timer is what enforces the video limit: a curator who records
+   * two minutes and is then told thirty seconds was the maximum has
+   * lost the two minutes, and is usually no longer standing where they
+   * recorded them.
+   */
+  protected startRecording(kind: MediaKind): void {
+    if (this.recording() || this.attaching() || !this.currentSubject()) return;
+    if (!this.canRecord()) return;
+    this.error.set(null);
+    this.recording.set(kind);
+    this.elapsed.set(0);
+    if (kind === 'AUDIO') this.listenForRelease();
+
+    const wantsVideo = kind === 'VIDEO';
+    navigator.mediaDevices
+      .getUserMedia(
+        wantsVideo ? { audio: true, video: { facingMode: 'environment' } } : { audio: true },
+      )
+      .then((stream) => {
+        // Released while permission was being granted.
+        if (this.recording() !== kind) {
+          stopTracks(stream);
+          return;
         }
+        this.recordedChunks = [];
+        const recorder = new MediaRecorder(stream);
+        this.recorder = recorder;
+        recorder.ondataavailable = (event) => {
+          if (event.data?.size) this.recordedChunks.push(event.data);
+        };
+        recorder.onstop = () => {
+          stopTracks(stream);
+          const captured = new Blob(this.recordedChunks, {
+            type: recorder.mimeType || (wantsVideo ? 'video/webm' : 'audio/webm'),
+          });
+          this.recordedChunks = [];
+          this.recorder = null;
+          const seconds = this.elapsed();
+          this.clearRecordingState();
+          if (captured.size > 0) void this.attach(captured, kind, seconds);
+        };
+        recorder.start();
+        const startedAt = Date.now();
+        this.recordingTimer = setInterval(() => {
+          const seconds = (Date.now() - startedAt) / 1000;
+          this.elapsed.set(seconds);
+          if (seconds >= this.limitFor(kind)) this.stopRecording();
+        }, 200);
       })
       .catch(() => {
-        this.uploadingPhoto.set(false);
-        this.error.set('Could not read the photo.');
+        this.clearRecordingState();
+        this.error.set('Could not reach the microphone or camera.');
       });
+  }
+
+  protected stopRecording(): void {
+    if (!this.recording()) return;
+    const recorder = this.recorder;
+    if (recorder && recorder.state !== 'inactive') {
+      recorder.stop(); // `onstop` attaches what was captured
+      return;
+    }
+    // Stopped before the recorder existed — permission is still pending.
+    this.clearRecordingState();
+  }
+
+  /**
+   * Stop an audio note when the finger comes up, wherever it comes up.
+   *
+   * On the window rather than the button: the button is gone by then,
+   * and a thumb that slid off the control still means "I have finished
+   * speaking".
+   */
+  private listenForRelease(): void {
+    if (typeof window === 'undefined' || this.releaseHandler) return;
+    const handler = () => this.stopRecording();
+    this.releaseHandler = handler;
+    window.addEventListener('pointerup', handler);
+    window.addEventListener('pointercancel', handler);
+  }
+
+  private clearRecordingState(): void {
+    if (this.recordingTimer !== null) {
+      clearInterval(this.recordingTimer);
+      this.recordingTimer = null;
+    }
+    if (this.releaseHandler && typeof window !== 'undefined') {
+      window.removeEventListener('pointerup', this.releaseHandler);
+      window.removeEventListener('pointercancel', this.releaseHandler);
+    }
+    this.releaseHandler = null;
+    this.recording.set(null);
+    this.elapsed.set(0);
+  }
+
+  /**
+   * Send a capture, or queue it.
+   *
+   * Online with a server-side subject, it goes as multipart — a clip
+   * is the one thing here big enough that base64's extra third is worth
+   * avoiding. Otherwise it goes into the queue as bytes and is encoded
+   * only when it is finally sent.
+   */
+  private async attach(
+    capture: Blob,
+    kind: MediaKind,
+    knownDuration: number | null = null,
+  ): Promise<void> {
+    const subject = this.currentSubject();
+    if (!subject) return;
+    this.attaching.set(true);
+    try {
+      const file = kind === 'IMAGE' ? await compressImage(capture) : capture;
+      const duration =
+        kind === 'IMAGE' ? null : (knownDuration ?? (await measureDuration(file, kind)));
+
+      const limit = this.limitFor(kind);
+      if (duration !== null && duration > limit) {
+        this.error.set(
+          `That ${kind.toLowerCase()} runs ${this.formatDuration(duration)}; ` +
+            `the limit is ${this.formatDuration(limit)}.`,
+        );
+        return;
+      }
+
+      if (typeof subject.ref === 'number' && this.queue.online()) {
+        const sent = await this.upload(subject, file, kind, duration);
+        if (sent) return;
+      }
+      this.queueCapture(subject, file, kind, duration);
+    } catch {
+      this.error.set('Could not read that capture.');
+    } finally {
+      this.attaching.set(false);
+    }
+  }
+
+  /** True if the server took it; false if the network was the problem. */
+  private async upload(
+    subject: SubjectContext,
+    file: Blob,
+    kind: MediaKind,
+    duration: number | null,
+  ): Promise<boolean> {
+    const form = new FormData();
+    form.append('file', file, fileNameFor(kind, file.type));
+    form.append('kind', kind);
+    if (duration !== null) form.append('duration_seconds', String(round1(duration)));
+    try {
+      const asset = await firstValueFrom(
+        this.api.uploadMedia(subject.kind, subject.ref as number, form),
+      );
+      this.media.update((items) => [...items, asFieldMedia(asset)]);
+      return true;
+    } catch (err) {
+      const status = (err as { status?: number })?.status;
+      // A dropped network falls through to the queue; a refusal is the
+      // server telling the curator something they need to read.
+      if (status !== 0) {
+        this.error.set(extractErrorMessage(err));
+        return true;
+      }
+      return false;
+    }
+  }
+
+  private queueCapture(
+    subject: SubjectContext,
+    file: Blob,
+    kind: MediaKind,
+    duration: number | null,
+  ): void {
+    void captureToBytes(file).then(({ bytes, contentType }) => {
+      const item = this.queue.enqueue(
+        'upload-media',
+        { kind, caption: '', duration_seconds: duration === null ? null : round1(duration) },
+        { subjectRef: subject.ref, subject: subject.kind, bytes, contentType },
+      );
+      this.media.update((items) => [
+        ...items,
+        {
+          key: item.localId,
+          id: null,
+          localId: item.localId,
+          kind,
+          durationSeconds: duration,
+        },
+      ]);
+    });
+  }
+
+  protected removeMedia(item: FieldMedia): void {
+    const subject = this.currentSubject();
+    if (!subject) return;
+    if (item.localId) {
+      // Never sent; dropping the queue entry is the whole removal.
+      this.queue.discard(item.localId);
+      this.media.update((items) => items.filter((m) => m.key !== item.key));
+      return;
+    }
+    if (item.id === null || typeof subject.ref !== 'number') return;
+    this.api.deleteMedia(subject.kind, subject.ref, item.id).subscribe({
+      next: () => this.media.update((items) => items.filter((m) => m.key !== item.key)),
+      error: (err) => this.error.set(extractErrorMessage(err)),
+    });
   }
 
   // ---- Zone drawing (task 3.4) ---------------------------------------------
@@ -1181,9 +1584,7 @@ export class FieldModeComponent {
     this.editingZone.set(existing);
     this.zoneName.set('');
     const ring =
-      existing?.shape?.coordinates?.[0]?.map(
-        (pt) => [pt[0], pt[1]] as [number, number],
-      ) ?? [];
+      existing?.shape?.coordinates?.[0]?.map((pt) => [pt[0], pt[1]] as [number, number]) ?? [];
     // Drop the GeoJSON closing point — the server re-closes the ring.
     if (ring.length > 1) ring.pop();
     this.vertices.set(ring);
@@ -1263,22 +1664,27 @@ export class FieldModeComponent {
     const existing = this.editingZone();
     if (existing) {
       const payload = { id: existing.id, vertices: verts };
+      const ctx: SubjectContext = {
+        kind: 'zones',
+        ref: existing.id,
+        name: existing.name,
+      };
       if (!this.queue.online()) {
         this.queue.enqueue('adjust-zone', payload);
-        this.afterZoneSaved(existing.name, true);
+        this.afterZoneSaved(ctx, true);
         return;
       }
       this.saving.set(true);
       this.api.updateZone(existing.id, { vertices: verts }).subscribe({
         next: () => {
           this.saving.set(false);
-          this.afterZoneSaved(existing.name, false);
+          this.afterZoneSaved(ctx, false);
         },
         error: (err) => {
           this.saving.set(false);
           if (err?.status === 0) {
             this.queue.enqueue('adjust-zone', payload);
-            this.afterZoneSaved(existing.name, true);
+            this.afterZoneSaved(ctx, true);
           } else {
             this.error.set(extractErrorMessage(err));
           }
@@ -1293,8 +1699,8 @@ export class FieldModeComponent {
       collection: this.collectionId(),
     };
     if (!this.queue.online()) {
-      this.queue.enqueue('create-zone', payload);
-      this.afterZoneSaved(payload.name, true);
+      const item = this.queue.enqueue('create-zone', payload);
+      this.afterZoneSaved({ kind: 'zones', ref: item.localId, name: payload.name }, true);
       return;
     }
     this.saving.set(true);
@@ -1302,13 +1708,13 @@ export class FieldModeComponent {
       next: (zone) => {
         this.saving.set(false);
         this.zones.update((zs) => [...zs, zone]);
-        this.afterZoneSaved(zone.name, false);
+        this.afterZoneSaved({ kind: 'zones', ref: zone.id, name: zone.name }, false);
       },
       error: (err) => {
         this.saving.set(false);
         if (err?.status === 0) {
-          this.queue.enqueue('create-zone', payload);
-          this.afterZoneSaved(payload.name, true);
+          const item = this.queue.enqueue('create-zone', payload);
+          this.afterZoneSaved({ kind: 'zones', ref: item.localId, name: payload.name }, true);
         } else {
           this.error.set(extractErrorMessage(err));
         }
@@ -1316,12 +1722,25 @@ export class FieldModeComponent {
     });
   }
 
-  private afterZoneSaved(name: string, queued: boolean): void {
+  /**
+   * A zone that has just been drawn becomes the subject in hand.
+   *
+   * The curator is standing at its edge with the thing fresh in mind,
+   * which is the only moment "enter by the north gate" gets recorded at
+   * all (tower-zone-media task 5.4).
+   */
+  private afterZoneSaved(ctx: SubjectContext, queued: boolean): void {
     this.mode.set('idle');
     this.editingZone.set(null);
     this.vertices.set([]);
     this.redrawZone();
-    this.notice.set(queued ? `Zone ${name} queued for sync.` : `Zone ${name} saved.`);
+    this.setSubject(ctx);
+    if (!queued) this.loadExisting();
+    this.notice.set(
+      queued
+        ? `Zone ${ctx.name} queued for sync — add media now.`
+        : `Zone ${ctx.name} saved — add media now.`,
+    );
   }
 
   // ---- Attach challenge (task 3.5) -----------------------------------------
@@ -1333,7 +1752,7 @@ export class FieldModeComponent {
   }
 
   protected saveChallenge(): void {
-    const tower = this.currentTower();
+    const tower = this.currentSubject();
     if (!tower || this.saving()) return;
     const payload =
       this.challengeTab() === 'existing'
@@ -1344,7 +1763,10 @@ export class FieldModeComponent {
             difficulty: this.challengeDifficulty() || 1,
           };
     if (typeof tower.ref !== 'number' || !this.queue.online()) {
-      this.queue.enqueue('attach-challenge', payload, tower.ref);
+      this.queue.enqueue('attach-challenge', payload, {
+        subjectRef: tower.ref,
+        subject: 'towers',
+      });
       this.sheetOpen.set(false);
       this.notice.set('Challenge link queued for sync.');
       return;
@@ -1359,7 +1781,10 @@ export class FieldModeComponent {
       error: (err) => {
         this.saving.set(false);
         if (err?.status === 0) {
-          this.queue.enqueue('attach-challenge', payload, tower.ref);
+          this.queue.enqueue('attach-challenge', payload, {
+            subjectRef: tower.ref,
+            subject: 'towers',
+          });
           this.sheetOpen.set(false);
           this.notice.set('Challenge link queued for sync.');
         } else {
@@ -1390,20 +1815,30 @@ export class FieldModeComponent {
     return typeof ref === 'string';
   }
 
-  protected describeEdit(kind: string): string {
-    switch (kind) {
+  protected describeEdit(item: FieldEdit): string {
+    if (item.kind === 'upload-media') {
+      // Which kind matters here: three chips reading "Reference media"
+      // tell a curator nothing about what is still unsent.
+      switch (item.payload['kind']) {
+        case 'AUDIO':
+          return 'Audio note';
+        case 'VIDEO':
+          return 'Video clip';
+        default:
+          return 'Reference photo';
+      }
+    }
+    switch (item.kind) {
       case 'create-tower':
         return 'New tower';
       case 'create-zone':
         return 'New zone';
       case 'adjust-zone':
         return 'Zone boundary';
-      case 'upload-photo':
-        return 'Reference photo';
       case 'attach-challenge':
         return 'Challenge link';
       default:
-        return kind;
+        return item.kind;
     }
   }
 }
@@ -1435,14 +1870,21 @@ function round1(value: number): number {
   return Math.round(value * 10) / 10;
 }
 
-/** Downscale + JPEG-compress a captured photo; resolves to a data URL. */
-function compressImage(file: File, maxDim: number, quality: number): Promise<string> {
+/**
+ * Downscale and JPEG-compress a captured photo.
+ *
+ * Done on the device because that is where the bandwidth is worth
+ * saving: a curator on a hillside is on mobile data, and a phone camera
+ * produces several megabytes of detail nobody needs to recognise a
+ * fountain.
+ */
+function compressImage(source: Blob): Promise<Blob> {
   return new Promise((resolve, reject) => {
-    const url = URL.createObjectURL(file);
+    const url = URL.createObjectURL(source);
     const img = new Image();
     img.onload = () => {
       URL.revokeObjectURL(url);
-      const scale = Math.min(1, maxDim / Math.max(img.width, img.height));
+      const scale = Math.min(1, PHOTO_MAX_DIM / Math.max(img.width, img.height));
       const canvas = document.createElement('canvas');
       canvas.width = Math.round(img.width * scale);
       canvas.height = Math.round(img.height * scale);
@@ -1452,7 +1894,11 @@ function compressImage(file: File, maxDim: number, quality: number): Promise<str
         return;
       }
       ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
-      resolve(canvas.toDataURL('image/jpeg', quality));
+      canvas.toBlob(
+        (blob) => (blob ? resolve(blob) : reject(new Error('compression failed'))),
+        'image/jpeg',
+        PHOTO_JPEG_QUALITY,
+      );
     };
     img.onerror = () => {
       URL.revokeObjectURL(url);
@@ -1460,4 +1906,68 @@ function compressImage(file: File, maxDim: number, quality: number): Promise<str
     };
     img.src = url;
   });
+}
+
+/** Whether this device can record audio and video in the page itself. */
+function supportsRecording(): boolean {
+  return (
+    typeof MediaRecorder !== 'undefined' &&
+    typeof navigator !== 'undefined' &&
+    typeof navigator.mediaDevices?.getUserMedia === 'function'
+  );
+}
+
+/** Release the microphone and camera; the indicator light matters. */
+function stopTracks(stream: MediaStream): void {
+  for (const track of stream.getTracks()) track.stop();
+}
+
+/**
+ * How long a capture runs, read from the browser's own decoder.
+ *
+ * Only needed for a file the device recorded for us — an in-page
+ * recording has already been timed. Resolves to null rather than
+ * failing: an unknown duration is allowed, and the server's cap still
+ * applies to the size.
+ */
+function measureDuration(capture: Blob, kind: MediaKind): Promise<number | null> {
+  return new Promise((resolve) => {
+    const element = document.createElement(kind === 'VIDEO' ? 'video' : 'audio');
+    const url = URL.createObjectURL(capture);
+    const settle = (value: number | null) => {
+      URL.revokeObjectURL(url);
+      resolve(value);
+    };
+    element.preload = 'metadata';
+    element.onloadedmetadata = () =>
+      settle(Number.isFinite(element.duration) ? element.duration : null);
+    element.onerror = () => settle(null);
+    element.src = url;
+  });
+}
+
+function asFieldMedia(asset: MediaAssetInfo): FieldMedia {
+  return {
+    key: `server-${asset.id}`,
+    id: asset.id,
+    localId: null,
+    kind: asset.kind,
+    durationSeconds: asset.duration_seconds,
+  };
+}
+
+/**
+ * A name for a capture that never had one.
+ *
+ * The server determines the kind from the declared content type, but a
+ * stored file with a sensible extension is one an administrator can
+ * recognise in a bucket listing six months later.
+ */
+function fileNameFor(kind: MediaKind, contentType: string): string {
+  const subtype = contentType.split('/')[1]?.split(';')[0] || 'bin';
+  // The token is only so that a morning's captures do not all arrive
+  // called `image-capture.jpeg` and get de-duplicated into
+  // `image-capture_a1B2c3.jpeg` by the storage backend.
+  const token = Math.random().toString(36).slice(2, 8);
+  return `${kind.toLowerCase()}-${token}.${subtype}`;
 }
