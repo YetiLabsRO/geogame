@@ -8,6 +8,7 @@ import {
 import { Router, RouterLink } from '@angular/router';
 
 import {
+  DialogService,
   GameApiService,
   LocationConsentStatus,
   UiAlertComponent,
@@ -186,6 +187,7 @@ export class LocationConsentComponent implements OnInit {
   private readonly api = inject(GameApiService);
   private readonly stream = inject(LocationStreamService);
   private readonly router = inject(Router);
+  private readonly dialogs = inject(DialogService);
 
   protected readonly status = signal<LocationConsentStatus | null>(null);
   protected readonly loadError = signal<string | null>(null);
@@ -225,13 +227,17 @@ export class LocationConsentComponent implements OnInit {
     });
   }
 
-  protected withdraw(): void {
+  protected async withdraw(): Promise<void> {
     if (this.busy()) return;
-    const ok = window.confirm(
-      'Withdraw consent? Streaming stops and your recorded positions for ' +
-        'this session are deleted. You cannot play a location-enabled ' +
-        'session without consent.',
-    );
+    const ok = await this.dialogs.confirm({
+      title: 'Withdraw consent?',
+      message:
+        'Streaming stops and your recorded positions for this session are ' +
+        'deleted. You cannot play a location-enabled session without consent.',
+      confirmLabel: 'Withdraw consent',
+      cancelLabel: 'Keep sharing',
+      danger: true,
+    });
     if (!ok) return;
     this.busy.set(true);
     this.actionError.set(null);

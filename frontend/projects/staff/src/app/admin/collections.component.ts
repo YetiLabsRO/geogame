@@ -1,12 +1,7 @@
 import { ChangeDetectionStrategy, Component, computed, inject, signal } from '@angular/core';
 import { FormBuilder, FormsModule, ReactiveFormsModule, Validators } from '@angular/forms';
 
-import {
-  AdminCollection,
-  AdminTower,
-  AdminZone,
-  StaffApiService,
-} from 'shared';
+import { AdminCollection, AdminTower, AdminZone, DialogService, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -234,6 +229,7 @@ import { extractErrorMessage } from '../auth/form-error';
 export class CollectionsComponent {
   private readonly fb = inject(FormBuilder).nonNullable;
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
 
   protected readonly collections = signal<AdminCollection[]>([]);
   protected readonly allTowers = signal<AdminTower[]>([]);
@@ -343,17 +339,19 @@ export class CollectionsComponent {
       });
   }
 
-  protected remove(c: AdminCollection): void {
+  protected async remove(c: AdminCollection): Promise<void> {
     const inUse = c.games.length
-      ? ` It is used by ${c.games.length} game(s).`
+      ? `It is used by ${c.games.length} game(s). `
       : '';
-    if (
-      !confirm(
-        `Delete collection "${c.name}"?${inUse} Towers and zones stay in the repository.`,
-      )
-    ) {
-      return;
-    }
+    const ok = await this.dialogs.confirm({
+      title: `Delete "${c.name}"?`,
+      message:
+        `${inUse}The towers and zones in it stay in the repository — only the ` +
+        'collection that gathered them goes. This cannot be undone.',
+      confirmLabel: 'Delete collection',
+      danger: true,
+    });
+    if (!ok) return;
     this.api.deleteCollection(c.id).subscribe({
       next: () => {
         if (this.selectedId() === c.id) this.selectedId.set(null);

@@ -524,6 +524,21 @@ class Game(models.Model):
             user=user, role=GameCollaborator.ROLE_RUNNER,
         ).exists()
 
+    def deletion_blockers(self):
+        """Why this Game may not be deleted, as an ordered list.
+
+        Deleting a Game takes its Sessions with it, so a Game is
+        blocked by exactly what its Sessions are blocked by: one
+        blocker per live run, each naming that run and the action that
+        would settle it. Same shape as `Session.deletion_blockers`.
+        """
+        blockers = []
+        for session in self.sessions.filter(
+            state__in=Session.ACTIVE_STATES,
+        ).order_by('start_time', 'id'):
+            blockers.extend(session.deletion_blockers())
+        return blockers
+
     def clone(self, slug, name=None, created_by=None):
         """Deep-copy this Game template, sharing the geometry repository.
 
@@ -1213,6 +1228,37 @@ class Session(models.Model):
     def can_start(self):
         """True when no team-composition blocker prevents starting."""
         return not self.start_blockers()
+
+    def deletion_blockers(self):
+        """Why this Session may not be deleted, as an ordered list.
+
+        Same blocker shape as `start_blockers` — a machine-readable
+        `code` plus a human-readable `message` — so one client-side
+        reader serves both gates. Empty list ⇒ the run is settled and
+        may go.
+
+        Only the live states block. DRAFT never ran; FINISHED has
+        stopped. Everything in between has players on the ground, and
+        deleting it would drop their teams and ownerships mid-game —
+        so the blocker names the action that would settle it instead.
+        """
+        if self.state not in self.ACTIVE_STATES:
+            return []
+        settle = (
+            'Close participation on it first.'
+            if self.state == self.OPEN_FOR_PARTICIPANTS
+            else 'Finish it first.'
+        )
+        return [{
+            'code': 'session_live',
+            'session_id': self.id,
+            'session_name': self.name,
+            'state': self.state,
+            'message': (
+                f'Session "{self.name}" is {self.get_state_display().lower()}. '
+                f'{settle}'
+            ),
+        }]
 
 
 class Team(models.Model):

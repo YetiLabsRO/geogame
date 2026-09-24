@@ -19,6 +19,7 @@ function profile(isStaff: boolean): UserProfile {
     active_team_id: null,
     active_roles: [],
     is_staff: isStaff,
+    is_superuser: false,
     allow_player_team_creation: false,
     captain_of_team_id: null,
   };

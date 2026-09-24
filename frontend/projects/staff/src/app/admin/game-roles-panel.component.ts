@@ -8,7 +8,7 @@ import {
 } from '@angular/core';
 import { FormsModule } from '@angular/forms';
 
-import { AdminGameRole, BuiltinPower, StaffApiService } from 'shared';
+import { AdminGameRole, BuiltinPower, DialogService, StaffApiService } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -175,6 +175,7 @@ interface RoleRow {
 })
 export class GameRolesPanelComponent {
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
 
   readonly gameId = input.required<number>();
 
@@ -276,9 +277,17 @@ export class GameRolesPanelComponent {
       });
   }
 
-  protected remove(row: RoleRow): void {
+  protected async remove(row: RoleRow): Promise<void> {
     if (row.saving) return;
-    if (!confirm(`Delete role "${row.role.name}"?`)) return;
+    const ok = await this.dialogs.confirm({
+      title: 'Delete this role?',
+      message:
+        `"${row.role.name}" is removed from the game, and from every team member ` +
+        'holding it. This cannot be undone.',
+      confirmLabel: 'Delete role',
+      danger: true,
+    });
+    if (!ok) return;
     this.patch(row, { saving: true, error: null });
     this.api.deleteGameRole(row.role.id).subscribe({
       next: () => this.rows.update((rows) => rows.filter((r) => r.role.id !== row.role.id)),

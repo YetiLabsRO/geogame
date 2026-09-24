@@ -32,6 +32,8 @@ export interface UserProfile {
   active_team_id: number | null;
   active_roles: ActiveRole[];
   is_staff: boolean;
+  /** Superadmin — gates the irreversible operations (deleting a Game or Session). */
+  is_superuser: boolean;
   allow_player_team_creation: boolean;
   captain_of_team_id: number | null;
 }
@@ -50,6 +52,7 @@ export class AuthService {
   readonly profile = this._profile.asReadonly();
   readonly isAuthenticated = computed(() => this._token() !== null);
   readonly isStaff = computed(() => this._profile()?.is_staff ?? false);
+  readonly isSuperuser = computed(() => this._profile()?.is_superuser ?? false);
 
   login(login: string, password: string): Observable<AuthResponse> {
     return this.http

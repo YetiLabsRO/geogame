@@ -658,9 +658,18 @@ export interface FailCounterInfo {
 }
 
 /** One reason a Session may not start (machine `code` + human `message`). */
-export interface StartBlocker {
-  code: 'too_few_teams' | 'too_many_teams' | 'team_below_minimum' | 'team_above_maximum';
+/**
+ * The common shape of every blocker the API refuses an action with: a
+ * machine-readable code and a sentence naming what would unblock it. Both
+ * the start gate and the deletion gate send this, so one reader serves both.
+ */
+export interface Blocker {
+  code: string;
   message: string;
+}
+
+export interface StartBlocker extends Blocker {
+  code: 'too_few_teams' | 'too_many_teams' | 'team_below_minimum' | 'team_above_maximum';
   required?: number;
   allowed?: number;
   current?: number;
@@ -1030,6 +1039,15 @@ export class StaffApiService {
     return this.http.patch<AdminGame>(`/api/staff/games/${id}/`, payload);
   }
 
+  /**
+   * Delete a Game and every Session on it. Superadmin only (403
+   * otherwise); refused with 409 + `blockers` while any of its Sessions
+   * is live. Shared Collections, Towers and Zones survive it.
+   */
+  deleteGame(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/games/${id}/`);
+  }
+
   // ---- Sessions ------------------------------------------------------------
 
   listSessions(gameId?: number): Observable<AdminSession[]> {
@@ -1047,6 +1065,14 @@ export class StaffApiService {
 
   updateSession(id: number, payload: AdminSessionPayload): Observable<AdminSession> {
     return this.http.patch<AdminSession>(`/api/staff/sessions/${id}/`, payload);
+  }
+
+  /**
+   * Delete a Session and its roster. Superadmin only (403 otherwise);
+   * refused with 409 + `blockers` unless the run is draft or finished.
+   */
+  deleteSession(id: number): Observable<void> {
+    return this.http.delete<void>(`/api/staff/sessions/${id}/`);
   }
 
   // ---- Session lifecycle transitions (session-lifecycle) -------------------

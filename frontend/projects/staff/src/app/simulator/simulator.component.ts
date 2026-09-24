@@ -33,6 +33,7 @@ import {
   SimulationState,
   StaffApiService,
   StatTileComponent,
+  StatusPillComponent,
   TeamColorResolver,
   TowerOwnershipChangedPayload,
 } from 'shared';
@@ -83,7 +84,7 @@ interface DisplayPlayer {
   selector: 'app-simulator',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, LowerCasePipe, FieldRowComponent, PageHeaderComponent, StatTileComponent],
+  imports: [FieldRowComponent, LowerCasePipe, PageHeaderComponent, ReactiveFormsModule, StatTileComponent, StatusPillComponent],
   template: `
     <app-page-header
       title="Simulator"
@@ -263,7 +264,7 @@ interface DisplayPlayer {
                           <div class="fw-semibold">{{ run.name }}</div>
                           <div class="small text-body-secondary">#{{ run.id }} · seed {{ run.seed }}</div>
                         </td>
-                        <td><span class="badge" [class]="statusBadgeClass(run.status)">{{ run.status }}</span></td>
+                        <td><app-status-pill [status]="run.status" /></td>
                         <td class="text-end tabular-nums">{{ run.tick_count }}</td>
                         <td class="text-end">
                           <div class="btn-group btn-group-sm">
@@ -301,7 +302,7 @@ interface DisplayPlayer {
           <h2 class="h5 mb-0">
             @if (activeRun(); as run) {
               {{ run.name }}
-              <span class="badge ms-2" [class]="statusBadgeClass(run.status)">{{ run.status }}</span>
+              <app-status-pill class="ms-2" [status]="run.status" />
             } @else {
               No run selected
             }
@@ -898,18 +899,6 @@ export class SimulatorComponent {
     });
   }
 
-  protected statusBadgeClass(status: string): string {
-    switch (status) {
-      case 'RUNNING':
-        return 'text-bg-success';
-      case 'PAUSED':
-        return 'text-bg-warning';
-      case 'FINISHED':
-        return 'text-bg-secondary';
-      default:
-        return 'text-bg-info';
-    }
-  }
 
   // ---- create run ------------------------------------------------------------
 

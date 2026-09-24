@@ -2,7 +2,14 @@ import { ChangeDetectionStrategy, Component, inject, signal } from '@angular/cor
 import { DatePipe } from '@angular/common';
 import { RouterLink } from '@angular/router';
 
-import { AdminSession, CurrentSession, GameApiService, PageHeaderComponent, StaffApiService } from 'shared';
+import {
+  AdminSession,
+  CurrentSession,
+  GameApiService,
+  PageHeaderComponent,
+  StaffApiService,
+  StatusPillComponent,
+} from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -25,7 +32,7 @@ interface GameBucket {
   selector: 'app-game-state',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, RouterLink, PageHeaderComponent],
+  imports: [DatePipe, PageHeaderComponent, RouterLink, StatusPillComponent],
   template: `
     <app-page-header
       title="Game state"
@@ -72,7 +79,7 @@ interface GameBucket {
                 {{ s.name }}
                 <code class="small text-body-secondary ms-1">{{ s.slug }}</code>
               </span>
-              <span class="badge" [class]="stateBadgeClass(s.state)">{{ s.state }}</span>
+              <app-status-pill [status]="s.state" />
             </a>
           }
         </div>
@@ -110,18 +117,8 @@ export class GameStateComponent {
     });
   }
 
-  protected stateBadgeClass(state: AdminSession['state']): string {
-    return STATE_BADGES[state] ?? 'text-bg-secondary';
-  }
 }
 
-const STATE_BADGES: Record<AdminSession['state'], string> = {
-  DRAFT: 'text-bg-secondary',
-  OPEN_FOR_PARTICIPANTS: 'text-bg-info',
-  RUNNING: 'text-bg-success',
-  PAUSED: 'text-bg-warning',
-  FINISHED: 'text-bg-dark',
-};
 
 function groupByGame(sessions: AdminSession[]): GameBucket[] {
   const byGame = new Map<string, GameBucket>();

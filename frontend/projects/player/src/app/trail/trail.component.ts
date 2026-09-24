@@ -4,6 +4,7 @@ import { RouterLink } from '@angular/router';
 
 import {
   GameApiService,
+  StatusLabelPipe,
   TrailState,
   TrailStepInfo,
   UiAlertComponent,
@@ -28,18 +29,7 @@ import {
 @Component({
   selector: 'app-trail',
   standalone: true,
-  imports: [
-    DatePipe,
-    RouterLink,
-    UiAlertComponent,
-    UiButtonComponent,
-    UiCardComponent,
-    UiChipComponent,
-    UiEmptyStateComponent,
-    UiIconComponent,
-    UiProgressMeterComponent,
-    UiSpinnerComponent,
-  ],
+  imports: [DatePipe, RouterLink, StatusLabelPipe, UiAlertComponent, UiButtonComponent, UiCardComponent, UiChipComponent, UiEmptyStateComponent, UiIconComponent, UiProgressMeterComponent, UiSpinnerComponent],
   changeDetection: ChangeDetectionStrategy.OnPush,
   template: `
     <div class="trail-screen">
@@ -94,7 +84,7 @@ import {
                     <div class="trail-step-panel__body">
                       <p class="tr-body">{{ step.clue || 'No clue — find the point!' }}</p>
                       <div class="trail-step-panel__chips">
-                        <ui-chip tone="neutral">{{ step.state || 'HIDDEN' }}</ui-chip>
+                        <ui-chip tone="neutral">{{ (step.state || 'HIDDEN') | statusLabel }}</ui-chip>
                         @if (step.has_gate) {
                           <ui-chip tone="slate">gate at the point</ui-chip>
                         } @else {
@@ -136,7 +126,7 @@ import {
                       </div>
                       <span class="tr-meta-tiny trail-list-row__clue">{{ step.clue }}</span>
                     </div>
-                    <ui-chip [tone]="stateTone(step)">{{ step.state }}</ui-chip>
+                    <ui-chip [tone]="stateTone(step)">{{ step.state | statusLabel }}</ui-chip>
                   </div>
                 }
               </div>

@@ -8,6 +8,7 @@ import {
   AdminGameRole,
   AdminPresenceRequirement,
   AdminTower,
+  DialogService,
   PresenceMethod,
   StaffApiService,
 } from 'shared';
@@ -543,6 +544,7 @@ interface Row {
 export class ChallengesComponent {
   private readonly fb = inject(FormBuilder).nonNullable;
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
 
   protected readonly rows = signal<Row[]>([]);
   protected readonly towers = signal<AdminTower[]>([]);
@@ -632,13 +634,19 @@ export class ChallengesComponent {
       });
   }
 
-  protected removeRequirement(req: AdminPresenceRequirement): void {
+  protected async removeRequirement(req: AdminPresenceRequirement): Promise<void> {
     const suffix =
       req.challenge_count > 0
-        ? ` It is referenced by ${req.challenge_count} challenge(s); they will ` +
-          'simply lose the requirement.'
+        ? `${req.challenge_count} challenge(s) reference it; they simply lose ` +
+          'the requirement. '
         : '';
-    if (!confirm(`Delete presence requirement "${req.name}"?${suffix}`)) return;
+    const ok = await this.dialogs.confirm({
+      title: `Delete "${req.name}"?`,
+      message: `${suffix}This cannot be undone.`,
+      confirmLabel: 'Delete requirement',
+      danger: true,
+    });
+    if (!ok) return;
     this.api.deletePresenceRequirement(req.id).subscribe({
       next: () => {
         this.refreshRequirements();
@@ -794,9 +802,17 @@ export class ChallengesComponent {
     });
   }
 
-  protected remove(row: Row): void {
+  protected async remove(row: Row): Promise<void> {
     if (row.saving) return;
-    if (!confirm(`Delete this challenge? This can't be undone.`)) return;
+    const ok = await this.dialogs.confirm({
+      title: 'Delete this challenge?',
+      message:
+        'The challenge and its media go, along with every attempt recorded ' +
+        'against it. This cannot be undone.',
+      confirmLabel: 'Delete challenge',
+      danger: true,
+    });
+    if (!ok) return;
     this.patch(row, { saving: true, error: null });
     this.api.deleteChallenge(row.challenge.id).subscribe({
       next: () => {
@@ -910,8 +926,14 @@ export class ChallengesComponent {
       });
   }
 
-  protected removeMedia(row: Row, media: AdminChallengeMedia): void {
-    if (!confirm('Remove this media from the challenge?')) return;
+  protected async removeMedia(row: Row, media: AdminChallengeMedia): Promise<void> {
+    const ok = await this.dialogs.confirm({
+      title: 'Remove this media?',
+      message: 'It is detached from the challenge and its file is deleted.',
+      confirmLabel: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
     this.patch(row, { mediaBusy: true, mediaErrors: [] });
     this.api.deleteChallengeMedia(row.challenge.id, media.id).subscribe({
       next: () => {

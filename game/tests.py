@@ -200,13 +200,18 @@ def _authed_client(team, username='scout'):
     return client, user
 
 
-def _staff_client(session=None, username='staff'):
-    """Create a staff user + token. Optionally pin current_session."""
+def _staff_client(session=None, username='staff', superuser=False):
+    """Create a staff user + token. Optionally pin current_session.
+
+    `superuser=True` for the irreversible operations (deleting a Game
+    or a Session), which sit above the staff bar.
+    """
     user = User.objects.create_user(
         username=username,
         email=f'{username}@example.com',
         password='password123',
         is_staff=True,
+        is_superuser=superuser,
     )
     if session is not None:
         user.profile.current_session = session
@@ -14926,3 +14931,216 @@ class ExistingBase64UploadsStillWorkTest(TestCase):
         )
         self.assertEqual(resp.status_code, 201, resp.content)
         self.assertEqual(MediaAsset.objects.get(tower=tower).kind, MEDIA_IMAGE)
+
+
+# ---------------------------------------------------------------------------
+# destructive-actions-and-dialogs — deleting Games and Sessions
+# ---------------------------------------------------------------------------
+
+
+class SessionDeletionGateTest(TestCase):
+    """Who may delete a Session, and when it is settled enough to go."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.super_client, self.superadmin = _staff_client(
+            username='root', superuser=True,
+        )
+        self.staff_client, self.staff = _staff_client(username='plain-staff')
+
+    def _url(self, session=None):
+        return f'/api/staff/sessions/{(session or self.session).id}/'
+
+    def _settle(self, state=Session.FINISHED):
+        Session.objects.filter(pk=self.session.pk).update(state=state)
+        self.session.refresh_from_db()
+
+    # ---- the permission lock ------------------------------------------
+
+    def test_plain_staff_is_refused(self):
+        self._settle()
+        resp = self.staff_client.delete(self._url())
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertTrue(Session.objects.filter(pk=self.session.pk).exists())
+
+    def test_anonymous_is_refused(self):
+        self._settle()
+        resp = APIClient().delete(self._url())
+        self.assertIn(resp.status_code, (401, 403))
+        self.assertTrue(Session.objects.filter(pk=self.session.pk).exists())
+
+    def test_creator_of_the_game_is_not_enough(self):
+        """Creator rights govern editing a template, not removing a run."""
+        self.game.created_by = self.staff
+        self.game.save(update_fields=['created_by'])
+        self._settle()
+        resp = self.staff_client.delete(self._url())
+        self.assertEqual(resp.status_code, 403, resp.content)
+
+    # ---- the state lock -----------------------------------------------
+
+    def test_finished_session_deletes(self):
+        self._settle(Session.FINISHED)
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Session.objects.filter(pk=self.session.pk).exists())
+
+    def test_draft_session_deletes(self):
+        self._settle(Session.DRAFT)
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Session.objects.filter(pk=self.session.pk).exists())
+
+    def test_live_session_is_refused_with_blockers(self):
+        for state, wanted in (
+            (Session.OPEN_FOR_PARTICIPANTS, 'close participation'),
+            (Session.RUNNING, 'finish it'),
+            (Session.PAUSED, 'finish it'),
+        ):
+            with self.subTest(state=state):
+                self._settle(state)
+                resp = self.super_client.delete(self._url())
+                self.assertEqual(resp.status_code, 409, resp.content)
+                body = resp.json()
+                self.assertEqual(len(body['blockers']), 1)
+                blocker = body['blockers'][0]
+                self.assertEqual(blocker['code'], 'session_live')
+                self.assertEqual(blocker['state'], state)
+                self.assertEqual(blocker['session_id'], self.session.id)
+                self.assertIn(wanted, blocker['message'].lower())
+                self.assertTrue(
+                    Session.objects.filter(pk=self.session.pk).exists(),
+                )
+
+    # ---- what goes with it --------------------------------------------
+
+    def test_deleting_takes_the_roster_and_leaves_the_game(self):
+        team_id = self.team.id
+        self._settle()
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Team.objects.filter(pk=team_id).exists())
+        self.assertTrue(Game.objects.filter(pk=self.game.pk).exists())
+
+    def test_deleting_leaves_no_dangling_current_session(self):
+        watcher, _ = _staff_client(
+            session=self.session, username='watcher',
+        )
+        profile = User.objects.get(username='watcher').profile
+        self.assertEqual(profile.current_session_id, self.session.id)
+        self._settle()
+        self.assertEqual(self.super_client.delete(self._url()).status_code, 204)
+        profile.refresh_from_db()
+        self.assertIsNone(profile.current_session_id)
+
+    def test_blockers_are_empty_for_a_settled_session(self):
+        for state in (Session.DRAFT, Session.FINISHED):
+            with self.subTest(state=state):
+                self._settle(state)
+                self.assertEqual(self.session.deletion_blockers(), [])
+
+
+class GameDeletionGateTest(TestCase):
+    """Deleting a Game takes its Sessions; a live one blocks it."""
+
+    def setUp(self):
+        self.game = _make_game()
+        self.group = _make_group(self.game)
+        self.zone = _make_zone(self.game)
+        self.tower = _make_tower(self.game, zone=self.zone)
+        self.team = _make_team(self.game, self.group)
+        self.session = self.team.session
+        self.super_client, self.superadmin = _staff_client(
+            username='root', superuser=True,
+        )
+        self.staff_client, self.staff = _staff_client(username='plain-staff')
+
+    def _url(self, game=None):
+        return f'/api/staff/games/{(game or self.game).id}/'
+
+    def _settle(self, state=Session.FINISHED):
+        Session.objects.filter(game=self.game).update(state=state)
+        self.session.refresh_from_db()
+
+    def test_plain_staff_is_refused(self):
+        self._settle()
+        resp = self.staff_client.delete(self._url())
+        self.assertEqual(resp.status_code, 403, resp.content)
+        self.assertTrue(Game.objects.filter(pk=self.game.pk).exists())
+
+    def test_live_session_blocks_the_game(self):
+        self._settle(Session.RUNNING)
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 409, resp.content)
+        blockers = resp.json()['blockers']
+        self.assertEqual([b['session_id'] for b in blockers], [self.session.id])
+        self.assertTrue(Game.objects.filter(pk=self.game.pk).exists())
+
+    def test_every_live_session_is_named(self):
+        now = timezone.now()
+        second = Session.objects.create(
+            game=self.game, slug='second', name='Second run',
+            start_time=now, end_time=now + timedelta(hours=1),
+            state=Session.PAUSED,
+        )
+        Session.objects.filter(pk=self.session.pk).update(
+            state=Session.OPEN_FOR_PARTICIPANTS,
+        )
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 409, resp.content)
+        named = {b['session_id'] for b in resp.json()['blockers']}
+        self.assertEqual(named, {self.session.id, second.id})
+
+    def test_settled_game_deletes_with_its_sessions(self):
+        self._settle()
+        session_id, team_id = self.session.id, self.team.id
+        resp = self.super_client.delete(self._url())
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Game.objects.filter(pk=self.game.pk).exists())
+        self.assertFalse(Session.objects.filter(pk=session_id).exists())
+        self.assertFalse(Team.objects.filter(pk=team_id).exists())
+
+    def test_game_with_no_sessions_deletes(self):
+        bare = _make_game(name='Bare', slug='bare')
+        resp = self.super_client.delete(self._url(bare))
+        self.assertEqual(resp.status_code, 204, resp.content)
+        self.assertFalse(Game.objects.filter(pk=bare.pk).exists())
+
+    def test_shared_map_content_survives(self):
+        """Collections, Towers and Zones are referenced, not owned."""
+        self._settle()
+        tower_id, zone_id = self.tower.id, self.zone.id
+        collection_ids = list(
+            self.game.collections.values_list('id', flat=True),
+        )
+        self.assertTrue(collection_ids)
+        self.assertEqual(self.super_client.delete(self._url()).status_code, 204)
+        self.assertTrue(Tower.objects.filter(pk=tower_id).exists())
+        self.assertTrue(Zone.objects.filter(pk=zone_id).exists())
+        self.assertEqual(
+            Collection.objects.filter(id__in=collection_ids).count(),
+            len(collection_ids),
+        )
+
+    def test_a_clone_survives_its_parent_with_empty_ancestry(self):
+        clone = self.game.clone('cloned', name='Cloned')
+        self.assertEqual(clone.cloned_from_id, self.game.id)
+        self._settle()
+        self.assertEqual(self.super_client.delete(self._url()).status_code, 204)
+        clone.refresh_from_db()
+        self.assertIsNone(clone.cloned_from_id)
+
+
+class ProfileExposesSuperuserTest(TestCase):
+    """The SPA hides a control it would be refused, so it must be told."""
+
+    def test_me_reports_superuser(self):
+        for username, superuser in (('root', True), ('plain', False)):
+            with self.subTest(superuser=superuser):
+                client, _ = _staff_client(username=username, superuser=superuser)
+                resp = client.get('/api/me/')
+                self.assertEqual(resp.status_code, 200, resp.content)
+                self.assertIs(resp.json()['is_superuser'], superuser)

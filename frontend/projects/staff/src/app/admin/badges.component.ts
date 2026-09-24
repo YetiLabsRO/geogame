@@ -8,7 +8,7 @@ import {
 import { DatePipe } from '@angular/common';
 import { FormsModule } from '@angular/forms';
 
-import { BadgeRow, BadgesService, GatewayRow } from 'shared';
+import { BadgeRow, BadgesService, GatewayRow, StatusPillComponent } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -27,7 +27,7 @@ const POLL_INTERVAL_MS = 10_000;
   selector: 'app-admin-badges',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [DatePipe, FormsModule],
+  imports: [DatePipe, FormsModule, StatusPillComponent],
   template: `
     <div class="d-flex justify-content-between align-items-center mb-3">
       <div>
@@ -97,25 +97,14 @@ const POLL_INTERVAL_MS = 10_000;
                   <tr [class.table-warning]="b.unreturned">
                     <td class="font-monospace">{{ b.badge_id }}</td>
                     <td>
-                      @switch (b.status) {
-                        @case ('AVAILABLE') {
-                          <span class="badge text-bg-success">available</span>
-                        }
-                        @case ('ASSIGNED') {
-                          <span class="badge text-bg-primary">assigned</span>
-                        }
-                        @case ('LOST') {
-                          <span class="badge text-bg-danger">lost</span>
-                        }
-                        @case ('RETIRED') {
-                          <span class="badge text-bg-secondary">retired</span>
-                        }
-                        @default {
-                          <span class="badge text-bg-secondary">{{ b.status }}</span>
-                        }
-                      }
+                      <app-status-pill [status]="b.status" />
                       @if (b.unreturned) {
-                        <span class="badge text-bg-warning ms-1">un-returned</span>
+                        <app-status-pill
+                          class="ms-1"
+                          status="UNRETURNED"
+                          tone="warning"
+                          label="Un-returned"
+                        />
                       }
                     </td>
                     <td>

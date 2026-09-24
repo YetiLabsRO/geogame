@@ -8,7 +8,7 @@ import {
 } from '@angular/core';
 import { DatePipe } from '@angular/common';
 
-import { StaffApiService, StaffTowerLock } from 'shared';
+import { DialogService, StaffApiService, StaffTowerLock } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
 
@@ -103,6 +103,7 @@ import { extractErrorMessage } from '../auth/form-error';
 })
 export class ActiveLocksComponent {
   private readonly api = inject(StaffApiService);
+  private readonly dialogs = inject(DialogService);
   private readonly destroyRef = inject(DestroyRef);
 
   protected readonly locks = signal<StaffTowerLock[]>([]);
@@ -138,9 +139,18 @@ export class ActiveLocksComponent {
     });
   }
 
-  protected cancel(lock: StaffTowerLock): void {
+  protected async cancel(lock: StaffTowerLock): Promise<void> {
     if (this.cancellingId() !== null) return;
-    if (!confirm(`Cancel ${lock.team_name}'s lock on ${lock.tower_name}?`)) return;
+    const ok = await this.dialogs.confirm({
+      title: 'Cancel this lock?',
+      message:
+        `${lock.team_name} holds the lock on ${lock.tower_name}. ` +
+        'Cancelling releases the tower for anyone to attempt.',
+      confirmLabel: 'Cancel lock',
+      cancelLabel: 'Leave it',
+      danger: true,
+    });
+    if (!ok) return;
     this.cancellingId.set(lock.id);
     this.cancelError.set(null);
     this.api.cancelTowerLock(lock.id).subscribe({

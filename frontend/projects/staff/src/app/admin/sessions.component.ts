@@ -20,9 +20,11 @@ import {
   AdminGame,
   AdminSession,
   AdminSessionPayload,
-  SessionState,
+  AuthService,
+  Blocker,
+  DialogService,
   StaffApiService,
-  StartBlocker,
+  StatusPillComponent,
 } from 'shared';
 
 import { extractErrorMessage } from '../auth/form-error';
@@ -33,8 +35,13 @@ interface Row {
   dirty: boolean;
   saving: boolean;
   error: string | null;
-  /** Start-gate blockers returned when activating was refused (409). */
+  /**
+   * Blockers returned by a refused 409 — the start gate when activating,
+   * the deletion gate when deleting. Both send the same shape.
+   */
   blockers: string[];
+  /** True while this row's delete is in flight. */
+  deleting: boolean;
 }
 
 interface GameGroup {
@@ -46,10 +53,23 @@ interface GameGroup {
   selector: 'app-admin-sessions',
   standalone: true,
   changeDetection: ChangeDetectionStrategy.OnPush,
-  imports: [ReactiveFormsModule, FormsModule, DatePipe, RouterLink],
+  imports: [ReactiveFormsModule, FormsModule, DatePipe, RouterLink, StatusPillComponent],
   template: `
-    <div class="d-flex justify-content-between align-items-center mb-3">
+    <div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
       <h1 class="h3 mb-0">Sessions</h1>
+      <div class="d-flex align-items-center gap-2 flex-wrap">
+        <label class="visually-hidden" for="session-game-filter">Filter by game</label>
+        <select
+          id="session-game-filter"
+          class="form-select form-select-sm w-auto"
+          [ngModel]="gameFilter()"
+          (ngModelChange)="setGameFilter($event)"
+        >
+          <option [ngValue]="null">All games</option>
+          @for (g of games(); track g.id) {
+            <option [ngValue]="g.id">{{ g.name }}</option>
+          }
+        </select>
       <ul class="nav nav-pills">
         @for (f of filters; track f.key) {
           <li class="nav-item">
@@ -64,6 +84,7 @@ interface GameGroup {
           </li>
         }
       </ul>
+      </div>
     </div>
     <p class="text-body-secondary small">
       A Session is one live run of a Game — its own roster and scoreboard.
@@ -143,8 +164,8 @@ interface GameGroup {
         <span class="spinner-border spinner-border-sm me-2"></span>
         Loading…
       </div>
-    } @else if (groups().length === 0) {
-      <div class="alert alert-info">No sessions yet.</div>
+    } @else if (visibleRowCount() === 0) {
+      <div class="alert alert-info">{{ emptyMessage() }}</div>
     } @else {
       @for (bucket of groups(); track bucket.game.id) {
         <div class="mb-4">
@@ -152,10 +173,7 @@ interface GameGroup {
             {{ bucket.game.name }}
             <code class="text-body-secondary small ms-2">{{ bucket.game.slug }}</code>
           </h2>
-          @if (bucket.rows.length === 0) {
-            <div class="alert alert-info">No sessions on this game.</div>
-          } @else {
-            <div class="table-responsive">
+          <div class="table-responsive">
               <table class="table align-middle">
                 <thead>
                   <tr>
@@ -186,9 +204,7 @@ interface GameGroup {
                         {{ row.session.end_time | date: 'short' }}
                       </td>
                       <td class="text-center">
-                        <span class="badge" [class]="stateBadgeClass(row.session.state)">
-                          {{ row.session.state }}
-                        </span>
+                        <app-status-pill [status]="row.session.state" />
                       </td>
                       <td class="text-end">
                         <div class="d-flex gap-2 justify-content-end">
@@ -209,6 +225,21 @@ interface GameGroup {
                             }
                             Save
                           </button>
+                          @if (isSuperuser()) {
+                            <button
+                              type="button"
+                              class="btn btn-sm btn-outline-danger"
+                              [disabled]="row.deleting"
+                              [attr.aria-label]="'Delete session ' + row.session.name"
+                              (click)="remove(row)"
+                            >
+                              @if (row.deleting) {
+                                <span class="spinner-border spinner-border-sm"></span>
+                              } @else {
+                                <i class="bi bi-trash"></i>
+                              }
+                            </button>
+                          }
                         </div>
                         @if (row.error; as msg) {
                           <div class="small text-danger mt-1">{{ msg }}</div>
@@ -225,8 +256,7 @@ interface GameGroup {
                   }
                 </tbody>
               </table>
-            </div>
-          }
+          </div>
         </div>
       }
     }
@@ -235,6 +265,15 @@ interface GameGroup {
 export class SessionsComponent {
   private readonly fb = inject(FormBuilder).nonNullable;
   private readonly api = inject(StaffApiService);
+  private readonly auth = inject(AuthService);
+  private readonly dialogs = inject(DialogService);
+
+  /**
+   * Deleting a session is superadmin-only. The control is absent for
+   * everyone else rather than present-and-disabled — an action they can
+   * never take is noise, and the server refuses it regardless.
+   */
+  protected readonly isSuperuser = this.auth.isSuperuser;
 
   protected readonly games = signal<AdminGame[]>([]);
   protected readonly sessions = signal<AdminSession[]>([]);
@@ -250,13 +289,17 @@ export class SessionsComponent {
     { key: 'past', label: 'Past' },
   ];
   protected readonly activeFilter = signal<'all' | 'active' | 'past'>('all');
+  /** Narrow to one game; null is every game, and the default. */
+  protected readonly gameFilter = signal<number | null>(null);
 
   protected readonly groups = computed<GameGroup[]>(() => {
     const filter = this.activeFilter();
+    const game = this.gameFilter();
     const byGame = new Map<number, Row[]>();
     for (const row of this.rows()) {
       if (filter === 'active' && !row.session.is_active) continue;
       if (filter === 'past' && row.session.is_active) continue;
+      if (game !== null && row.session.game !== game) continue;
       const key = row.session.game;
       const bucket = byGame.get(key);
       if (bucket) {
@@ -265,12 +308,32 @@ export class SessionsComponent {
         byGame.set(key, [row]);
       }
     }
-    return this.games().map((game) => ({
-      game,
-      rows: (byGame.get(game.id) ?? []).slice().sort((a, b) =>
-        a.session.start_time.localeCompare(b.session.start_time),
-      ),
-    }));
+    // Only games the filters left something in — a narrowed list should not
+    // make you scroll past a heading per game to reach the one you wanted.
+    return this.games()
+      .filter((g) => (byGame.get(g.id) ?? []).length > 0)
+      .map((g) => ({
+        game: g,
+        rows: (byGame.get(g.id) ?? [])
+          .slice()
+          .sort((a, b) => a.session.start_time.localeCompare(b.session.start_time)),
+      }));
+  });
+
+  protected readonly visibleRowCount = computed(() =>
+    this.groups().reduce((total, bucket) => total + bucket.rows.length, 0),
+  );
+
+  /** Says what is filtered out, so an empty list is never a dead end. */
+  protected readonly emptyMessage = computed(() => {
+    if (this.rows().length === 0) return 'No sessions yet.';
+    const applied: string[] = [];
+    const game = this.games().find((g) => g.id === this.gameFilter());
+    if (game) applied.push(`game "${game.name}"`);
+    if (this.activeFilter() !== 'all') applied.push(`the ${this.activeFilter()} filter`);
+    return applied.length === 0
+      ? 'No sessions yet.'
+      : `No sessions match ${applied.join(' and ')}.`;
   });
 
   protected readonly createForm = this.fb.group({
@@ -289,8 +352,8 @@ export class SessionsComponent {
     this.activeFilter.set(filter);
   }
 
-  protected stateBadgeClass(state: SessionState): string {
-    return STATE_BADGES[state] ?? 'text-bg-secondary';
+  protected setGameFilter(gameId: number | null): void {
+    this.gameFilter.set(gameId);
   }
 
   private refresh(): void {
@@ -311,6 +374,7 @@ export class SessionsComponent {
             saving: false,
             error: null,
             blockers: [],
+            deleting: false,
           })),
         );
         this.loading.set(false);
@@ -388,6 +452,7 @@ export class SessionsComponent {
                     saving: false,
                     error: null,
                     blockers: [],
+                    deleting: false,
                   }
                 : r,
             ),
@@ -403,6 +468,45 @@ export class SessionsComponent {
       });
   }
 
+  /**
+   * Delete this session, once its superadmin has said so in the app's own
+   * dialog. The server refuses anything still live with a 409 whose
+   * blockers name the action that would settle it; those land on the row
+   * beside the control they were asked for, and the row stays put.
+   */
+  protected async remove(row: Row): Promise<void> {
+    if (row.deleting) return;
+    const ok = await this.dialogs.confirm({
+      title: `Delete "${row.session.name}"?`,
+      message:
+        'Its teams, their memberships and everything this run recorded — ' +
+        'ownerships, submissions, positions — go with it. The game and its ' +
+        'map are untouched. This cannot be undone.',
+      confirmLabel: 'Delete session',
+      danger: true,
+    });
+    if (!ok) return;
+
+    this.patch(row, { deleting: true, error: null, blockers: [] });
+    this.api.deleteSession(row.session.id).subscribe({
+      next: () => {
+        this.rows.update((rows) => rows.filter((r) => r.session.id !== row.session.id));
+        // A switcher pointing at a session that no longer exists is worse
+        // than one pointing at nothing.
+        if (this.auth.profile()?.current_session === row.session.id) {
+          this.auth.fetchProfile().subscribe({ error: () => undefined });
+        }
+      },
+      error: (err) => {
+        this.patch(row, {
+          deleting: false,
+          error: extractErrorMessage(err),
+          blockers: extractBlockerMessages(err),
+        });
+      },
+    });
+  }
+
   private patch(row: Row, patch: Partial<Row>): void {
     this.rows.update((rows) =>
       rows.map((r) => (r.session.id === row.session.id ? { ...r, ...patch } : r)),
@@ -410,22 +514,19 @@ export class SessionsComponent {
   }
 }
 
-const STATE_BADGES: Record<SessionState, string> = {
-  DRAFT: 'text-bg-secondary',
-  OPEN_FOR_PARTICIPANTS: 'text-bg-info',
-  RUNNING: 'text-bg-success',
-  PAUSED: 'text-bg-warning',
-  FINISHED: 'text-bg-dark',
-};
 
 function isDirty<T extends object>(a: T, b: T): boolean {
   return (Object.keys(a) as (keyof T)[]).some((k) => a[k] !== b[k]);
 }
 
-/** Pull the start-gate `blockers` messages out of a 409 error body, if any. */
+/**
+ * Pull the `blockers` messages out of a 409 body, if any. Both refusals
+ * that carry blockers — the start gate and the deletion gate — send the
+ * same shape, so one reader serves both.
+ */
 function extractBlockerMessages(err: unknown): string[] {
   if (!(err instanceof HttpErrorResponse)) return [];
-  const blockers = (err.error as { blockers?: StartBlocker[] } | null)?.blockers;
+  const blockers = (err.error as { blockers?: Blocker[] } | null)?.blockers;
   if (!Array.isArray(blockers)) return [];
   return blockers
     .map((b) => b.message)
